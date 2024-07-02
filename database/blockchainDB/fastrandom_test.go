@@ -13,7 +13,7 @@ func TestUint64(t *testing.T) {
 	var dist [100]float64
 	var total float64
 
-	fr := NewFastRandom([32]byte{1, 2, 3})
+	fr := NewFastRandom([]byte{1, 2, 3})
 	for i := 0; i < 1_000_000; i++ {
 		integer := fr.Uint64()
 		hash := fr.NextHash()
@@ -43,7 +43,7 @@ func TestUint64(t *testing.T) {
 // Could also test for two, three, four character sequences as well, but 
 // for the purposes of this random number sequencer, these tests are good enough
 func TestRandBuff(t *testing.T) {
-	fr := NewFastRandom([32]byte{23, 56, 234, 123, 78, 28})
+	fr := NewFastRandom([]byte{23, 56, 234, 123, 78, 28})
 	var positionCounts [1000][256]float64
 	var charCounts [256]float64
 	var total = 0

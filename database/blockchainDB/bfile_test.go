@@ -26,7 +26,7 @@ func TestBFile(t *testing.T) {
 	bFile, err := NewBFile(filename,3)
 	NoErrorStop(t,err,"failed to open BFile")
 	 
-	r := NewFastRandom([32]byte{1,2,3})
+	r := NewFastRandom([]byte{1,2,3})
 	for i:= 0;i<100_000;i++ {
 		key := r.NextHash()
 		value := r.RandBuff(100,100)
@@ -37,7 +37,7 @@ func TestBFile(t *testing.T) {
 	bFile.Block()
 	bFile, err = OpenBFile(filename,3)
 	NoErrorStop(t,err,"open failed")
-	r = NewFastRandom([32]byte{1,2,3})
+	r = NewFastRandom([]byte{1,2,3})
 	for i:= 0;i<100_000;i++ {
 		key := r.NextHash()
 		value := r.RandBuff(100,100)

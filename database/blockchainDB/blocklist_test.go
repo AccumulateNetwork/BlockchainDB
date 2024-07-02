@@ -28,11 +28,7 @@ func TestOpenBlockFile(t *testing.T) {
 	os.RemoveAll(Directory)
 
 	bf, err := NewBlockList(Directory, 1, 5)
-	assert.NoError(t, err, "failed to create a BlockFile")
-	bf.Close()
-
-	bf, err = NewBlockFile(Directory, 5)
-	assert.NoError(t, err, "failed to create a BlockFile")
+	assert.NoError(t, err, "failed to create a BlockList")
 	bf.Close()
 
 	os.RemoveAll(Directory)
@@ -53,10 +49,10 @@ func TestBlockFileLoad(t *testing.T) {
 
 	fmt.Println("Writing BlockFiles: ")
 
-	bf, err = NewBlockFile(Directory, 5)
+	bf, err = NewBlockList(Directory, 1,3)
 	StopOnError(t, err, "failed to create a BlockFile")
 
-	fr := NewFastRandom([32]byte{1, 2, 3})
+	fr := NewFastRandom([]byte{1, 2, 3})
 	for i := 0; i < 2; i++ { // Create so many Blocks
 		bf.NextBlockFile()
 		fmt.Printf("Writing to BlockFile %d\n",bf.BlockHeight)
@@ -70,7 +66,7 @@ func TestBlockFileLoad(t *testing.T) {
 	bf.Close()
 	bf, err = OpenBlockList(Directory, 3)
 	StopOnError(t, err, "failed to open a BlockList")
-	fr = NewFastRandom([32]byte{1, 2, 3})
+	fr = NewFastRandom([]byte{1, 2, 3})
 	for i := 1; i <= 2; i++ {
 		fmt.Printf("%3d ", i)
 		_, err = bf.OpenBFile(i, 5)

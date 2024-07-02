@@ -111,22 +111,6 @@ func (b *BlockList) NextBlockFile() (err error) {
 	return nil
 }
 
-// NewBlockFile
-// Create a new BlockFile
-func NewBlockFile(Directory string, BufferCnt int) (blockList *BlockList, err error) {
-	blockList = new(BlockList)
-	blockList.Directory = Directory
-	blockList.BufferCnt = BufferCnt
-	blockList.LoadState()
-
-	filename := blockList.GetFilename(blockList.BlockHeight)
-	if blockList.BFile, err = NewBFile(filename, BufferCnt); err != nil {
-		return nil, err
-	}
-
-	return blockList, nil
-}
-
 // OpenBlockList
 // Open an existing BlockList
 func OpenBlockList(Directory string, BufferCnt int) (blockList *BlockList, err error){

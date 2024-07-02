@@ -1,9 +1,9 @@
 package blockchainDB
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 
-	miao "github.com/minio/sha256-simd"
 )
 
 type FastRandom struct {
@@ -25,11 +25,11 @@ func (f *FastRandom) Step() {
 	f.index &= 0xFF
 }
 
-func NewFastRandom(seed [32]byte) *FastRandom {
+func NewFastRandom(seed []byte) *FastRandom {
 	f := new(FastRandom)
-	f.seed = seed
+	f.seed = sha256.Sum256(seed)
 	for i := range f.sponge { // Fill the sponge with parts of hashes of hashes
-		f.seed = miao.Sum256(f.seed[:])
+		f.seed = sha256.Sum256(f.seed[:])
 		f.sponge[i] = binary.BigEndian.Uint64(f.seed[:])
 	}
 	for i:= 0;i<512;i++{

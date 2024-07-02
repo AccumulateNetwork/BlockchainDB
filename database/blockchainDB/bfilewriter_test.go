@@ -28,7 +28,7 @@ func TestBFileWriter(t *testing.T) {
 	os.Mkdir(Directory, os.ModePerm)
 	defer os.RemoveAll(Directory)
 	
-	fw := NewFastRandom([32]byte{2, 3, 4})
+	fw := NewFastRandom([]byte{2, 3, 4})
 	fileSize := uint64(BufferSize * buffersPerFile)
 
 	for i := 0; i < fileCnt; i++ { // How many file to be built
@@ -46,7 +46,7 @@ func TestBFileWriter(t *testing.T) {
 		bfw.Close(b, 0, fileSize)
 	}
 
-	fw = NewFastRandom([32]byte{2, 3, 4})
+	fw = NewFastRandom([]byte{2, 3, 4})
 	var buff [BufferSize]byte
 
 	for i := 0; i < fileCnt; i++ { // How many file to be built

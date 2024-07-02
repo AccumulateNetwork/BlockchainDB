@@ -20,7 +20,7 @@ func TestShard(t *testing.T) {
 	assert.NoError(t, err, err)
 
 	entries := make(map[[32]byte][]byte)
-	fr := NewFastRandom([32]byte{1, 2, 3, 4, 5})
+	fr := NewFastRandom([]byte{1, 2, 3, 4, 5})
 
 	writes :=0
 	reads :=0
