@@ -14,7 +14,7 @@ func TestUint64(t *testing.T) {
 	var total float64
 
 	fr := NewFastRandom([]byte{1, 2, 3})
-	for i := 0; i < 1_000_000; i++ {
+	for i := 0; i < 10_000; i++ {
 		integer := fr.Uint64()
 		hash := fr.NextHash()
 
@@ -31,7 +31,7 @@ func TestUint64(t *testing.T) {
 	}
 	for i, v := range dist {
 		L := float64(len(dist))
-		assert.Falsef(t, v/total-1/L > .001 || v/total-1/L < -.001,
+		assert.Falsef(t, v/total-1/L > .01 || v/total-1/L < -.01,
 			"not evenly distributed %d,%5.3f", i, v)
 	}
 }

@@ -87,7 +87,8 @@ func NewBlockList(Directory string, Partition int, BufferCnt int) (blockFile *Bl
 	bf.Partition = Partition
 	bf.BufferCnt = BufferCnt
 	bf.BlockHeight = 0
-
+	bf.SaveState()
+	
 	return bf, nil
 }
 
