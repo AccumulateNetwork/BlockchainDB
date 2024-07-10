@@ -19,9 +19,9 @@ func TestBFileWriter(t *testing.T) {
 		fileCnt        = 11 // How many files
 	)
 
-	buffPool := make(chan *[BufferSize]byte, bufferCnt) // Make the buffPool
+	buffPool := make(chan *BFBuffer, bufferCnt) // Make the buffPool
 	for i := 0; i < bufferCnt; i++ {
-		buffPool <- new([BufferSize]byte) // Use 5 buffers
+		buffPool <- NewBFBuffer() // Use 5 buffers
 	}
 
 	Directory := filepath.Join(os.TempDir(), "bfwFiles")
@@ -39,7 +39,7 @@ func TestBFileWriter(t *testing.T) {
 		for i := 0; i < buffersPerFile; i++ {
 			b := <-buffPool
 			buff := fw.RandBuff(BufferSize, BufferSize)
-			copy(b[:], buff)
+			copy(b.Buffer[:], buff)
 			bfw.Write(b, BufferSize)
 		}
 		b := <-buffPool

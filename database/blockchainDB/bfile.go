@@ -55,28 +55,18 @@ const (
 	BFileBVN10
 )
 
-// BBuff
-// Block Buff
-// Holds all the persisted transactions and their keys.
-type BBuff struct {
-	Buffer [BufferSize]byte    // Buffer of all the values
-	File   *os.File            // File where the buffer is persisted
-	EOD    int                 // offset to the end of data (for the last Buffer written to the file)
-	Keys   map[[32]byte]DBBKey // Keys and offset to the values the values
-}
-
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
-	File      *os.File               // The file being buffered
-	FileName  string                 // + The file name to open, and optional details to create a filename
-	Keys      map[[32]byte]DBBKey    // The set of keys written to the BFile
-	BuffPool  chan *[BufferSize]byte // Buffer Pool (buffers not in use)
-	Buffer    *[BufferSize]byte      // The current buffer under construction
-	BufferCnt int                    // Number of buffers used by the bfWriter
-	bfWriter  *BFileWriter           // Writes buffers to the File
-	EOD       uint64                 // Offset to the end of Data for the whole file(place to hold it until the file is closed)
-	EOB       int                    // End of the current buffer... Where to put the next data 'write'
+	File      *os.File            // The file being buffered
+	FileName  string              // + The file name to open, and optional details to create a filename
+	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
+	BuffPool  chan *BFBuffer      // Buffer Pool (buffers not in use)
+	Buffer    *BFBuffer           // The current buffer under construction
+	BufferCnt int                 // Number of buffers used by the bfWriter
+	bfWriter  *BFileWriter        // Writes buffers to the File
+	EOD       uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
+	EOB       int                 // End of the current buffer... Where to put the next data 'write'
 }
 
 // Get
@@ -151,9 +141,9 @@ func (b *BFile) Block() {
 // CreateBuffers
 // Create the buffers for a BFile, and set up the BWriter
 func (b *BFile) CreateBuffers() {
-	b.BuffPool = make(chan *[BufferSize]byte, b.BufferCnt) // Create the waiting channel
+	b.BuffPool = make(chan *BFBuffer, b.BufferCnt) // Create the waiting channel
 	for i := 0; i < b.BufferCnt; i++ {
-		b.BuffPool <- new([BufferSize]byte) // Put some buffers in the waiting queue
+		b.BuffPool <- NewBFBuffer() // Put some buffers in the waiting queue
 	}
 	b.bfWriter = NewBFileWriter(b.File, b.BuffPool)
 }
@@ -199,14 +189,14 @@ func (b *BFile) Write(Data []byte) error {
 	// Write to the current buffer
 	dLen := len(Data)
 	if dLen <= space { //               If the current buffer has room, just
-		copy(b.Buffer[b.EOB:], Data) // add to the buffer then return
+		copy(b.Buffer.Buffer[b.EOB:], Data) // add to the buffer then return
 		b.EOB += dLen                // Well, after updating offsets...
 		b.EOD += uint64(dLen)
 		return nil
 	}
 
 	if space > 0 {
-		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
+		copy(b.Buffer.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
 		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
 		b.EOD += uint64(space)
 		Data = Data[space:]

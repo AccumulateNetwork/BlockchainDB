@@ -13,7 +13,7 @@ const (
 
 type cmd struct {
 	op     int
-	buffer *[BufferSize]byte
+	buffer *BFBuffer
 	EOB    int
 	EOD    uint64
 }
@@ -24,8 +24,9 @@ type cmd struct {
 // file before it is closed.
 type BFileWriter struct {
 	File       *os.File
-	BuffPool   chan *[BufferSize]byte
+	BuffPool   chan *BFBuffer
 	Operations chan cmd
+	Cache      *BFBuffer
 }
 
 // process
@@ -36,10 +37,10 @@ func (b *BFileWriter) process() {
 		c := <-b.Operations
 		switch c.op {
 		case opWrite:
-			b.File.Write(c.buffer[:c.EOB])
+			b.File.Write(c.buffer.Buffer[:c.EOB])
 			b.BuffPool <- c.buffer
 		case opClose:
-			b.File.Write(c.buffer[:c.EOB])
+			b.File.Write(c.buffer.Buffer[:c.EOB])
 			if _, err := b.File.Seek(0, io.SeekStart); err != nil { // Seek to start
 				panic(err)
 			}
@@ -58,18 +59,19 @@ func (b *BFileWriter) process() {
 // NewBFileWriter
 // Create a new BFileWriter.  As long as the BFile is open, the BFileWriter will
 // process commands.  Close the BFileWriter to close the BFile
-func NewBFileWriter(file *os.File, buffPool chan *[BufferSize]byte) *BFileWriter {
+func NewBFileWriter(file *os.File, buffPool chan *BFBuffer) *BFileWriter {
 	bfWriter := new(BFileWriter)
 	bfWriter.File = file
 	bfWriter.BuffPool = buffPool
 	bfWriter.Operations = make(chan cmd, 10)
+	bfWriter.Cache = NewBFBuffer()
 	go bfWriter.process()
 	return bfWriter
 }
 
 // Write
 // Write a buffer or part of a buffer to the BFile.
-func (b *BFileWriter) Write(buffer *[BufferSize]byte, EOB int) {
+func (b *BFileWriter) Write(buffer *BFBuffer, EOB int) {
 	b.Operations <- cmd{opWrite, buffer, EOB, 0}
 }
 
@@ -77,7 +79,7 @@ func (b *BFileWriter) Write(buffer *[BufferSize]byte, EOB int) {
 // Writes whatever is in the buffer, updates the offset to EOD, and Closes the BFile
 // Note that if what is in the buffer needs to be reflected in the EOD, the caller has
 // to provide the updated EOD.
-func (b *BFileWriter) Close(buffer *[BufferSize]byte, EOB int, EOD uint64) {
+func (b *BFileWriter) Close(buffer *BFBuffer, EOB int, EOD uint64) {
 	if b.File != nil {
 		b.Operations <- cmd{opClose, buffer, EOB, EOD}
 	}
