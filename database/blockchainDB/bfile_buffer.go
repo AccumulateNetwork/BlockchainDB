@@ -15,15 +15,15 @@ func NewBFBuffer() *BFBuffer {
 	var buffer [BufferSize]byte
 	bfc := new(BFBuffer)
 	bfc.Buffer = &buffer
-	bfc.keyValues = make(map[[32]byte][]byte)
+	bfc.keyValues = map[[32]byte][]byte{}
 	return bfc
 }
 
-// Put
+// Put2Cache
 // We cannot cache key values where the len(values)==0
 // One data structure is used to hold all values in the cache to reduce
 // garbage collection pressure
-func (b *BFBuffer) Put(key [32]byte, value []byte) {
+func (b *BFBuffer) Put2Cache(key [32]byte, value []byte) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 	if len(value) == 0 {
@@ -36,8 +36,9 @@ func (b *BFBuffer) Put(key [32]byte, value []byte) {
 	b.lastValue = b.values[last:len(b.values)]
 }
 
-// Get
-func (b *BFBuffer) Get(key [32]byte) (value []byte) {
+// GetFromCache
+// Returns nil if undefined.
+func (b *BFBuffer) GetFromCache(key [32]byte) (value []byte) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
@@ -50,10 +51,10 @@ func (b *BFBuffer) Get(key [32]byte) (value []byte) {
 	return nil
 }
 
-// Purge
+// PurgeCache
 // Purges the cache of all key value pairs, preserving the last key value pair
 // added to the cache
-func (b *BFBuffer) Purge() {
+func (b *BFBuffer) PurgeCache() {
 	b.mutex.Lock()
 
 	// Get a copy of the last value because we can't be sure
@@ -68,5 +69,5 @@ func (b *BFBuffer) Purge() {
 	}
 	b.mutex.Unlock()
 
-	b.Put(b.lastKey, value) // Put the last Key Value back into the cache
+	b.Put2Cache(b.lastKey, value) // Put the last Key Value back into the cache
 }

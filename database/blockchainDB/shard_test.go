@@ -16,7 +16,7 @@ func TestShard(t *testing.T) {
 	defer os.RemoveAll(directory)
 	filename := filepath.Join(directory, "shard")
 
-	shard, err := NewShard(5, filename)
+	shard, err := NewShard(filename,3)
 	assert.NoError(t, err, err)
 
 	entries := make(map[[32]byte][]byte)

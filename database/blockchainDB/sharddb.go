@@ -50,7 +50,7 @@ func NewShardDB(Directory string, Partition, ShardCnt, BufferCnt int) (SDB *Shar
 			os.RemoveAll(Directory)
 			return nil, err
 		}
-		SDB.Shards[i], err = NewShard(BufferCnt, filepath.Join(sDir, "shard.dat"))
+		SDB.Shards[i], err = NewShard(filepath.Join(sDir, "shard.dat"),BufferCnt)
 		if err != nil {
 			os.RemoveAll(Directory)
 			return nil, err

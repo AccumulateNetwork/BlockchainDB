@@ -30,15 +30,15 @@ func TestShardDB(t *testing.T) {
 		return
 	}
 	r := NewFastRandom([]byte{1, 2, 3, 4})
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 100_000; i++ {
 		key := r.NextHash()
-		value := r.RandBuff(200, 200)
+		value := r.RandBuff(100, 1000)
 		shardDB.Put(key, value)
 	}
 	r = NewFastRandom([]byte{1, 2, 3, 4})
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 100_000; i++ {
 		key := r.NextHash()
-		value := r.RandBuff(200, 200)
+		value := r.RandBuff(100, 1000)
 		v := shardDB.Get(key)
 		assert.Equal(t, value, v, "did not get the same value back")
 	}

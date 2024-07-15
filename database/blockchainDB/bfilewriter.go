@@ -26,7 +26,6 @@ type BFileWriter struct {
 	File       *os.File
 	BuffPool   chan *BFBuffer
 	Operations chan cmd
-	Cache      *BFBuffer
 }
 
 // process
@@ -38,6 +37,7 @@ func (b *BFileWriter) process() {
 		switch c.op {
 		case opWrite:
 			b.File.Write(c.buffer.Buffer[:c.EOB])
+			c.buffer.PurgeCache()
 			b.BuffPool <- c.buffer
 		case opClose:
 			b.File.Write(c.buffer.Buffer[:c.EOB])
@@ -64,7 +64,6 @@ func NewBFileWriter(file *os.File, buffPool chan *BFBuffer) *BFileWriter {
 	bfWriter.File = file
 	bfWriter.BuffPool = buffPool
 	bfWriter.Operations = make(chan cmd, 10)
-	bfWriter.Cache = NewBFBuffer()
 	go bfWriter.process()
 	return bfWriter
 }

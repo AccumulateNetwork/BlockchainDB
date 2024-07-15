@@ -30,7 +30,7 @@ func OpenShard(BufferCnt int, Filename string) (shard *Shard, err error) {
 	shard.BufferCnt = BufferCnt
 	shard.Filename = Filename
 	shard.Cache = make(map[[32]byte][]byte)
-	if shard.BFile, err = OpenBFile(Filename,BufferCnt); err != nil {
+	if shard.BFile, err = OpenBFile(Filename, BufferCnt); err != nil {
 		return nil, err
 	}
 	go shard.process()
@@ -39,7 +39,7 @@ func OpenShard(BufferCnt int, Filename string) (shard *Shard, err error) {
 
 // NewShard
 // Create and open a new Shard
-func NewShard(BufferCnt int, Filename string) (shard *Shard, err error) {
+func NewShard(Filename string, BufferCnt int) (shard *Shard, err error) {
 	shard = new(Shard)
 	shard.BufferCnt = BufferCnt
 	shard.Filename = Filename
@@ -95,7 +95,7 @@ func (s *Shard) Open() (err error) {
 		return
 	}
 	if s.BFile, err = OpenBFile(s.Filename, s.BufferCnt); err != nil {
-		if !os.IsNotExist(err) {  // Can't deal with errors other than does not exist
+		if !os.IsNotExist(err) { // Can't deal with errors other than does not exist
 			return err
 		}
 		if s.BFile, err = NewBFile(s.Filename, s.BufferCnt); err != nil {

@@ -27,7 +27,7 @@ func TestBFileWriter(t *testing.T) {
 	Directory := filepath.Join(os.TempDir(), "bfwFiles")
 	os.Mkdir(Directory, os.ModePerm)
 	defer os.RemoveAll(Directory)
-	
+
 	fw := NewFastRandom([]byte{2, 3, 4})
 	fileSize := uint64(BufferSize * buffersPerFile)
 

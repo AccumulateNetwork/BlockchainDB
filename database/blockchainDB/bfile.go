@@ -62,20 +62,44 @@ type BFile struct {
 	FileName  string              // + The file name to open, and optional details to create a filename
 	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
 	BuffPool  chan *BFBuffer      // Buffer Pool (buffers not in use)
-	Buffer    *BFBuffer           // The current buffer under construction
+	KVCache   *BFBuffer           // The current KVCache under construction
+	KVCaches  []*BFBuffer         // List of KVCaches to support Get while key/values are in flight
 	BufferCnt int                 // Number of buffers used by the bfWriter
 	bfWriter  *BFileWriter        // Writes buffers to the File
 	EOD       uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
 	EOB       int                 // End of the current buffer... Where to put the next data 'write'
 }
 
-// Get
-// Get the value for a given DBKeyFull
-func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
-	dBBKey, ok := b.Keys[Key]
-	if !ok {
-		return nil, fmt.Errorf("key %x not found", Key)
+// CacheGet
+// Return the value for the key if it is in the any of the buffer's BFBuffer
+// Return nil if not found.
+func (b *BFile) CacheGet(Key [32]byte) (value []byte) {
+	for _, b := range b.KVCaches {
+		v := b.GetFromCache(Key)
+		if v != nil {
+			return v
+		}
 	}
+	return nil
+}
+
+// Get
+// Get the value for a given DBKeyFull.  The value returned
+// is free for the user to use (i.e. not part of a buffer used
+// by the BFile)
+func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
+
+	value = b.CacheGet(Key) // If the key value is in the cache, get it
+	if value != nil {       // and done.
+		v := append([]byte{}, value...)
+		return v, nil
+	}
+
+	dBBKey, ok := b.Keys[Key] // Pull the value from disk
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+
 	if _, err = b.File.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -87,7 +111,10 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 // Put
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
-	dbbKey := new(DBBKey)
+
+	b.KVCache.Put2Cache(Key, Value) // Caches the key value so we can Get it
+
+	dbbKey := new(DBBKey) // Save away the Key and offset
 	dbbKey.Offset = b.EOD
 	dbbKey.Length = uint64(len(Value))
 
@@ -123,10 +150,10 @@ func (b *BFile) Close() {
 				panic(err)
 			}
 		}
-		b.Keys = nil                           // Drop the reference to the Keys map
-		b.bfWriter.Close(b.Buffer, b.EOB, eod) // Close that file
-		b.bfWriter = nil                       // kill any reference to the bfWriter
-		b.Buffer = nil                         // Close writes the buffer, and the file is closed. clear the buffer
+		b.Keys = nil                            // Drop the reference to the Keys map
+		b.bfWriter.Close(b.KVCache, b.EOB, eod) // Close that file
+		b.bfWriter = nil                        // kill any reference to the bfWriter
+		b.KVCache = nil                         // Close writes the buffer, and the file is closed. clear the buffer
 	}
 }
 
@@ -143,7 +170,9 @@ func (b *BFile) Block() {
 func (b *BFile) CreateBuffers() {
 	b.BuffPool = make(chan *BFBuffer, b.BufferCnt) // Create the waiting channel
 	for i := 0; i < b.BufferCnt; i++ {
-		b.BuffPool <- NewBFBuffer() // Put some buffers in the waiting queue
+		bfb := NewBFBuffer()
+		b.BuffPool <- bfb // Put some buffers in the waiting queue
+		b.KVCaches = append(b.KVCaches, bfb)
 	}
 	b.bfWriter = NewBFileWriter(b.File, b.BuffPool)
 }
@@ -180,8 +209,8 @@ func (b *BFile) space() int {
 // EOB and EOD are updated as needed.
 func (b *BFile) Write(Data []byte) error {
 
-	if b.Buffer == nil { // Get a buffer if it is needed
-		b.Buffer = <-b.BuffPool
+	if b.KVCache == nil { // Get a buffer if it is needed
+		b.KVCache = <-b.BuffPool
 		b.EOB = 0
 	}
 
@@ -189,24 +218,28 @@ func (b *BFile) Write(Data []byte) error {
 	// Write to the current buffer
 	dLen := len(Data)
 	if dLen <= space { //               If the current buffer has room, just
-		copy(b.Buffer.Buffer[b.EOB:], Data) // add to the buffer then return
-		b.EOB += dLen                // Well, after updating offsets...
+		copy(b.KVCache.Buffer[b.EOB:], Data) // add to the buffer then return
+		b.EOB += dLen                        // Well, after updating offsets...
 		b.EOD += uint64(dLen)
 		return nil
 	}
 
 	if space > 0 {
-		copy(b.Buffer.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
-		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
+		copy(b.KVCache.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
+		b.EOB += space                               // Update b.EOB (should be equal to BufferSize)
 		b.EOD += uint64(space)
 		Data = Data[space:]
 	}
 
 	// Write out the current buffer, get the other buffer, and put the rest of Value there.
-	b.bfWriter.Write(b.Buffer, b.EOB) // Write out this buffer
-	b.Buffer = <-b.BuffPool           // Get the next buffer
-	b.EOB = 0                         // Start at the beginning of the buffer
-	return b.Write(Data)              // Write out the remaining data
+	lastKey := b.KVCache.lastKey            // The next Buffer gets the lastKey
+	lastValue := b.KVCache.lastValue        //  and lastValue of the previous buffer in its cache
+	b.bfWriter.Write(b.KVCache, b.EOB)      // Write out this buffer
+	b.KVCache = <-b.BuffPool                // Get the next buffer
+	b.KVCache.Put2Cache(lastKey, lastValue) // Put the last key/value pair in the next cache too.
+
+	b.EOB = 0            // Start at the beginning of the buffer
+	return b.Write(Data) // Write out the remaining data
 }
 
 // OpenBFile
@@ -260,43 +293,32 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 // Compress
 // Reads the entire BFile into memory then writes it back out again.
 // The BFile is closed.  The new compressed BFile is returned, along with an error
-// If an error is reported, the state of the BFile is undetermined.
+// If an error is reported, the BFile is unchanged.
 func (b *BFile) Compress() (newBFile *BFile, err error) {
 
-	// Get the state of the BFile needed and
-	// Close the BFile (to flush it all to disk)
-	keys := b.Keys         // These are the keys so far
-	EOD := b.EOD           // The length of the values
-	filename := b.FileName // The filename
-
-	b.Close() // Close the BFile to force all its contents to disk
-	b.Block() // Block here to ensure all writes and the close completes
-
-	// Now read the values into a values buffer
-	values := make([]byte, EOD)    // EOD provides the byte length of all values
-	file, err := os.Open(filename) // Open the file
-	if err != nil {
-		return nil, err
-	}
-	if cnt, err := file.Read(values); cnt != int(EOD) || err != nil {
+	keyValues := make(map[[32]byte][]byte)
+	i := 0
+	for k := range b.Keys {
+		value, err := b.Get(k)
+		i++
 		if err != nil {
-			return nil, err
+			return b, err
 		}
-		return nil, fmt.Errorf("read %d bytes, tried to read %d bytes", cnt, EOD)
+		keyValues[k] = value
 	}
 
-	// At this point, the keys have the offsets and lengths to each value
-	// Open a new BFile, and write all the keys and values.  Now
-	// no gaps remain in the BFile for values that have had multiple values
-	// written to them.
+	b.Close()
+	b.Block()
 
-	if b, err = NewBFile(filename, 5); err != nil { // Create a new BFile
-		return nil, err
-	}
-	for k, v := range keys { //                        Write all the key value pairs
-		value := values[v.Offset : v.Offset+v.Length]
-		b.Put(k, value)
+	b2, err := NewBFile(b.FileName, b.BufferCnt)
+	if err != nil {
+		return b, err // This should never happen
 	}
 
-	return b, nil
+	for k, v := range keyValues {
+		b2.Put(k, v)
+	}
+
+	return b2, nil
+
 }
