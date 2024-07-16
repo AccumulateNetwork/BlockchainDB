@@ -1,7 +1,6 @@
 package blockchainDB
 
 import (
-	"io"
 	"os"
 	"sync"
 )
@@ -12,18 +11,15 @@ import (
 type OSFile struct {
 	mutex    sync.Mutex
 	File     *os.File
-	Position int64
 }
 
 // Lock the file, and maintain the position of the file
 func (o *OSFile) Lock() {
 	o.mutex.Lock()
-	o.Position, _ = o.File.Seek(0, io.SeekCurrent)
 }
 
-// Unlock the file, and restore the position of the file
-func (o *OSFile) Unlock() {
-	o.File.Seek(o.Position, io.SeekStart)
+// UnLock the file, and restore the position of the file
+func (o *OSFile) UnLock() {
 	o.mutex.Unlock()
 }
 
@@ -62,4 +58,3 @@ func OpenOSFile(name string, flag int, perm os.FileMode) (*OSFile, error) {
 func (o *OSFile) Close() error {
 	return o.File.Close()
 }
-

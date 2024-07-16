@@ -99,9 +99,9 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 	if !ok {
 		return nil, fmt.Errorf("not found")
 	}
-	
+
 	b.OSFile.Lock()
-	defer b.OSFile.Unlock()
+	defer b.OSFile.UnLock()
 
 	if _, err = b.OSFile.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
 		return nil, err

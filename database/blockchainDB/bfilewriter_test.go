@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -45,7 +44,6 @@ func TestBFileWriter(t *testing.T) {
 		}
 		b := <-buffPool
 		bfw.Close(b, 0, fileSize)
-		time.Sleep(time.Second*1)
 	}
 	
 	fw = NewFastRandom([]byte{2, 3, 4})

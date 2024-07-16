@@ -1,8 +1,10 @@
 package blockchainDB
 
 import (
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -29,17 +31,23 @@ func TestShardDB(t *testing.T) {
 	if err != nil {
 		return
 	}
+	start := time.Now()
+	fmt.Printf("Write %v\n", time.Since(start))
 	r := NewFastRandom([]byte{1, 2, 3, 4})
 	for i := 0; i < 100_000; i++ {
 		key := r.NextHash()
 		value := r.RandBuff(100, 1000)
 		shardDB.Put(key, value)
 	}
-	r = NewFastRandom([]byte{1, 2, 3, 4})
-	for i := 0; i < 100_000; i++ {
-		key := r.NextHash()
-		value := r.RandBuff(100, 1000)
-		v := shardDB.Get(key)
-		assert.Equal(t, value, v, "did not get the same value back")
+	for i := 0; i < 5; i++ {
+		fmt.Printf("Read Pass %d %v\n", i, time.Since(start))
+		r = NewFastRandom([]byte{1, 2, 3, 4})
+		for i := 0; i < 100_000; i++ {
+			key := r.NextHash()
+			value := r.RandBuff(100, 1000)
+			v := shardDB.Get(key)
+			assert.Equal(t, value, v, "did not get the same value back")
+		}
 	}
+	fmt.Printf("Done %v\n", time.Since(start))
 }
