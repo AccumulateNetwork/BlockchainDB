@@ -60,13 +60,13 @@ func TestBFile2(t *testing.T) {
 
 	r := NewFastRandom([]byte{1, 2, 3})
 	
-	for i := 0; i < 59; i++ {
+	for i := 0; i < 1000; i++ {
 		key := r.NextHash()
-		value := r.RandBuff(10000, 10000)
+		value := r.RandBuff(100, 1000)
 		err = bFile.Put(key, value)
 		assert.NoError(t, err, "failed to put")
 	}
-	for i := 0; i < 1; i++ {
+	for i := 0; i < 1000; i++ {
 		kn := 0
 		for k := range bFile.Keys {
 			kn++

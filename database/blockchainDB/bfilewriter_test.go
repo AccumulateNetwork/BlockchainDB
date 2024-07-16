@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -31,9 +32,9 @@ func TestBFileWriter(t *testing.T) {
 	fw := NewFastRandom([]byte{2, 3, 4})
 	fileSize := uint64(BufferSize * buffersPerFile)
 
-	for i := 0; i < fileCnt; i++ { // How many file to be built
+	for i := 0; i < fileCnt; i++ { // How many files to be built
 		filename := filepath.Join(Directory, fmt.Sprintf("file%04d.dat", i))
-		file, err := os.Create(filename)
+		file, err := CreateOSFile(filename)
 		assert.NoError(t, err, "could not create file %s", filename)
 		bfw := NewBFileWriter(file, buffPool)
 		for i := 0; i < buffersPerFile; i++ {
@@ -44,12 +45,13 @@ func TestBFileWriter(t *testing.T) {
 		}
 		b := <-buffPool
 		bfw.Close(b, 0, fileSize)
+		time.Sleep(time.Second*1)
 	}
-
+	
 	fw = NewFastRandom([]byte{2, 3, 4})
 	var buff [BufferSize]byte
 
-	for i := 0; i < fileCnt; i++ { // How many file to be built
+	for i := 0; i < fileCnt; i++ { // How many files to be built
 		filename := filepath.Join(Directory, fmt.Sprintf("file%04d.dat", i))
 		file, err := os.Open(filename)
 		assert.NoError(t, err, "could not create file %s", filename)

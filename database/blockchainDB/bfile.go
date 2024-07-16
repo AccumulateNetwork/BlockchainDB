@@ -58,7 +58,7 @@ const (
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
-	File      *os.File            // The file being buffered
+	OSFile    *OSFile             // The file being buffered
 	FileName  string              // + The file name to open, and optional details to create a filename
 	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
 	BuffPool  chan *BFBuffer      // Buffer Pool (buffers not in use)
@@ -99,12 +99,15 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 	if !ok {
 		return nil, fmt.Errorf("not found")
 	}
+	
+	b.OSFile.Lock()
+	defer b.OSFile.Unlock()
 
-	if _, err = b.File.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
+	if _, err = b.OSFile.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
 		return nil, err
 	}
 	value = make([]byte, dBBKey.Length)
-	_, err = b.File.Read(value)
+	_, err = b.OSFile.Read(value)
 	return value, err
 }
 
@@ -174,7 +177,7 @@ func (b *BFile) CreateBuffers() {
 		b.BuffPool <- bfb // Put some buffers in the waiting queue
 		b.KVCaches = append(b.KVCaches, bfb)
 	}
-	b.bfWriter = NewBFileWriter(b.File, b.BuffPool)
+	b.bfWriter = NewBFileWriter(b.OSFile, b.BuffPool)
 }
 
 // NewBFile
@@ -184,7 +187,7 @@ func NewBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 	bFile.FileName = Filename              //
 	bFile.Keys = make(map[[32]byte]DBBKey) // Allocate the Keys map
 	bFile.BufferCnt = BufferCnt            // How many buffers we are going to use
-	if bFile.File, err = os.Create(Filename); err != nil {
+	if bFile.OSFile, err = CreateOSFile(Filename); err != nil {
 		return nil, err
 	}
 	bFile.CreateBuffers()
@@ -249,16 +252,16 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 	b := new(BFile) // create a new BFile
 	b.BufferCnt = BufferCnt
 	b.CreateBuffers()
-	if b.File, err = os.OpenFile(Filename, os.O_RDWR, os.ModePerm); err != nil {
+	if b.OSFile, err = OpenOSFile(Filename, os.O_RDWR, os.ModePerm); err != nil {
 		return nil, err
 	}
 
 	var offsetB [8]byte
-	if _, err := b.File.Read(offsetB[:]); err != nil {
+	if _, err := b.OSFile.Read(offsetB[:]); err != nil {
 		return nil, fmt.Errorf("%s is not set up as a BFile", Filename)
 	}
 	off := binary.BigEndian.Uint64(offsetB[:])
-	n, err := b.File.Seek(int64(off), io.SeekStart)
+	n, err := b.OSFile.Seek(int64(off), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +271,7 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 
 	// Load all the keys into the map
 	b.Keys = map[[32]byte]DBBKey{}
-	keyList, err := io.ReadAll(b.File)
+	keyList, err := io.ReadAll(b.OSFile)
 	cnt := len(keyList) / 48
 	for i := 0; i < cnt; i++ {
 		dbBKey := new(DBBKey)
@@ -282,7 +285,7 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 
 	// The assumption is that the keys will be over written, and data will be
 	// added beginning at the end of the data section (as was stored at offsetB)
-	if _, err := b.File.Seek(int64(off), io.SeekStart); err != nil {
+	if _, err := b.OSFile.Seek(int64(off), io.SeekStart); err != nil {
 		return nil, err
 	}
 	b.EOD = off

@@ -3,7 +3,6 @@ package blockchainDB
 import (
 	"encoding/binary"
 	"io"
-	"os"
 )
 
 const (
@@ -23,7 +22,7 @@ type cmd struct {
 // It uses a channel to keep the buffers in order, and to finish writing to the
 // file before it is closed.
 type BFileWriter struct {
-	File       *os.File
+	OSFile       *OSFile
 	BuffPool   chan *BFBuffer
 	Operations chan cmd
 }
@@ -36,20 +35,25 @@ func (b *BFileWriter) process() {
 		c := <-b.Operations
 		switch c.op {
 		case opWrite:
-			b.File.Write(c.buffer.Buffer[:c.EOB])
+			b.OSFile.Lock()
+			b.OSFile.Write(c.buffer.Buffer[:c.EOB])
+			b.OSFile.Unlock()
 			c.buffer.PurgeCache()
 			b.BuffPool <- c.buffer
 		case opClose:
-			b.File.Write(c.buffer.Buffer[:c.EOB])
-			if _, err := b.File.Seek(0, io.SeekStart); err != nil { // Seek to start
+			b.OSFile.Lock()
+			defer b.OSFile.Unlock()
+
+			b.OSFile.Write(c.buffer.Buffer[:c.EOB])
+			if _, err := b.OSFile.Seek(0, io.SeekStart); err != nil { // Seek to start
 				panic(err)
 			}
 			var buff [8]byte                                   // Write out the offset to the keys into
 			binary.BigEndian.PutUint64(buff[:], uint64(c.EOD)) // the DBBlock file.
-			if _, err := b.File.Write(buff[:]); err != nil {   //
+			if _, err := b.OSFile.Write(buff[:]); err != nil {   //
 				panic(err)
 			}
-			b.File.Close()
+			b.OSFile.Close()
 			b.BuffPool <- c.buffer
 			return
 		}
@@ -59,9 +63,9 @@ func (b *BFileWriter) process() {
 // NewBFileWriter
 // Create a new BFileWriter.  As long as the BFile is open, the BFileWriter will
 // process commands.  Close the BFileWriter to close the BFile
-func NewBFileWriter(file *os.File, buffPool chan *BFBuffer) *BFileWriter {
+func NewBFileWriter(file *OSFile, buffPool chan *BFBuffer) *BFileWriter {
 	bfWriter := new(BFileWriter)
-	bfWriter.File = file
+	bfWriter.OSFile = file
 	bfWriter.BuffPool = buffPool
 	bfWriter.Operations = make(chan cmd, 10)
 	go bfWriter.process()
@@ -79,7 +83,7 @@ func (b *BFileWriter) Write(buffer *BFBuffer, EOB int) {
 // Note that if what is in the buffer needs to be reflected in the EOD, the caller has
 // to provide the updated EOD.
 func (b *BFileWriter) Close(buffer *BFBuffer, EOB int, EOD uint64) {
-	if b.File != nil {
+	if b.OSFile != nil {
 		b.Operations <- cmd{opClose, buffer, EOB, EOD}
 	}
 }
