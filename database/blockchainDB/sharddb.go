@@ -110,6 +110,10 @@ func (s *ShardDB) GetShard(key [32]byte) *Shard {
 	return s.Shards[i]
 }
 
+// PutH
+// Put an key/value pair where the key is the hash of the value.
+// Any entry that cannot change can be stored more efficiently with
+// PutH 
 func (s *ShardDB) PutH(scratch bool, key [32]byte, value []byte) error {
 	return s.PermBFile.Put(key, value)
 }

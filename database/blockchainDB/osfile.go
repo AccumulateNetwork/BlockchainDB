@@ -9,8 +9,8 @@ import (
 // We have different processes accessing the underlying file.  Access
 // has to be locked and unlocked to prevent stomping on toes.
 type OSFile struct {
-	mutex    sync.Mutex
-	File     *os.File
+	mutex sync.Mutex
+	File  *os.File
 }
 
 // Lock the file, and maintain the position of the file
@@ -35,7 +35,7 @@ func (o *OSFile) Write(b []byte) (n int, err error) {
 	return o.File.Write(b)
 }
 
-func CreateOSFile(Filename string) (osFile *OSFile, err error) {
+func NewOSFile(Filename string) (osFile *OSFile, err error) {
 	if file, err := os.Create(Filename); err == nil {
 		osFile = new(OSFile)
 		osFile.File = file

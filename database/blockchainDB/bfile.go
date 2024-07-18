@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -58,6 +59,7 @@ const (
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
+	Mutex     sync.Mutex          // Locking to allow compression to run
 	OSFile    *OSFile             // The file being buffered
 	FileName  string              // + The file name to open, and optional details to create a filename
 	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
@@ -70,10 +72,11 @@ type BFile struct {
 	EOB       int                 // End of the current buffer... Where to put the next data 'write'
 }
 
-// CacheGet
+// cacheGet
+// Internal use
 // Return the value for the key if it is in the any of the buffer's BFBuffer
 // Return nil if not found.
-func (b *BFile) CacheGet(Key [32]byte) (value []byte) {
+func (b *BFile) cacheGet(Key [32]byte) (value []byte) {
 	for _, b := range b.KVCaches {
 		v := b.GetFromCache(Key)
 		if v != nil {
@@ -88,8 +91,16 @@ func (b *BFile) CacheGet(Key [32]byte) (value []byte) {
 // is free for the user to use (i.e. not part of a buffer used
 // by the BFile)
 func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	return b.get(Key)
+}
+// get 
+// Internal
+// Does a get without messing with locking
+func (b *BFile) get(Key [32]byte) (value []byte, err error) {
 
-	value = b.CacheGet(Key) // If the key value is in the cache, get it
+	value = b.cacheGet(Key) // If the key value is in the cache, get it
 	if value != nil {       // and done.
 		v := append([]byte{}, value...)
 		return v, nil
@@ -114,6 +125,14 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 // Put
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	return b.put(Key,Value)
+}
+// put
+// Internal
+// Does a put without locking
+func (b *BFile) put(Key [32]byte, Value []byte) (err error) {
 
 	b.KVCache.Put2Cache(Key, Value) // Caches the key value so we can Get it
 
@@ -131,6 +150,15 @@ func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
 // the buffers to disk.  If that is needed, then caller needs to call BFile.Block()
 // after the call to BFile.Close()
 func (b *BFile) Close() {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	b.close()
+}
+// close
+// Internal
+// Close without locking
+func (b *BFile) close() {
+
 	if b.bfWriter != nil {
 		eod := b.EOD // Keep the current EOD so we can close the BFile properly with an offset to the keys
 
@@ -163,14 +191,24 @@ func (b *BFile) Close() {
 // Block
 // Block waits until all buffers have been returned to the BufferPool.
 func (b *BFile) Block() {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
+	b.block()
+}
+// block
+// Internal
+// Block without locking
+func (b *BFile) block() {
+
 	for len(b.BuffPool) < b.BufferCnt {
 		time.Sleep(time.Microsecond * 50)
 	}
 }
 
-// CreateBuffers
+// createBuffers
+// Internal
 // Create the buffers for a BFile, and set up the BWriter
-func (b *BFile) CreateBuffers() {
+func (b *BFile) createBuffers() {
 	b.BuffPool = make(chan *BFBuffer, b.BufferCnt) // Create the waiting channel
 	for i := 0; i < b.BufferCnt; i++ {
 		bfb := NewBFBuffer()
@@ -187,10 +225,10 @@ func NewBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 	bFile.FileName = Filename              //
 	bFile.Keys = make(map[[32]byte]DBBKey) // Allocate the Keys map
 	bFile.BufferCnt = BufferCnt            // How many buffers we are going to use
-	if bFile.OSFile, err = CreateOSFile(Filename); err != nil {
+	if bFile.OSFile, err = NewOSFile(Filename); err != nil {
 		return nil, err
 	}
-	bFile.CreateBuffers()
+	bFile.createBuffers()
 
 	var offsetB [8]byte // Offset to end of file (8, the length of the offset)
 	if err := bFile.Write(offsetB[:]); err != nil {
@@ -200,6 +238,7 @@ func NewBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 }
 
 // space
+// Internal
 // Returns the number of bytes to the end of the current buffer
 func (b *BFile) space() int {
 	return BufferSize - b.EOB
@@ -251,7 +290,7 @@ func (b *BFile) Write(Data []byte) error {
 func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 	b := new(BFile) // create a new BFile
 	b.BufferCnt = BufferCnt
-	b.CreateBuffers()
+	b.createBuffers()
 	if b.OSFile, err = OpenOSFile(Filename, os.O_RDWR, os.ModePerm); err != nil {
 		return nil, err
 	}
@@ -298,11 +337,13 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 // The BFile is closed.  The new compressed BFile is returned, along with an error
 // If an error is reported, the BFile is unchanged.
 func (b *BFile) Compress() (newBFile *BFile, err error) {
+	b.Mutex.Lock()
+	defer b.Mutex.Unlock()
 
 	keyValues := make(map[[32]byte][]byte)
 	i := 0
 	for k := range b.Keys {
-		value, err := b.Get(k)
+		value, err := b.get(k)
 		i++
 		if err != nil {
 			return b, err
@@ -310,8 +351,8 @@ func (b *BFile) Compress() (newBFile *BFile, err error) {
 		keyValues[k] = value
 	}
 
-	b.Close()
-	b.Block()
+	b.close()
+	b.block()
 
 	b2, err := NewBFile(b.FileName, b.BufferCnt)
 	if err != nil {
@@ -319,7 +360,7 @@ func (b *BFile) Compress() (newBFile *BFile, err error) {
 	}
 
 	for k, v := range keyValues {
-		b2.Put(k, v)
+		b2.put(k, v)
 	}
 
 	return b2, nil

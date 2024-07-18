@@ -33,7 +33,7 @@ func TestBFileWriter(t *testing.T) {
 
 	for i := 0; i < fileCnt; i++ { // How many files to be built
 		filename := filepath.Join(Directory, fmt.Sprintf("file%04d.dat", i))
-		file, err := CreateOSFile(filename)
+		file, err := NewOSFile(filename)
 		assert.NoError(t, err, "could not create file %s", filename)
 		bfw := NewBFileWriter(file, buffPool)
 		for i := 0; i < buffersPerFile; i++ {
@@ -45,7 +45,7 @@ func TestBFileWriter(t *testing.T) {
 		b := <-buffPool
 		bfw.Close(b, 0, fileSize)
 	}
-	
+
 	fw = NewFastRandom([]byte{2, 3, 4})
 	var buff [BufferSize]byte
 

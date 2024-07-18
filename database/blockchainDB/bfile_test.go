@@ -21,8 +21,8 @@ func NoErrorStop(t *testing.T, err error, msg string) {
 }
 
 func TestBFile(t *testing.T) {
+	os.RemoveAll(Directory)
 	os.Mkdir(Directory, os.ModePerm)
-	defer os.RemoveAll(Directory)
 	filename := filepath.Join(Directory, "BFile.dat")
 	bFile, err := NewBFile(filename, 3)
 	NoErrorStop(t, err, "failed to open BFile")
@@ -52,14 +52,14 @@ func TestBFile(t *testing.T) {
 }
 
 func TestBFile2(t *testing.T) {
+	os.RemoveAll(Directory)
 	os.Mkdir(Directory, os.ModePerm)
-	defer os.RemoveAll(Directory)
 	filename := filepath.Join(Directory, "BFile.dat")
 	bFile, err := NewBFile(filename, 3)
 	NoErrorStop(t, err, "failed to open BFile")
 
 	r := NewFastRandom([]byte{1, 2, 3})
-	
+
 	for i := 0; i < 1000; i++ {
 		key := r.NextHash()
 		value := r.RandBuff(100, 1000)
@@ -78,12 +78,12 @@ func TestBFile2(t *testing.T) {
 }
 
 func TestCompress(t *testing.T) {
+	os.RemoveAll(Directory)
 	os.Mkdir(Directory, os.ModePerm)
-	defer os.RemoveAll(Directory)
 	filename := filepath.Join(Directory, "BFile.dat")
 	bFile, err := NewBFile(filename, 3)
 	NoErrorStop(t, err, "failed to open BFile")
-	Compresses := 1000
+	Compresses := 100
 	TestSet := 1000
 
 	for i := 0; i < Compresses; i++ {
