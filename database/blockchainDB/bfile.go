@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -59,13 +58,12 @@ const (
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
-	Mutex     sync.Mutex          // Locking to allow compression to run
 	OSFile    *OSFile             // The file being buffered
 	FileName  string              // + The file name to open, and optional details to create a filename
 	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
 	BuffPool  chan *BFBuffer      // Buffer Pool (buffers not in use)
-	KVCache   *BFBuffer           // The current KVCache under construction
-	KVCaches  []*BFBuffer         // List of KVCaches to support Get while key/values are in flight
+	Buffer    *BFBuffer           // The current BFBuffer under construction
+	Buffers   []*BFBuffer         // List of BFBuffers to support Get while key/values are in flight
 	BufferCnt int                 // Number of buffers used by the bfWriter
 	bfWriter  *BFileWriter        // Writes buffers to the File
 	EOD       uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
@@ -77,7 +75,7 @@ type BFile struct {
 // Return the value for the key if it is in the any of the buffer's BFBuffer
 // Return nil if not found.
 func (b *BFile) cacheGet(Key [32]byte) (value []byte) {
-	for _, b := range b.KVCaches {
+	for _, b := range b.Buffers {
 		v := b.GetFromCache(Key)
 		if v != nil {
 			return v
@@ -91,15 +89,6 @@ func (b *BFile) cacheGet(Key [32]byte) (value []byte) {
 // is free for the user to use (i.e. not part of a buffer used
 // by the BFile)
 func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
-	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
-	return b.get(Key)
-}
-// get 
-// Internal
-// Does a get without messing with locking
-func (b *BFile) get(Key [32]byte) (value []byte, err error) {
-
 	value = b.cacheGet(Key) // If the key value is in the cache, get it
 	if value != nil {       // and done.
 		v := append([]byte{}, value...)
@@ -125,16 +114,8 @@ func (b *BFile) get(Key [32]byte) (value []byte, err error) {
 // Put
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
-	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
-	return b.put(Key,Value)
-}
-// put
-// Internal
-// Does a put without locking
-func (b *BFile) put(Key [32]byte, Value []byte) (err error) {
 
-	b.KVCache.Put2Cache(Key, Value) // Caches the key value so we can Get it
+	b.Buffer.Put2Cache(Key, Value) // Caches the key value so we can Get it
 
 	dbbKey := new(DBBKey) // Save away the Key and offset
 	dbbKey.Offset = b.EOD
@@ -150,16 +131,16 @@ func (b *BFile) put(Key [32]byte, Value []byte) (err error) {
 // the buffers to disk.  If that is needed, then caller needs to call BFile.Block()
 // after the call to BFile.Close()
 func (b *BFile) Close() {
-	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
 	b.close()
 }
+
 // close
 // Internal
 // Close without locking
 func (b *BFile) close() {
 
 	if b.bfWriter != nil {
+
 		eod := b.EOD // Keep the current EOD so we can close the BFile properly with an offset to the keys
 
 		keys := make([][48]byte, len(b.Keys)) // Collect all the keys into a list to sort them
@@ -169,7 +150,6 @@ func (b *BFile) close() {
 			keys[i] = [48]byte(value) //         Copy each key into a 48 byte entry
 			i++                       //         Get the next key
 		}
-		b.Keys = make(map[[32]byte]DBBKey) //    Once we have the list of keys, we don't need the map anymore
 
 		// Sort all the entries by the keys.  Because no key will be a duplicate, it doesn't matter
 		// that the offset and length are at the end of the 48 byte entry
@@ -181,20 +161,19 @@ func (b *BFile) close() {
 				panic(err)
 			}
 		}
-		b.Keys = nil                            // Drop the reference to the Keys map
-		b.bfWriter.Close(b.KVCache, b.EOB, eod) // Close that file
-		b.bfWriter = nil                        // kill any reference to the bfWriter
-		b.KVCache = nil                         // Close writes the buffer, and the file is closed. clear the buffer
+		b.Keys = nil                           // Drop the reference to the Keys map
+		b.bfWriter.Close(b.Buffer, b.EOB, eod) // Close that file
+		b.bfWriter = nil                       // kill any reference to the bfWriter
+		b.Buffer = nil                         // Close writes the buffer, and the file is closed. clear the buffer
 	}
 }
 
 // Block
 // Block waits until all buffers have been returned to the BufferPool.
 func (b *BFile) Block() {
-	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
 	b.block()
 }
+
 // block
 // Internal
 // Block without locking
@@ -213,7 +192,7 @@ func (b *BFile) createBuffers() {
 	for i := 0; i < b.BufferCnt; i++ {
 		bfb := NewBFBuffer()
 		b.BuffPool <- bfb // Put some buffers in the waiting queue
-		b.KVCaches = append(b.KVCaches, bfb)
+		b.Buffers = append(b.Buffers, bfb)
 	}
 	b.bfWriter = NewBFileWriter(b.OSFile, b.BuffPool)
 }
@@ -251,8 +230,8 @@ func (b *BFile) space() int {
 // EOB and EOD are updated as needed.
 func (b *BFile) Write(Data []byte) error {
 
-	if b.KVCache == nil { // Get a buffer if it is needed
-		b.KVCache = <-b.BuffPool
+	if b.Buffer == nil { // Get a buffer if it is needed
+		b.Buffer = <-b.BuffPool
 		b.EOB = 0
 	}
 
@@ -260,25 +239,25 @@ func (b *BFile) Write(Data []byte) error {
 	// Write to the current buffer
 	dLen := len(Data)
 	if dLen <= space { //               If the current buffer has room, just
-		copy(b.KVCache.Buffer[b.EOB:], Data) // add to the buffer then return
-		b.EOB += dLen                        // Well, after updating offsets...
+		copy(b.Buffer.Buffer[b.EOB:], Data) // add to the buffer then return
+		b.EOB += dLen                       // Well, after updating offsets...
 		b.EOD += uint64(dLen)
 		return nil
 	}
 
 	if space > 0 {
-		copy(b.KVCache.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
-		b.EOB += space                               // Update b.EOB (should be equal to BufferSize)
+		copy(b.Buffer.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
+		b.EOB += space                              // Update b.EOB (should be equal to BufferSize)
 		b.EOD += uint64(space)
 		Data = Data[space:]
 	}
 
 	// Write out the current buffer, get the other buffer, and put the rest of Value there.
-	lastKey := b.KVCache.lastKey            // The next Buffer gets the lastKey
-	lastValue := b.KVCache.lastValue        //  and lastValue of the previous buffer in its cache
-	b.bfWriter.Write(b.KVCache, b.EOB)      // Write out this buffer
-	b.KVCache = <-b.BuffPool                // Get the next buffer
-	b.KVCache.Put2Cache(lastKey, lastValue) // Put the last key/value pair in the next cache too.
+	lastKey := b.Buffer.lastKey            // The next Buffer gets the lastKey
+	lastValue := b.Buffer.lastValue        //  and lastValue of the previous buffer in its cache
+	b.bfWriter.Write(b.Buffer, b.EOB)      // Write out this buffer
+	b.Buffer = <-b.BuffPool                // Get the next buffer
+	b.Buffer.Put2Cache(lastKey, lastValue) // Put the last key/value pair in the next cache too.
 
 	b.EOB = 0            // Start at the beginning of the buffer
 	return b.Write(Data) // Write out the remaining data
@@ -337,14 +316,10 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 // The BFile is closed.  The new compressed BFile is returned, along with an error
 // If an error is reported, the BFile is unchanged.
 func (b *BFile) Compress() (newBFile *BFile, err error) {
-	b.Mutex.Lock()
-	defer b.Mutex.Unlock()
-
 	keyValues := make(map[[32]byte][]byte)
-	i := 0
+
 	for k := range b.Keys {
-		value, err := b.get(k)
-		i++
+		value, err := b.Get(k)
 		if err != nil {
 			return b, err
 		}
@@ -354,13 +329,13 @@ func (b *BFile) Compress() (newBFile *BFile, err error) {
 	b.close()
 	b.block()
 
-	b2, err := NewBFile(b.FileName, b.BufferCnt)
+	b2, err := NewBFile(b.FileName+".tmp", b.BufferCnt)
 	if err != nil {
 		return b, err // This should never happen
 	}
 
 	for k, v := range keyValues {
-		b2.put(k, v)
+		b2.Put(k, v)
 	}
 
 	return b2, nil

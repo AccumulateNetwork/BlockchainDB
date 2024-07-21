@@ -57,7 +57,8 @@ func (f *FastRandom) NextHash() (hash [32]byte) {
 		hash[i] = byte(f.state)
 		f.Step()
 	}
-	return f.seed
+	var a [32]byte = f.seed
+	return a
 }
 
 func (f *FastRandom) NextBool() bool {

@@ -36,6 +36,7 @@ func (b *BFileWriter) process() {
 		switch c.op {
 		case opWrite:
 			b.OSFile.Lock()
+			b.OSFile.Seek(0,io.SeekEnd)
 			b.OSFile.Write(c.buffer.Buffer[:c.EOB])
 			b.OSFile.UnLock()
 			c.buffer.PurgeCache()

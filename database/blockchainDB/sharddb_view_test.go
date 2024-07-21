@@ -2,7 +2,6 @@ package blockchainDB
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -14,9 +13,9 @@ func TestView(t *testing.T) {
 	NumKeys := 1000          // Number of keys used in the test
 	Timeout := time.Second * 1 // The timeout period
 
-	os.RemoveAll(Directory)
-	os.Mkdir(Directory, os.ModePerm)
-	sdbv, err := NewShardDBViews(Directory, Timeout, Partition, 256, 1)
+	Directory, rm := MakeDir()
+	defer rm()
+	sdbv, err := NewShardDBViews(Directory, Timeout, 1, 256, 1)
 	assert.NoError(t, err, "failed to open ShardDBViews")
 
 	// Collect NumKeys number of key/values, and populate the DB
