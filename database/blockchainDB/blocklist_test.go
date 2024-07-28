@@ -6,16 +6,17 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 // Create and close a BlockFile
 func TestCreateBlockFile(t *testing.T) {
-	Directory := filepath.Join(os.TempDir(), "BFTest")
-	os.RemoveAll(Directory)
+	Directory, rm := MakeDir()
+	defer rm()
 
-	bf, err := NewBlockList(Directory, 1, 5)
+	bf, err := NewBlockList(Directory, 1)
 	assert.NoError(t, err, "error creating BlockList")
 	assert.NotNil(t, bf, "failed to create BlockList")
 	bf.Close()
@@ -24,41 +25,64 @@ func TestCreateBlockFile(t *testing.T) {
 }
 
 func TestOpenBlockFile(t *testing.T) {
-	Directory := filepath.Join(os.TempDir(), "BFTest")
+	Directory := filepath.Join(os.TempDir(), "BList")
 	os.RemoveAll(Directory)
+	os.Mkdir(Directory, os.ModePerm)
 
-	bf, err := NewBlockList(Directory, 1, 5)
+	bf, err := NewBlockList(Directory, 1)
 	assert.NoError(t, err, "failed to create a BlockList")
+	assert.NotNil(t, bf, "failed to create BlockList")
+	bf.Close()
+
+	bf, err = OpenBlockList(Directory)
+	assert.NoError(t, err, "failed to create a BlockList")
+	assert.NotNil(t, bf, "failed to create BlockList")
 	bf.Close()
 
 	os.RemoveAll(Directory)
 }
 
-func StopOnError (t *testing.T, err error, msg string){
-	assert.NoError(t,err,msg)
-	if err != nil {panic("error")}
-}
-
 func TestBlockFileLoad(t *testing.T) {
+	const (
+		NumberOfBlocks = 10
+		NumberOfKeyValues = 10_000
+	)
+	
+	
 	fmt.Println("Testing open and close of a BlockList")
-	Directory := filepath.Join(os.TempDir(), "BFTest")
+	Directory := filepath.Join(os.TempDir(), "BTest")
+	BListDir := filepath.Join(Directory, "BList")
 	os.RemoveAll(Directory)
-	bf, err := NewBlockList(Directory, 1, 3)
-	StopOnError(t, err, "Failed to create BlockList")
+	os.Mkdir(Directory, os.ModePerm)
+	os.Mkdir(BListDir, os.ModePerm)
+	defer os.RemoveAll(Directory)
+
+	bf, err := NewBlockList(BListDir, 1)
+	if err != nil {
+		assert.NoError(t, err, "Failed to create BlockList")
+		return
+	}
+
 	bf.Close()
 
 	fmt.Println("Writing BlockFiles: ")
 
-	bf, err = OpenBlockList(Directory, 3)
-	StopOnError(t, err, "failed to create a BlockFile")
+	bf, err = OpenBlockList(BListDir)
+	if err != nil {
+		assert.NoError(t, err, "failed to create a BlockFile")
+		return
+	}
 
 	fr := NewFastRandom([]byte{1, 2, 3})
-	for i := 0; i < 2; i++ { // Create so many Blocks
-		bf.NextBlockFile()
-		fmt.Printf("Writing to BlockFile %d\n",bf.BlockHeight)
-		for i := 0; i < 10; i++ { // Write so many key value pairs
-			bf.Put(fr.NextHash(), fr.RandBuff(100, 300))
+	for i := 0; i < NumberOfBlocks; i++ { // Create so many Blocks
+		fmt.Printf("Writing to BlockFile %d\n", bf.BlockHeight)
+		for i := 0; i < NumberOfKeyValues; i++ { // Write so many key value pairs
+			key := fr.NextHash()
+			value := fr.RandBuff(100,300)
+			bf.Put(key,value)
 		}
+		err = bf.NextBlockFile()
+		assert.NoError(t, err, "NextBlockFile failed")
 	}
 
 	fmt.Printf("\nReading BlockFiles: ")
@@ -67,24 +91,34 @@ func TestBlockFileLoad(t *testing.T) {
 	if true {
 		return
 	}
-	bf, err = OpenBlockList(Directory, 3)
-	StopOnError(t, err, "failed to open a BlockList")
+	bf, err = OpenBlockList(Directory)
+	if err != nil {
+		assert.NoError(t, err, "failed to open a BlockList")
+		return
+	}
+	start:= time.Now()
 	fr = NewFastRandom([]byte{1, 2, 3})
-	for i := 1; i <= 2; i++ {
+	for i := 0; i <= NumberOfBlocks; i++ {
 		fmt.Printf("%3d ", i)
-		_, err = bf.OpenBFile(i, 5)
-		fmt.Printf("Reading from BlockFile %d\n",i)
-		StopOnError(t, err, fmt.Sprintf("failed to open block file %d", i))
-		for j := 0; j < 10; j++ {
+		_, err = bf.OpenBFile(i)
+		fmt.Printf("Reading from BlockFile %d\n", i)
+		if err != nil {
+			assert.NoError(t, err, fmt.Sprintf("failed to open block file %d", i))
+			return
+		}
+		for j := 0; j < NumberOfKeyValues; j++ {
 			hash := fr.NextHash()
 			value := fr.RandBuff(100, 300)
 			v, err := bf.Get(hash)
-			StopOnError(t, err, "failed to get value for key")
-			assert.Equalf(t, value, v, "blk %d pair %d value was not the value expected", j, j)
-			if !bytes.Equal(value,v) {
+			if err != nil || !bytes.Equal(value, v) {
+				assert.NoError(t, err, "failed to get value for key")
+				assert.Equalf(t, value, v, "blk %d pair %d value was not the value expected", j, j)
+				return
+			}
+			if !bytes.Equal(value, v) {
 				panic("error")
 			}
 		}
 	}
-	fmt.Print("\nDone\n")
+	fmt.Printf("\nDone: %v\n",time.Since(start))
 }

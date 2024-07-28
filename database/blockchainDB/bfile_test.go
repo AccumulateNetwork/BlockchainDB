@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -17,13 +18,13 @@ import (
 //
 //	Directory,rm := MakeDir()
 //	defer rm()
-var FR = NewFastRandom([]byte{1, 3, 5, 7, 9, 11})
+var FR = NewFastRandom(nil) // nil uses the computer to pick a seed
 var MDMutex sync.Mutex
 
 func MakeDir() (directory string, delDir func()) {
 	MDMutex.Lock()
 	defer MDMutex.Unlock()
-	name := filepath.Join(os.TempDir(), fmt.Sprintf("Directory%d", FR.UintN(10000)))
+	name := filepath.Join(os.TempDir(), fmt.Sprintf("BlockDB-%d", FR.UintN(1000000)))
 	os.RemoveAll(name)
 	os.Mkdir(name, os.ModePerm)
 	return name, func() { os.RemoveAll(name) }
@@ -40,8 +41,7 @@ func TestBFile(t *testing.T) {
 	Directory, rm := MakeDir()
 	defer rm()
 
-	filename := filepath.Join(Directory, "BFile.dat")
-	bFile, err := NewBFile(filename, 3)
+	bFile, err := NewBFile(Directory, "BFile.dat")
 	NoErrorStop(t, err, "failed to open BFile")
 
 	r := NewFastRandom([]byte{1, 2, 3})
@@ -52,8 +52,7 @@ func TestBFile(t *testing.T) {
 		NoErrorStop(t, err, "failed to put")
 	}
 	bFile.Close()
-	bFile.Block()
-	bFile, err = OpenBFile(filename, 3)
+	bFile, err = OpenBFile(Directory, "BFile.dat")
 	NoErrorStop(t, err, "open failed")
 	r = NewFastRandom([]byte{1, 2, 3})
 	for i := 0; i < 100_000; i++ {
@@ -71,8 +70,7 @@ func TestBFile(t *testing.T) {
 func TestBFile2(t *testing.T) {
 	Directory, rm := MakeDir()
 	defer rm()
-	filename := filepath.Join(Directory, "BFile.dat")
-	bFile, err := NewBFile(filename, 3)
+	bFile, err := NewBFile(Directory, "BFile.dat")
 	NoErrorStop(t, err, "failed to open BFile")
 
 	r := NewFastRandom([]byte{1, 2, 3})
@@ -103,14 +101,13 @@ func TestBFile2(t *testing.T) {
 }
 
 func TestCompress(t *testing.T) {
-	Directory, _:= MakeDir()
-	//defer rm()
-	filename := filepath.Join(Directory, "BFile.dat")
-	bFile, err := NewBFile(filename, 1)
+	Directory, rm := MakeDir()
+	defer rm()
+	bFile, err := NewBFile(Directory, "BFile.dat")
 	NoErrorStop(t, err, "failed to open BFile")
 
 	Compresses := 10
-	TestSet := 10
+	TestSet := 100000
 
 	fr := NewFastRandom([]byte{1, 2, 3})
 
@@ -123,10 +120,18 @@ func TestCompress(t *testing.T) {
 		keyValues[key] = value
 		bFile.Put(key, value)
 	}
-
+	txs := 0
+	start := time.Now()
 	// Compress the BFile so many times
-	for i := 0; i < Compresses; i++ {
-
+	for i := 1; i <= Compresses; i++ {
+		if i%10 == 0 {
+			fmt.Printf("%4d %6.2f tps -- ", i, float64(txs)/time.Since(start).Seconds())
+			if i%100 == 0 {
+				fmt.Println()
+			}
+			txs = 0
+			start = time.Now()
+		}
 		// Compress the bFile
 		bf, err := bFile.Compress()
 		if err != nil {
@@ -148,6 +153,7 @@ func TestCompress(t *testing.T) {
 		// Update some of the values in the bFile
 		for key := range keyValues {
 			if fr.UintN(100) < 20 {
+				txs++
 				value := fr.RandBuff(100, 100)
 				err = bFile.Put(key, value)
 				assert.NoError(t, err, "failed to put")
@@ -156,5 +162,4 @@ func TestCompress(t *testing.T) {
 		}
 
 	}
-	bFile.Close()
 }

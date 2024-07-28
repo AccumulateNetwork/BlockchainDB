@@ -6,82 +6,31 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
-	"time"
 )
 
 // BFile
-// This is a Block buffered file designed to support a write only file
-// where data is only appended to the file.
-//
-// BFile keeps a set of buffers.
-//
-// Each Buffer:
-//    The first 8 bytes points to the end of the data portion of the
-//    the file.
-//
-//    UpdateEndOfData updates the end of data offset
-//
-//    Key entries follow the EndOfData
-//
-//    Data is added to the buffer until it is full.
-//
-//    When the buffer is full, a go routine is created to flush
-//    the buffer is written to disk.
-//
-//    Once the buffer is reset, it is put back into the waiting channel
-//
-// When the BFile is closed, the first 8 bytes are updated to point
-// to the end of the file
-//
+// A Buffered File for a Key/Value database
+// Writes are buffered and cached then written to disk on nice file system boundaries
 
 const (
 	BufferSize = 64 * 1024 * 1 // N MB, i.e. N *(1024^2)
-
-	BFilePerm    = iota // Key/Value pairs where the key is a function of the Value (can't change)
-	BFileDynamic        // Key/Value pair where the value can be updated
-
-	BFileDN = iota // Some partitions. Could do this some other way? Use Strings?
-	BFileBVN0
-	BFileBVN1
-	BFileBVN2
-	BFileBVN3
-	BFileBVN4
-	BFileBVN5
-	BFileBVN6
-	BFileBVN7
-	BFileBVN8
-	BFileBVN9
-	BFileBVN10
 )
 
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
-	OSFile    *OSFile             // The file being buffered
+	File      *os.File            // The file being buffered
+	Directory string              // Where the DB is on disk
 	FileName  string              // + The file name to open, and optional details to create a filename
 	Keys      map[[32]byte]DBBKey // The set of keys written to the BFile
-	BuffPool  chan *BFBuffer      // Buffer Pool (buffers not in use)
-	Buffer    *BFBuffer           // The current BFBuffer under construction
-	Buffers   []*BFBuffer         // List of BFBuffers to support Get while key/values are in flight
-	BufferCnt int                 // Number of buffers used by the bfWriter
-	bfWriter  *BFileWriter        // Writes buffers to the File
+	LastKey   [32]byte            // Last Key written to the BFile
+	LastValue []byte              // Last Value written to the BFile
+	Cache     map[[32]byte][]byte // Cache for key/values that have not yet been written to disk
+	Buffer    [BufferSize]byte    // The current BFBuffer under construction
 	EOD       uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
-	EOB       int                 // End of the current buffer... Where to put the next data 'write'
-}
-
-// cacheGet
-// Internal use
-// Return the value for the key if it is in the any of the buffer's BFBuffer
-// Return nil if not found.
-func (b *BFile) cacheGet(Key [32]byte) (value []byte) {
-	for _, b := range b.Buffers {
-		v := b.GetFromCache(Key)
-		if v != nil {
-			return v
-		}
-	}
-	return nil
+	EOB       int                 // End within the buffer
 }
 
 // Get
@@ -89,9 +38,9 @@ func (b *BFile) cacheGet(Key [32]byte) (value []byte) {
 // is free for the user to use (i.e. not part of a buffer used
 // by the BFile)
 func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
-	value = b.cacheGet(Key) // If the key value is in the cache, get it
-	if value != nil {       // and done.
-		v := append([]byte{}, value...)
+	value, ok := b.Cache[Key] // If the key value is in the cache, get it
+	if ok {                   // and done.
+		v := append([]byte{}, value...) // Return a copy of the value
 		return v, nil
 	}
 
@@ -100,14 +49,11 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 		return nil, fmt.Errorf("not found")
 	}
 
-	b.OSFile.Lock()
-	defer b.OSFile.UnLock()
-
-	if _, err = b.OSFile.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
+	if _, err = b.File.Seek(int64(dBBKey.Offset), io.SeekStart); err != nil {
 		return nil, err
 	}
 	value = make([]byte, dBBKey.Length)
-	_, err = b.OSFile.Read(value)
+	_, err = b.File.Read(value)
 	return value, err
 }
 
@@ -115,7 +61,7 @@ func (b *BFile) Get(Key [32]byte) (value []byte, err error) {
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
 
-	b.Buffer.Put2Cache(Key, Value) // Caches the key value so we can Get it
+	b.Cache[Key] = Value
 
 	dbbKey := new(DBBKey) // Save away the Key and offset
 	dbbKey.Offset = b.EOD
@@ -131,84 +77,52 @@ func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
 // the buffers to disk.  If that is needed, then caller needs to call BFile.Block()
 // after the call to BFile.Close()
 func (b *BFile) Close() {
-	b.close()
-}
 
-// close
-// Internal
-// Close without locking
-func (b *BFile) close() {
+	eod := b.EOD // Keep the current EOD so we can close the BFile properly with an offset to the keys
 
-	if b.bfWriter != nil {
+	keys := make([][DBKeySize]byte, len(b.Keys)) // Collect all the keys into a list to sort them
+	i := 0                                // This ensures that all users get the same DBBlocks
+	for k, v := range b.Keys {            // Since maps randomize order
+		value := v.Bytes(k)              //  Get the value
+		keys[i] = [DBKeySize]byte(value) //  Copy each key into a byte entry
+		i++                              //  Get the next key
+	}
 
-		eod := b.EOD // Keep the current EOD so we can close the BFile properly with an offset to the keys
+	// Sort all the entries by the keys.  Because no key will be a duplicate, it doesn't matter
+	// that the offset and length are at the end of the byte entry
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
-		keys := make([][48]byte, len(b.Keys)) // Collect all the keys into a list to sort them
-		i := 0                                // This ensures that all users get the same DBBlocks
-		for k, v := range b.Keys {            // Since maps randomize order
-			value := v.Bytes(k)       //         Get the value
-			keys[i] = [48]byte(value) //         Copy each key into a 48 byte entry
-			i++                       //         Get the next key
+	for _, k := range keys { // Once keys are sorted, write all the keys to the end of the DBBlock
+		err := b.Write(k[:]) //
+		if err != nil {
+			panic(err)
 		}
-
-		// Sort all the entries by the keys.  Because no key will be a duplicate, it doesn't matter
-		// that the offset and length are at the end of the 48 byte entry
-		sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-
-		for _, k := range keys { // Once keys are sorted, write all the keys to the end of the DBBlock
-			err := b.Write(k[:]) //
-			if err != nil {
-				panic(err)
-			}
-		}
-		b.Keys = nil                           // Drop the reference to the Keys map
-		b.bfWriter.Close(b.Buffer, b.EOB, eod) // Close that file
-		b.bfWriter = nil                       // kill any reference to the bfWriter
-		b.Buffer = nil                         // Close writes the buffer, and the file is closed. clear the buffer
 	}
-}
-
-// Block
-// Block waits until all buffers have been returned to the BufferPool.
-func (b *BFile) Block() {
-	b.block()
-}
-
-// block
-// Internal
-// Block without locking
-func (b *BFile) block() {
-
-	for len(b.BuffPool) < b.BufferCnt {
-		time.Sleep(time.Microsecond * 50)
+	b.Keys = nil // Drop the reference to the Keys map
+	b.File.Write(b.Buffer[:b.EOB])
+	if _, err := b.File.Seek(0, io.SeekStart); err != nil { // Seek to start
+		panic(err)
 	}
-}
-
-// createBuffers
-// Internal
-// Create the buffers for a BFile, and set up the BWriter
-func (b *BFile) createBuffers() {
-	b.BuffPool = make(chan *BFBuffer, b.BufferCnt) // Create the waiting channel
-	for i := 0; i < b.BufferCnt; i++ {
-		bfb := NewBFBuffer()
-		b.BuffPool <- bfb // Put some buffers in the waiting queue
-		b.Buffers = append(b.Buffers, bfb)
+	var buff [8]byte                                 // Write out the offset to the keys into
+	binary.BigEndian.PutUint64(buff[:], uint64(eod)) // the DBBlock file.
+	if _, err := b.File.Write(buff[:]); err != nil { //
+		panic(err)
 	}
-	b.bfWriter = NewBFileWriter(b.OSFile, b.BuffPool)
+	b.File.Close()
+
 }
 
 // NewBFile
 // Creates a new Buffered file.  The caller is responsible for writing the header
-func NewBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
-	bFile = new(BFile)                     // create a new BFile
-	bFile.FileName = Filename              //
-	bFile.Keys = make(map[[32]byte]DBBKey) // Allocate the Keys map
-	bFile.BufferCnt = BufferCnt            // How many buffers we are going to use
-	if bFile.OSFile, err = NewOSFile(Filename); err != nil {
+func NewBFile(Directory string, Filename string) (bFile *BFile, err error) {
+	bFile = new(BFile)                      // create a new BFile
+	bFile.Directory = Directory             // Directory for the BFile
+	bFile.FileName = Filename               //
+	bFile.Cache = make(map[[32]byte][]byte) // Allocate the key/value cache
+	bFile.Keys = make(map[[32]byte]DBBKey)  // Allocate the Keys map
+	if bFile.File, err = os.Create(filepath.Join(Directory, Filename)); err != nil {
 		return nil, err
 	}
-	bFile.createBuffers()
-
 	var offsetB [8]byte // Offset to end of file (8, the length of the offset)
 	if err := bFile.Write(offsetB[:]); err != nil {
 		return nil, err
@@ -216,70 +130,64 @@ func NewBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 	return bFile, nil
 }
 
-// space
-// Internal
-// Returns the number of bytes to the end of the current buffer
-func (b *BFile) space() int {
-	return BufferSize - b.EOB
-}
-
 // Write
 // Writes given Data into the BFile onto the End of the BFile.
 // The data is copied into a buffer.  If the buffer is full, it is flushed
-// to disk.  Left over data goes into the next buffer.
+// to disk.  If more data is involved, add to the next buffer.  Rinse and
+// repeat until all the data is written to disk.
+//
 // EOB and EOD are updated as needed.
 func (b *BFile) Write(Data []byte) error {
 
-	if b.Buffer == nil { // Get a buffer if it is needed
-		b.Buffer = <-b.BuffPool
-		b.EOB = 0
-	}
+	space := BufferSize - b.EOB
 
-	space := b.space()
 	// Write to the current buffer
 	dLen := len(Data)
 	if dLen <= space { //               If the current buffer has room, just
-		copy(b.Buffer.Buffer[b.EOB:], Data) // add to the buffer then return
-		b.EOB += dLen                       // Well, after updating offsets...
+		copy(b.Buffer[b.EOB:], Data) // add to the buffer then return
+		b.EOB += dLen                // Well, after updating offsets...
 		b.EOD += uint64(dLen)
 		return nil
 	}
 
 	if space > 0 {
-		copy(b.Buffer.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
-		b.EOB += space                              // Update b.EOB (should be equal to BufferSize)
+		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
+		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
 		b.EOD += uint64(space)
 		Data = Data[space:]
 	}
 
-	// Write out the current buffer, get the other buffer, and put the rest of Value there.
-	lastKey := b.Buffer.lastKey            // The next Buffer gets the lastKey
-	lastValue := b.Buffer.lastValue        //  and lastValue of the previous buffer in its cache
-	b.bfWriter.Write(b.Buffer, b.EOB)      // Write out this buffer
-	b.Buffer = <-b.BuffPool                // Get the next buffer
-	b.Buffer.Put2Cache(lastKey, lastValue) // Put the last key/value pair in the next cache too.
+	// Write out the current buffer, and put the rest of the Data into the buffer
 
-	b.EOB = 0            // Start at the beginning of the buffer
-	return b.Write(Data) // Write out the remaining data
+	if _, err := b.File.Write(b.Buffer[:b.EOB]); err != nil {
+		return err
+	}
+	b.Cache[b.LastKey] = b.LastValue // Put the last key/value pair in the next cache too.
+	b.EOB = 0                        // Start at the beginning of the buffer
+	if len(Data) > 0 {               // If more data to write, recurse
+		return b.Write(Data) //         Write out the remaining data
+	}
+	return nil
 }
 
 // OpenBFile
 // Open a DBBlock file at a given height for read/write access
 // The only legitimate writes to a BFile would be to add/update keys
-func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
-	b := new(BFile) // create a new BFile
-	b.BufferCnt = BufferCnt
-	b.createBuffers()
-	if b.OSFile, err = OpenOSFile(Filename, os.O_RDWR, os.ModePerm); err != nil {
+func OpenBFile(Directory, Filename string) (bFile *BFile, err error) {
+	filename := filepath.Join(Directory, Filename) // Build the full filename
+	b := new(BFile)                                // create a new BFile
+	if b.File, err = os.OpenFile(filename, os.O_RDWR, os.ModePerm); err != nil {
 		return nil, err
 	}
-
+	b.Directory = Directory
+	b.FileName = filename
+	b.Cache = make(map[[32]byte][]byte)
 	var offsetB [8]byte
-	if _, err := b.OSFile.Read(offsetB[:]); err != nil {
+	if _, err := b.File.Read(offsetB[:]); err != nil {
 		return nil, fmt.Errorf("%s is not set up as a BFile", Filename)
 	}
 	off := binary.BigEndian.Uint64(offsetB[:])
-	n, err := b.OSFile.Seek(int64(off), io.SeekStart)
+	n, err := b.File.Seek(int64(off), io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
@@ -289,8 +197,8 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 
 	// Load all the keys into the map
 	b.Keys = map[[32]byte]DBBKey{}
-	keyList, err := io.ReadAll(b.OSFile)
-	cnt := len(keyList) / 48
+	keyList, err := io.ReadAll(b.File)
+	cnt := len(keyList) / DBKeySize
 	for i := 0; i < cnt; i++ {
 		dbBKey := new(DBBKey)
 		address, err := dbBKey.Unmarshal(keyList)
@@ -298,12 +206,12 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 			return nil, err
 		}
 		b.Keys[address] = *dbBKey
-		keyList = keyList[48:]
+		keyList = keyList[DBKeySize:]
 	}
 
 	// The assumption is that the keys will be over written, and data will be
 	// added beginning at the end of the data section (as was stored at offsetB)
-	if _, err := b.OSFile.Seek(int64(off), io.SeekStart); err != nil {
+	if _, err := b.File.Seek(int64(off), io.SeekStart); err != nil {
 		return nil, err
 	}
 	b.EOD = off
@@ -317,7 +225,6 @@ func OpenBFile(Filename string, BufferCnt int) (bFile *BFile, err error) {
 // If an error is reported, the BFile is unchanged.
 func (b *BFile) Compress() (newBFile *BFile, err error) {
 	keyValues := make(map[[32]byte][]byte)
-
 	for k := range b.Keys {
 		value, err := b.Get(k)
 		if err != nil {
@@ -326,10 +233,9 @@ func (b *BFile) Compress() (newBFile *BFile, err error) {
 		keyValues[k] = value
 	}
 
-	b.close()
-	b.block()
-
-	b2, err := NewBFile(b.FileName+".tmp", b.BufferCnt)
+	b.Close()
+	os.Remove(b.FileName)
+	b2, err := NewBFile(b.Directory, b.FileName)
 	if err != nil {
 		return b, err // This should never happen
 	}

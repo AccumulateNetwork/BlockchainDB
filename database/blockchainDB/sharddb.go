@@ -20,11 +20,10 @@ type ShardDB struct {
 // NewShardDB
 // Creates a ShardDB directory and structures.  Will overwrite an existing
 // file or directory if it exists.
-func NewShardDB(Directory string, Partition, ShardCnt, BufferCnt int) (SDB *ShardDB, err error) {
+func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err error) {
 	os.RemoveAll(Directory)
 
 	SDB = new(ShardDB)
-	SDB.BufferCnt = BufferCnt
 	SDB.Shards = make([]*Shard, ShardCnt)
 	err = os.Mkdir(Directory, os.ModePerm)
 	if err != nil {
@@ -36,21 +35,18 @@ func NewShardDB(Directory string, Partition, ShardCnt, BufferCnt int) (SDB *Shar
 	}
 	defer f.Close()
 
-	f.Write([]byte{byte(ShardCnt >> 8), byte(ShardCnt)}) // Write big endian 16 bit shard cnt
+	var BShardCnt [2]byte// Write big endian 16 bit shard cnt
+	binary.BigEndian.PutUint16(BShardCnt[:],uint16(ShardCnt)) //
+	f.Write(BShardCnt[:]) //
 
-	SDB.PermBFile, err = NewBlockList(filepath.Join(Directory, "PermBFile.dat"), Partition, BufferCnt)
-	if err != nil {
+	PermList := filepath.Join(Directory,"permList")
+	if 	SDB.PermBFile, err = NewBlockList(PermList,1);err != nil {
 		return nil, err
 	}
 
 	for i := 0; i < len(SDB.Shards); i++ {
-		sDir := filepath.Join(Directory, fmt.Sprintf("shard%03d-%03d", Partition, i))
-		err = os.Mkdir(sDir, os.ModePerm)
-		if err != nil {
-			os.RemoveAll(Directory)
-			return nil, err
-		}
-		SDB.Shards[i], err = NewShard(filepath.Join(sDir, "shard.dat"),BufferCnt)
+		ithShard := fmt.Sprintf("shard%03d-%03d", Partition, i)
+		SDB.Shards[i], err = NewShard(Directory, ithShard)
 		if err != nil {
 			os.RemoveAll(Directory)
 			return nil, err
@@ -62,7 +58,7 @@ func NewShardDB(Directory string, Partition, ShardCnt, BufferCnt int) (SDB *Shar
 
 // OpenShardDB
 // Opens an existing ShardDB.
-func OpenShardDB(Directory string, Partition, BufferCnt int) (SDB *ShardDB, err error) {
+func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
 
 	// Get the ShardCnt from the ShardDB state.dat file.
 	var ShardCntBuff [2]byte
@@ -80,15 +76,16 @@ func OpenShardDB(Directory string, Partition, BufferCnt int) (SDB *ShardDB, err 
 	_ = ShardCnt
 	// Open the shards
 	SDB = new(ShardDB)
-	//SDB.PermBFile, err = Open(BufferCnt, filepath.Join(Directory,"PermBFile.dat"))
-	//SDB.Shards = make([]*Shards,ShardCnt)
+	permList := filepath.Join(Directory,"permList")
+	SDB.PermBFile, err = OpenBlockList(permList)
+	SDB.Shards = make([]*Shard,ShardCnt)
 	for i := 0; i < len(SDB.Shards); i++ {
-		sDir := filepath.Join(Directory, fmt.Sprintf("shard%03d-%03d", Partition, i))
-		if SDB.Shards[i], err = OpenShard(BufferCnt, filepath.Join(Directory, sDir, "shard.dat")); err != nil {
+		sDir := fmt.Sprintf("shard%03d-%03d", Partition, i)
+		if SDB.Shards[i], err = OpenShard(Directory, sDir); err != nil {
 			return nil, err
 		}
 	}
-	return nil, nil
+	return SDB, nil
 }
 
 func (s *ShardDB) Close() {

@@ -3,6 +3,7 @@ package blockchainDB
 import (
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -14,23 +15,24 @@ import (
 // Shard
 // Holds the stuff required to access a shard.
 type Shard struct {
-	BufferCnt int                 // Number of buffers to use
-	Filename  string              // The file with the BFile
-	BFile     *BFile              // The BFile
-	Cache     map[[32]byte][]byte // Cache of what is being written to the cache
-	KeyCount  int                 // How many keys in the BFile
-	KeyWrites int                 // How many writes since compression
-	Mutex     sync.Mutex          // Keeps compression from conflict with access
+	Directory  string              // Directory for the shard
+	SDirectory string              // Directory for the Database
+	BFile      *BFile              // The BFile
+	Cache      map[[32]byte][]byte // Cache of what is being written to the cache
+	KeyCount   int                 // How many keys in the BFile
+	KeyWrites  int                 // How many writes since compression
+	Mutex      sync.Mutex          // Keeps compression from conflict with access
 }
 
 // OpenShard
 // Open an existing shard
-func OpenShard(BufferCnt int, Filename string) (shard *Shard, err error) {
+func OpenShard(Directory, SDirectory string) (shard *Shard, err error) {
 	shard = new(Shard)
-	shard.BufferCnt = BufferCnt
-	shard.Filename = Filename
+	shard.Directory = Directory
+	shard.SDirectory = SDirectory
+	sDir := filepath.Join(Directory, SDirectory)
 	shard.Cache = make(map[[32]byte][]byte)
-	if shard.BFile, err = OpenBFile(Filename, BufferCnt); err != nil {
+	if shard.BFile, err = OpenBFile(sDir, "shard.dat"); err != nil {
 		return nil, err
 	}
 	go shard.process()
@@ -39,12 +41,15 @@ func OpenShard(BufferCnt int, Filename string) (shard *Shard, err error) {
 
 // NewShard
 // Create and open a new Shard
-func NewShard(Filename string, BufferCnt int) (shard *Shard, err error) {
+func NewShard(Directory, SDirectory string) (shard *Shard, err error) {
 	shard = new(Shard)
-	shard.BufferCnt = BufferCnt
-	shard.Filename = Filename
+	shard.Directory = Directory
+	shard.SDirectory = SDirectory
+	sDir := filepath.Join(Directory, SDirectory)
+	os.RemoveAll(sDir)
+	os.Mkdir(sDir, os.ModePerm)
 	shard.Cache = make(map[[32]byte][]byte)
-	if shard.BFile, err = NewBFile(Filename, BufferCnt); err != nil {
+	if shard.BFile, err = NewBFile(sDir, "shard.dat"); err != nil {
 		return nil, err
 	}
 	go shard.process()
@@ -55,9 +60,9 @@ func NewShard(Filename string, BufferCnt int) (shard *Shard, err error) {
 // Note that process calls rand.Intn() which isn't randomized without a call to
 // rand.Seed()
 func (s *Shard) process() {
-	for {
-		r := time.Duration(rand.Intn(5))
-		time.Sleep(r*time.Second + 15)
+	for s.BFile != nil { //                 Quit when the Shard is closed
+		r := time.Duration(rand.Intn(5)) // Wait some random amount of time
+		time.Sleep(r*time.Second + 15)   // time being 15 +/- 5 seconds
 		s.compress()
 	}
 }
@@ -94,11 +99,11 @@ func (s *Shard) Open() (err error) {
 	if s.BFile != nil {
 		return
 	}
-	if s.BFile, err = OpenBFile(s.Filename, s.BufferCnt); err != nil {
+	if s.BFile, err = OpenBFile(s.Directory, s.SDirectory); err != nil {
 		if !os.IsNotExist(err) { // Can't deal with errors other than does not exist
 			return err
 		}
-		if s.BFile, err = NewBFile(s.Filename, s.BufferCnt); err != nil {
+		if s.BFile, err = NewBFile(s.Directory, s.SDirectory); err != nil {
 			return err // If file creation fails, return that error
 		}
 	}

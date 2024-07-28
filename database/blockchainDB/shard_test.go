@@ -3,7 +3,6 @@ package blockchainDB
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,12 +10,11 @@ import (
 )
 
 func TestShard(t *testing.T) {
-	directory := filepath.Join(os.TempDir(), "ShardTest")
+	directory,rm := MakeDir()
 	os.Mkdir(directory, os.ModePerm)
-	defer os.RemoveAll(directory)
-	filename := filepath.Join(directory, "shard")
+	defer rm()
 
-	shard, err := NewShard(filename,3)
+	shard, err := NewShard(directory, "shard")
 	assert.NoError(t, err, err)
 
 	entries := make(map[[32]byte][]byte)
@@ -25,7 +23,7 @@ func TestShard(t *testing.T) {
 	writes :=0
 	reads :=0
 	start := time.Now()
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 10000; i++ {
 		if i%100 == 0 && i != 0 {
 			fmt.Printf("Writes: %10d Reads %10d %13.0f/s \n",writes,reads,
 		    float64(writes+reads)/time.Since(start).Seconds())

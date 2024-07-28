@@ -7,8 +7,12 @@ import (
 	"path/filepath"
 )
 
+type DBLocation struct {
+}
+
 type BlockList struct {
-	Directory     string //
+	Directory     string // Directory of the DB
+	KeyLocation   map[[32]byte]*DBLocation
 	BlockHeight   int
 	CurrentHeight int
 	Partition     int
@@ -20,13 +24,14 @@ type BlockList struct {
 // Returns the filename for a block at a given height
 func (b *BlockList) GetFilename(height int) (filename string) {
 	filename = fmt.Sprintf("Block%dPart%d", b.BlockHeight, b.Partition)
-	return filepath.Join(b.Directory, filename)
+	return filename
 }
 
 // SaveState
 // Saves the state of a given BlockList
 func (b *BlockList) SaveState() error {
 	stateName := filepath.Join(b.Directory, "BlockState.dat")
+
 	stateFile, err := os.Create(stateName)
 	if err != nil {
 		return err
@@ -51,6 +56,7 @@ func (b *BlockList) SaveState() error {
 // Loads the state of an existing block list
 func (b *BlockList) LoadState() error {
 	stateName := filepath.Join(b.Directory, "BlockState.dat")
+
 	stateFile, err := os.Open(stateName)
 	if err != nil {
 		return err
@@ -75,20 +81,21 @@ func (b *BlockList) LoadState() error {
 // This is a directory of blocks.  Blocks are created one after another in the directory.
 // The BlockFile is left open, and should be closed when it is complete.  The state of
 // the BlockFile is not updated until the BlockFile is closed.
-func NewBlockList(Directory string, Partition int, BufferCnt int) (blockFile *BlockList, err error) {
-
-	if err = os.Mkdir(Directory, os.ModePerm); err != nil {
-		return nil, nil
+func NewBlockList(Directory string, Partition int) (blockFile *BlockList, err error) {
+	os.RemoveAll(Directory)                                 // Remove any directory there, if there is one
+	if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Create the BlockList Directory
+		return nil, err
 	}
 
 	bf := new(BlockList)
 
 	bf.Directory = Directory
 	bf.Partition = Partition
-	bf.BufferCnt = BufferCnt
-	bf.BlockHeight = 0
+	bf.BlockHeight = 1
 	bf.SaveState()
-	
+	if bf.BFile, err = NewBFile(Directory, bf.GetFilename(bf.BlockHeight)); err != nil {
+		return nil, err
+	}
 	return bf, nil
 }
 
@@ -105,7 +112,7 @@ func (b *BlockList) NextBlockFile() (err error) {
 	b.BlockHeight++
 
 	filename := b.GetFilename(b.BlockHeight)
-	if b.BFile, err = NewBFile(filename, b.BufferCnt); err != nil {
+	if b.BFile, err = NewBFile(b.Directory, filename); err != nil {
 		return err
 	}
 
@@ -114,14 +121,19 @@ func (b *BlockList) NextBlockFile() (err error) {
 
 // OpenBlockList
 // Open an existing BlockList
-func OpenBlockList(Directory string, BufferCnt int) (blockList *BlockList, err error){
+func OpenBlockList(Directory string) (blockList *BlockList, err error) {
 	blockList = new(BlockList)
 	blockList.Directory = Directory
-	blockList.BufferCnt = BufferCnt
+	
 	if err = blockList.LoadState(); err != nil {
 		return nil, err
 	}
-	return blockList, nil
+	filename := blockList.GetFilename(blockList.BlockHeight)
+	if blockList.BFile, err = OpenBFile(blockList.Directory, filename); err != nil {
+		return nil, err
+	}
+
+	return blockList, err
 }
 
 // OpenBFile
@@ -129,13 +141,13 @@ func OpenBlockList(Directory string, BufferCnt int) (blockList *BlockList, err e
 // currently opened, then it is closed.  If the BFile being opened does not
 // exist (has a height > b.BlockHeight) then the provided Height must be
 // b.BlockHeight+1
-func (b *BlockList) OpenBFile(Height int, BufferCnt int) (bFile *BFile, err error) {
+func (b *BlockList) OpenBFile(Height int) (bFile *BFile, err error) {
 	if Height > b.BlockHeight+1 {
 		return nil, fmt.Errorf("height %d is invalid. current BlockList height is: %d",
 			Height, b.BlockHeight)
 	}
 	filename := b.GetFilename(Height)
-	if bFile, err = OpenBFile(filename,BufferCnt); err != nil {
+	if bFile, err = OpenBFile(b.Directory, filename); err != nil {
 		return nil, err
 	}
 	if b.BFile != nil {

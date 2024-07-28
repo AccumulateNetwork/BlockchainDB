@@ -3,6 +3,7 @@ package blockchainDB
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -40,7 +41,7 @@ func TestUint64(t *testing.T) {
 // possible value (0-256) should be evenly distributed, and evenly distributed
 // over every position in the random buffer.
 //
-// Could also test for two, three, four character sequences as well, but 
+// Could also test for two, three, four character sequences as well, but
 // for the purposes of this random number sequencer, these tests are good enough
 func TestRandBuff(t *testing.T) {
 	fr := NewFastRandom([]byte{23, 56, 234, 123, 78, 28})
@@ -81,4 +82,13 @@ func TestRandBuff(t *testing.T) {
 		}
 	}
 
+}
+
+func TestNewFastRandom(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		start := time.Now()
+			fr:= NewFastRandom(nil)
+		t := time.Since(start)
+		fmt.Printf("allocate na: %d mu: %d ms: %d seed: %x \n", t.Nanoseconds(),t.Microseconds(),t.Milliseconds(),fr.seed)
+	}
 }
