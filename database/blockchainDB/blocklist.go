@@ -104,7 +104,9 @@ func NewBlockList(Directory string, Partition int) (blockFile *BlockList, err er
 // Creates the next BFile.
 func (b *BlockList) NextBlockFile() (err error) {
 	if b.BFile != nil {
-		b.BFile.Close()
+		if err = b.BFile.Close(); err != nil {
+			return err
+		}
 		if err = b.SaveState(); err != nil {
 			return err
 		}
@@ -124,7 +126,7 @@ func (b *BlockList) NextBlockFile() (err error) {
 func OpenBlockList(Directory string) (blockList *BlockList, err error) {
 	blockList = new(BlockList)
 	blockList.Directory = Directory
-	
+
 	if err = blockList.LoadState(); err != nil {
 		return nil, err
 	}
@@ -151,7 +153,9 @@ func (b *BlockList) OpenBFile(Height int) (bFile *BFile, err error) {
 		return nil, err
 	}
 	if b.BFile != nil {
-		b.BFile.Close()
+		if err = b.BFile.Close(); err != nil {
+			return nil, err
+		}
 	}
 	b.BFile = bFile
 	return bFile, err
@@ -161,16 +165,18 @@ func (b *BlockList) OpenBFile(Height int) (bFile *BFile, err error) {
 // Closes the BlockFile and the underlying BFile, and updates
 // the BlockFile state.  Note that the rest of the BlockList state
 // is unaltered.
-func (b *BlockList) Close() {
+func (b *BlockList) Close() (err error) {
 	if b.BFile == nil {
 		return
 	}
-	b.BFile.Close()
+	if err = b.BFile.Close(); err != nil {
+		return err
+	}
 	b.BFile = nil
 	if err := b.SaveState(); err != nil {
 		fmt.Printf("%v", err)
 	}
-
+	return nil
 }
 
 // Put

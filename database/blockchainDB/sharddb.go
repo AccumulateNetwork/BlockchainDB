@@ -35,12 +35,12 @@ func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err er
 	}
 	defer f.Close()
 
-	var BShardCnt [2]byte// Write big endian 16 bit shard cnt
-	binary.BigEndian.PutUint16(BShardCnt[:],uint16(ShardCnt)) //
-	f.Write(BShardCnt[:]) //
+	var BShardCnt [2]byte                                      // Write big endian 16 bit shard cnt
+	binary.BigEndian.PutUint16(BShardCnt[:], uint16(ShardCnt)) //
+	f.Write(BShardCnt[:])                                      //
 
-	PermList := filepath.Join(Directory,"permList")
-	if 	SDB.PermBFile, err = NewBlockList(PermList,1);err != nil {
+	PermList := filepath.Join(Directory, "permList")
+	if SDB.PermBFile, err = NewBlockList(PermList, 1); err != nil {
 		return nil, err
 	}
 
@@ -76,9 +76,9 @@ func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
 	_ = ShardCnt
 	// Open the shards
 	SDB = new(ShardDB)
-	permList := filepath.Join(Directory,"permList")
+	permList := filepath.Join(Directory, "permList")
 	SDB.PermBFile, err = OpenBlockList(permList)
-	SDB.Shards = make([]*Shard,ShardCnt)
+	SDB.Shards = make([]*Shard, ShardCnt)
 	for i := 0; i < len(SDB.Shards); i++ {
 		sDir := fmt.Sprintf("shard%03d-%03d", Partition, i)
 		if SDB.Shards[i], err = OpenShard(Directory, sDir); err != nil {
@@ -88,15 +88,20 @@ func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
 	return SDB, nil
 }
 
-func (s *ShardDB) Close() {
+func (s *ShardDB) Close() (err error) {
 	if s.PermBFile != nil {
-		s.PermBFile.Close()
+		if err = s.PermBFile.Close(); err != nil {
+			return err
+		}
 	}
 	for _, shard := range s.Shards {
 		if shard != nil {
-			shard.BFile.Close() // Close everything we have opened
+			if err = shard.BFile.Close(); err != nil { // Close everything we have opened
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // GetShard
@@ -110,7 +115,7 @@ func (s *ShardDB) GetShard(key [32]byte) *Shard {
 // PutH
 // Put an key/value pair where the key is the hash of the value.
 // Any entry that cannot change can be stored more efficiently with
-// PutH 
+// PutH
 func (s *ShardDB) PutH(scratch bool, key [32]byte, value []byte) error {
 	return s.PermBFile.Put(key, value)
 }

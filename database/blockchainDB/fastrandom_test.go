@@ -92,3 +92,15 @@ func TestNewFastRandom(t *testing.T) {
 		fmt.Printf("allocate na: %d mu: %d ms: %d seed: %x \n", t.Nanoseconds(),t.Microseconds(),t.Milliseconds(),fr.seed)
 	}
 }
+
+func TestReset(t *testing.T){
+	fr := NewFastRandom(nil)
+	var hashes [][32]byte
+	for i:= 0; i<1; i++{
+		hashes = append(hashes,fr.NextHash())
+	}
+	fr.Reset()
+	for _,v:= range hashes{
+		assert.Equal(t,v,fr.NextHash(),"Not equal")
+	}
+}

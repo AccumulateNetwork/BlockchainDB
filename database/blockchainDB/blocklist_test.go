@@ -19,8 +19,8 @@ func TestCreateBlockFile(t *testing.T) {
 	bf, err := NewBlockList(Directory, 1)
 	assert.NoError(t, err, "error creating BlockList")
 	assert.NotNil(t, bf, "failed to create BlockList")
-	bf.Close()
-
+	err = bf.Close()
+	assert.NoError(t, err, "close failed")
 	os.RemoveAll(Directory)
 }
 
@@ -32,23 +32,24 @@ func TestOpenBlockFile(t *testing.T) {
 	bf, err := NewBlockList(Directory, 1)
 	assert.NoError(t, err, "failed to create a BlockList")
 	assert.NotNil(t, bf, "failed to create BlockList")
-	bf.Close()
+	err = bf.Close()
+	assert.NoError(t, err, "close failed")
 
 	bf, err = OpenBlockList(Directory)
 	assert.NoError(t, err, "failed to create a BlockList")
 	assert.NotNil(t, bf, "failed to create BlockList")
-	bf.Close()
+	err = bf.Close()
+	assert.NoError(t, err, "close failed")
 
 	os.RemoveAll(Directory)
 }
 
 func TestBlockFileLoad(t *testing.T) {
 	const (
-		NumberOfBlocks = 10
+		NumberOfBlocks    = 10
 		NumberOfKeyValues = 10_000
 	)
-	
-	
+
 	fmt.Println("Testing open and close of a BlockList")
 	Directory := filepath.Join(os.TempDir(), "BTest")
 	BListDir := filepath.Join(Directory, "BList")
@@ -63,7 +64,8 @@ func TestBlockFileLoad(t *testing.T) {
 		return
 	}
 
-	bf.Close()
+	err = bf.Close()
+	assert.NoError(t, err, "close failed")
 
 	fmt.Println("Writing BlockFiles: ")
 
@@ -78,8 +80,8 @@ func TestBlockFileLoad(t *testing.T) {
 		fmt.Printf("Writing to BlockFile %d\n", bf.BlockHeight)
 		for i := 0; i < NumberOfKeyValues; i++ { // Write so many key value pairs
 			key := fr.NextHash()
-			value := fr.RandBuff(100,300)
-			bf.Put(key,value)
+			value := fr.RandBuff(100, 300)
+			bf.Put(key, value)
 		}
 		err = bf.NextBlockFile()
 		assert.NoError(t, err, "NextBlockFile failed")
@@ -87,7 +89,8 @@ func TestBlockFileLoad(t *testing.T) {
 
 	fmt.Printf("\nReading BlockFiles: ")
 
-	bf.Close()
+	err = bf.Close()
+	assert.NoError(t, err, "close failed")
 	if true {
 		return
 	}
@@ -96,7 +99,7 @@ func TestBlockFileLoad(t *testing.T) {
 		assert.NoError(t, err, "failed to open a BlockList")
 		return
 	}
-	start:= time.Now()
+	start := time.Now()
 	fr = NewFastRandom([]byte{1, 2, 3})
 	for i := 0; i <= NumberOfBlocks; i++ {
 		fmt.Printf("%3d ", i)
@@ -120,5 +123,5 @@ func TestBlockFileLoad(t *testing.T) {
 			}
 		}
 	}
-	fmt.Printf("\nDone: %v\n",time.Since(start))
+	fmt.Printf("\nDone: %v\n", time.Since(start))
 }

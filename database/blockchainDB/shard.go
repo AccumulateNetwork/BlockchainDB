@@ -1,11 +1,9 @@
 package blockchainDB
 
 import (
-	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 )
 
 //  Note that this code does not behave properly if compiled prior to 1.20
@@ -35,7 +33,6 @@ func OpenShard(Directory, SDirectory string) (shard *Shard, err error) {
 	if shard.BFile, err = OpenBFile(sDir, "shard.dat"); err != nil {
 		return nil, err
 	}
-	go shard.process()
 	return shard, err
 }
 
@@ -52,42 +49,21 @@ func NewShard(Directory, SDirectory string) (shard *Shard, err error) {
 	if shard.BFile, err = NewBFile(sDir, "shard.dat"); err != nil {
 		return nil, err
 	}
-	go shard.process()
 	return shard, err
-}
-
-// process
-// Note that process calls rand.Intn() which isn't randomized without a call to
-// rand.Seed()
-func (s *Shard) process() {
-	for s.BFile != nil { //                 Quit when the Shard is closed
-		r := time.Duration(rand.Intn(5)) // Wait some random amount of time
-		time.Sleep(r*time.Second + 15)   // time being 15 +/- 5 seconds
-		s.compress()
-	}
-}
-
-func (s *Shard) compress() {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	var err error
-	if s.KeyWrites > 1000 {
-		s.BFile, err = s.BFile.Compress()
-		if err != nil {
-			panic(err)
-		}
-	}
 }
 
 // Close
 // Clean up and close the Shard
-func (s *Shard) Close() {
+func (s *Shard) Close() (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
 	s.Cache = nil
-	s.BFile.Close()
+	if err := s.BFile.Close(); err != nil {
+		return err
+	}
 	s.BFile = nil
+	return nil
 }
 
 // Open

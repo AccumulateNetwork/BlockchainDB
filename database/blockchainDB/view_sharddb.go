@@ -69,10 +69,10 @@ func OpenShardDBViews(
 	return nil, err
 }
 
-func (s *ShardDBViews) Close() {
+func (s *ShardDBViews) Close() error {
 	s.ActiveViews = nil
 	s.Map = nil
-	s.DB.Close()
+	return s.DB.Close()
 }
 
 // Active Views
