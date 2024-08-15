@@ -13,15 +13,20 @@ import (
 func TestAShard(t *testing.T) {
 	Directory, rm := MakeDir()
 	defer rm()
+
+	const NumKeyValues = 1_000_000
+
 	shardDB, err := NewShardDB(Directory, 1, 3)
 	assert.NoError(t, err, "failed to create a shardDB")
 	shard := shardDB.Shards[0]
+	start := time.Now()
 	fr := NewFastRandom([]byte{1, 2, 3})
-	for i := 0; i < 1000000; i++ {
+	for i := 0; i < NumKeyValues; i++ {
 		key := fr.NextHash()
 		value := fr.RandBuff(100, 500)
 		shard.Put(key, value)
 	}
+	fmt.Printf("Number of entries %d  %10.2f t/s\n",NumKeyValues,NumKeyValues/time.Since(start).Seconds())
 	err = shardDB.Close()
 	assert.NoError(t, err, "close failed")
 	_, err = OpenShardDB(Directory, 1)
@@ -30,8 +35,8 @@ func TestAShard(t *testing.T) {
 
 func TestShardDB(t *testing.T) {
 
-	const numWrites = 100_000
-	const EntrySize = 5000
+	const numWrites = 10_000_000
+	const EntrySize = 400
 
 	Directory, rm := MakeDir()
 	defer rm()

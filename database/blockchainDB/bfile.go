@@ -140,48 +140,43 @@ func (b *BFile) Close() error {
 
 	// Write the offset to keys (end of data, i.e. EOD) to disk
 	if _, err := b.File.Seek(0, io.SeekStart); err != nil {
-		panic(err)
+		return err
 	}
 	var buff [8]byte                                            // Write out the offset to the keys into
 	binary.BigEndian.PutUint64(buff[:], uint64(b.OffsetToKeys)) // the DBBlock file.
 	if _, err := b.File.Write(buff[:]); err != nil {            //
-		panic(err) // There is no recovery on this error
+		return err
 	}
 	// Put the file pointer to the offsetToKeys.  Because the following
 	// code writes out all the keys.
 	if _, err := b.File.Seek(int64(b.OffsetToKeys), io.SeekStart); err != nil {
-		panic(err)
+		return err
 	}
 
-	// Encode all the keys into a list of DBBKey; len is keys + NewKeys
-	keys := make([][DBKeySize]byte, len(b.Keys)+len(b.NewKeys))
+	// Create a byte slice to hold all keys
+	keyCount := len(b.Keys) + len(b.NewKeys)
+	keySlice := make([]byte, keyCount*DBKeySize)
+
+	// Encode all the keys into the byte slice
 	i := 0
 	nilKey := [32]byte{}
-	for k, v := range b.Keys {
+	encodeKey := func(k [32]byte, v DBBKey) {
 		if k != nilKey {
-			value := v.Bytes(k)              //  Get the value
-			keys[i] = [DBKeySize]byte(value) //  Copy each key into a byte entry
-			i++                              //  Get the next key
+			copy(keySlice[i:], v.Bytes(k))
+			i += DBKeySize
 		}
+	}
+
+	for k, v := range b.Keys {
+		encodeKey(k, v)
 	}
 	for k, v := range b.NewKeys {
-		if k != nilKey {
-			value := v.Bytes(k)              //  Get the value
-			keys[i] = [DBKeySize]byte(value) //  Copy each key into a byte entry
-			i++                              //  Get the next key
-		}
-
+		encodeKey(k, v)
 	}
 
-	for _, k := range keys[:i] { // Write all the keys to the end of the DBBlock
-		err := b.Write(k[:]) //
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := b.Flush(); err != nil { // Flush the keys to the BFile
-		return err
+	// Write all the keys to the end of the DBBlock in one operation
+	if _, err := b.File.Write(keySlice); err != nil {
+		return fmt.Errorf("failed to write keys: %w", err)
 	}
 
 	// Close the file, and clear all cache like stuff.
@@ -265,7 +260,9 @@ func (b *BFile) Write(Data []byte) (err error) {
 
 	defer func() {
 		if err == nil {
-			err = b.Close()
+			if len(b.NewKeys) > 10000 {
+				err = b.Close()
+			}
 		}
 	}()
 
