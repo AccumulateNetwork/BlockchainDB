@@ -18,6 +18,11 @@ const (
 	BufferSize = 64 * 1024 * 1 // N MB, i.e. N *(1024^2)
 )
 
+type Header struct {
+	EOD uint64
+	Offsets [1024] uint64
+}
+
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type BFile struct {
@@ -30,8 +35,9 @@ type BFile struct {
 	LastValue    []byte              // Last Value written to the BFile
 	Cache        map[[32]byte][]byte // Cache for key/values that have not yet been written to disk
 	Buffer       [BufferSize]byte    // The current BFBuffer under construction
-	OffsetToKeys uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
+	KeysOffset   uint64              // Offset to the end of Data for the whole file(place to hold it until the file is closed)
 	EOB          int                 // End within the buffer
+	Offsets      [1024]uint64        // Offsets to particular keys
 }
 
 // Get
@@ -103,7 +109,7 @@ func (b *BFile) Put(Key [32]byte, Value []byte) (err error) {
 	b.Cache[Key] = Value
 
 	dbbKey := new(DBBKey) // Save away the Key and offset
-	dbbKey.Offset = b.OffsetToKeys
+	dbbKey.Offset = b.KeysOffset
 	dbbKey.Length = uint64(len(Value))
 
 	b.NewKeys[Key] = *dbbKey
@@ -143,13 +149,13 @@ func (b *BFile) Close() error {
 		return err
 	}
 	var buff [8]byte                                            // Write out the offset to the keys into
-	binary.BigEndian.PutUint64(buff[:], uint64(b.OffsetToKeys)) // the DBBlock file.
+	binary.BigEndian.PutUint64(buff[:], uint64(b.KeysOffset)) // the DBBlock file.
 	if _, err := b.File.Write(buff[:]); err != nil {            //
 		return err
 	}
 	// Put the file pointer to the offsetToKeys.  Because the following
 	// code writes out all the keys.
-	if _, err := b.File.Seek(int64(b.OffsetToKeys), io.SeekStart); err != nil {
+	if _, err := b.File.Seek(int64(b.KeysOffset), io.SeekStart); err != nil {
 		return err
 	}
 
@@ -186,7 +192,7 @@ func (b *BFile) Close() error {
 	clear(b.Keys)
 	clear(b.NewKeys)
 	b.LastValue = nil
-	b.OffsetToKeys = 0
+	b.KeysOffset = 0
 	return nil
 }
 
@@ -241,14 +247,14 @@ func (b *BFile) Write(Data []byte) (err error) {
 	if dLen <= space { //               If the current buffer has room, just
 		copy(b.Buffer[b.EOB:], Data) // add to the buffer then return
 		b.EOB += dLen                // Well, after updating offsets...
-		b.OffsetToKeys += uint64(dLen)
+		b.KeysOffset += uint64(dLen)
 		return nil
 	}
 
 	if space > 0 {
 		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
 		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
-		b.OffsetToKeys += uint64(space)
+		b.KeysOffset += uint64(space)
 		Data = Data[space:]
 	}
 
@@ -303,6 +309,7 @@ func (b *BFile) Open() (err error) {
 	if b.File, err = os.OpenFile(filename, os.O_RDWR, os.ModePerm); err != nil {
 		return err
 	}
+	HeaderSize
 	var offsetB [8]byte
 	if _, err := b.File.Read(offsetB[:]); err != nil {
 		return fmt.Errorf("%s is not set up as a BFile", b.Filename)
@@ -336,7 +343,7 @@ func (b *BFile) Open() (err error) {
 		return err
 	}
 
-	b.OffsetToKeys = EOD
+	b.KeysOffset = EOD
 	b.EOB = 0
 	return err
 }

@@ -211,7 +211,7 @@ func Dump(t *testing.T, bf *BFile) {
 		fmt.Printf("               BFile.File open\n")
 	}
 	fmt.Printf("                   Cache %8d\n", len(bf.Cache))
-	fmt.Printf("            OffsetToKeys %8x\n", bf.OffsetToKeys)
+	fmt.Printf("              KeysOffset %8x\n", bf.KeysOffset)
 	fmt.Printf("                    Keys %8x\n", len(bf.Keys))
 	fmt.Printf("                 NewKeys %8x\n", len(bf.NewKeys))
 	fmt.Printf("                     EOB %8x\n", bf.EOB)
