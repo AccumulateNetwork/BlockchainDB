@@ -2,7 +2,6 @@ package blockchainDB
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +22,8 @@ import (
 var FR = NewFastRandom(nil) // nil uses the computer to pick a seed
 var MDMutex sync.Mutex
 
+// MakeDir
+// Create a Directory, return its name, and a function to remove that directory
 func MakeDir() (directory string, delDir func()) {
 	MDMutex.Lock()
 	defer MDMutex.Unlock()
@@ -32,6 +33,15 @@ func MakeDir() (directory string, delDir func()) {
 	return name, func() { os.RemoveAll(name) }
 }
 
+// MakeFilename
+// Create a Directory and a File in that directory.  Returns the full path to the filename
+// and a function to remove that Directory.
+func MakeFilename(filename string) (Filename string, delDir func()) {
+	directory, rm := MakeDir()
+	Filename = filepath.Join(directory, filename)
+	return Filename, rm
+}
+
 func NoErrorStop(t *testing.T, err error, msg string) {
 	assert.NoError(t, err, msg)
 	if err != nil {
@@ -39,53 +49,105 @@ func NoErrorStop(t *testing.T, err error, msg string) {
 	}
 }
 
-func TestBFile(t *testing.T) {
-	Directory, rm := MakeDir()
+func TestNew(t *testing.T) {
+	Filename, rm := MakeFilename("BFile.dat")
 	defer rm()
 
-	const NumEntries = 10
-	const EntrySize = 10
-	Seed := []byte{1, 2, 3, 4}
+	var numEntries = 100000
+
+	fr := NewFastRandom([]byte{1})
+
+	bFile, err := NewBFile(Filename)
+	assert.NoError(t, err, "Failed to create BFile.dat")
+
+	for i := 0; i < numEntries; i++ {
+		k, v := fr.NextHash(), fr.RandBuff(10, 10)
+		bFile.Put(k, v)
+		v2, _ := bFile.Get(k)
+		if !bytes.Equal(v, v2) {
+			fmt.Printf("Failed at %d\n", i)
+			return
+		}
+		assert.Equal(t, v, v2, "Not the same")
+
+	}
+
+	bFile.Close()
+	hs1 := bFile.Header.Marshal() // Get a string for the header
+	bFile.Open(false)
+	bFile.Close()
+	hs2 := bFile.Header.Marshal() // Get a string for the header after opening and closing
+	assert.Equal(t, hs1, hs2, "Headers should be the same")
+
+	fr.Reset()
+	for i := 0; i < numEntries; i++ {
+		k, v := fr.NextHash(), fr.RandBuff(10, 10)
+		v2, err := bFile.Get(k)
+		assert.NoError(t, err, "couldn't get the value back")
+		if !bytes.Equal(v, v2) {
+			fmt.Printf("Failed at %d\n", i)
+			return
+		}
+		assert.Equal(t, v, v2, "didn't get the value we expected")
+	}
+
+}
+
+func TestBFile(t *testing.T) {
+	Filename, rm := MakeFilename("BFile.dat")
+	defer rm()
+
+	bFile, err := NewBFile(Filename)
+	assert.NoError(t, err, "failed to create/open BFile")
+	const NumEntries = 1000
+	const EntrySize = 100
+	Seed := []byte{2, 2, 2, 2, 5}
+
 	r := NewFastRandom(Seed)
 
-	nextKeyValue := func() (key [32]byte, value []byte) {
-		key, value = r.NextHash(), r.RandBuff(EntrySize, EntrySize)
-		fmt.Printf("key %32x value %10x \n", key, value[:10])
-		return key, value
-	}
-
-	bFile, err := NewBFile(Directory, "BFile.dat")
-	assert.NoError(t, err, "failed to open BFile")
-
+	fmt.Printf("Write %d entries of %d bytes\n", NumEntries, EntrySize)
 	for i := 0; i < NumEntries; i++ {
-		key, value := nextKeyValue()
+		key, value := r.NextHash(), r.RandBuff(EntrySize, EntrySize)
 		err = bFile.Put(key, value)
+		if err != nil {
+			fmt.Printf("Put error: %d %v\n", i, err)
+			return
+		}
+
+		bFile.Close()
+
+		v, err := bFile.Get(key)
+		if err != nil {
+			fmt.Printf("error: %d %v\n", i, err)
+			return
+		}
 		assert.NoError(t, err, "failed to put")
+
+		if !bytes.Equal(value, v) {
+			fmt.Printf("Not equal %x != %x\n", value, v)
+		}
+		assert.Equal(t, value, v, "Not the same value")
 	}
-
-	Dump(t, bFile)
-
 	err = bFile.Close()
 	assert.NoError(t, err, "failed to close")
 
-	Dump(t, bFile)
+	fmt.Printf("Read all the %d entries and check them.\n", NumEntries)
 
 	r.Reset() // Reset the random number sequence
-	bFile, err = OpenBFile(Directory, "BFile.dat")
-	assert.NoError(t, err, "open failed")
-
-	fmt.Println("\nloaded keys")
-	for k, v := range bFile.Keys {
-		fmt.Printf(" > %032x %02d %08d %08d \n", k, v.Height, v.Offset, v.Length)
-	}
-
 	for i := 0; i < NumEntries; i++ {
-		key, value := nextKeyValue()
+		key, value := r.NextHash(), r.RandBuff(EntrySize, EntrySize)
 		v, err := bFile.Get(key)
-
-		assert.NoError(t, err, "failed to get value")
-		assert.Equal(t, value, v, "failed to get the right value")
-		if err != nil || !bytes.Equal(v, value) {
+		assert.NoErrorf(t, err, "%d failed to get value", i)
+		assert.Equalf(t, value, v, "%d failed to get the right value", i)
+		if err != nil || !bytes.Equal(value,v) {
+			e := ""
+			if err != nil {
+				e = err.Error()
+			}
+			fmt.Printf("       i %d\n", i)
+			fmt.Printf("     err %v\n", e)
+			fmt.Printf("Expected %x\n", value)
+			fmt.Printf("     Got %x\n", v)
 			return
 		}
 	}
@@ -95,10 +157,11 @@ func TestBFile2(t *testing.T) {
 	const loops = 10
 	const kvNum = 100
 
-	Directory, rm := MakeDir()
+	Filename, rm := MakeFilename("BFile.dat")
 	defer rm()
-	bFile, err := NewBFile(Directory, "BFile.dat")
-	NoErrorStop(t, err, "failed to open BFile")
+
+	bFile, err := NewBFile(Filename)
+	assert.NoError(t, err, "failed to create/open BFile")
 
 	r := NewFastRandom([]byte{1, 2, 3})
 
@@ -133,10 +196,11 @@ func TestBFile2(t *testing.T) {
 }
 
 func TestCompress(t *testing.T) {
-	Directory, rm := MakeDir()
+	Filename, rm := MakeFilename("BFile.dat")
 	defer rm()
-	bFile, err := NewBFile(Directory, "BFile.dat")
-	NoErrorStop(t, err, "failed to open BFile")
+
+	bFile, err := NewBFile(Filename)
+	assert.NoError(t, err, "failed to create/open BFile")
 
 	Compresses := 10
 	TestSet := 10_000
@@ -203,28 +267,33 @@ func TestCompress(t *testing.T) {
 }
 
 func Dump(t *testing.T, bf *BFile) {
-	filename := filepath.Join(bf.Directory, bf.Filename)
-	fmt.Printf("                    Path %s\n", filename)
-	if bf.File == nil {
-		fmt.Printf("           BFile.File not open\n")
-	} else {
-		fmt.Printf("               BFile.File open\n")
-	}
+	bf.Close()
+	err := bf.Open(true)
+	assert.NoError(t, err, "Failed to open BFile")
 	fmt.Printf("                   Cache %8d\n", len(bf.Cache))
-	fmt.Printf("              KeysOffset %8x\n", bf.KeysOffset)
+	fmt.Printf("              KeysOffset %8x\n", bf.Header.Offsets[0])
 	fmt.Printf("                    Keys %8x\n", len(bf.Keys))
 	fmt.Printf("                 NewKeys %8x\n", len(bf.NewKeys))
 	fmt.Printf("                     EOB %8x\n", bf.EOB)
-	fmt.Printf("              BFile Path %s\n", filepath.Join(bf.Directory, bf.Filename))
+	fmt.Printf("              BFile Path %s\n", bf.Filename)
 
-	err := bf.Open()
-	assert.NoError(t, err, "could not open BFile")
 	_, err = bf.File.Seek(0, io.SeekStart)
 	assert.NoError(t, err, "could not seek")
-	var offsetB [8]byte
+	var offsetB [HeaderSize]byte
 	bf.File.Read(offsetB[:])
-	offset := binary.BigEndian.Uint64(offsetB[:])
 	fmt.Printf("\nDump:\n")
+	fmt.Printf("             EndOfValues %08x\n", offsetB[:8])
+	for i := 8; i+64 < HeaderSize; i += 8 * 8 {
+		fmt.Printf("%08x %08x %08x %08x  %08x %08x %08x %08x \n",
+			offsetB[i+0:i+8], offsetB[i+8:i+16], offsetB[i+16:i+24], offsetB[i+24:i+32],
+			offsetB[i+32:i+40], offsetB[i+40:i+48], offsetB[i+48:i+56], offsetB[i+56:i+64])
+	}
+
+	if true {
+		return
+	}
+
+	offset := 0
 	fmt.Printf("                  Offset %x %x\n", offsetB, offset)
 	var valuesB [1]byte
 

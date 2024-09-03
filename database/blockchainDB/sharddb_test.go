@@ -18,7 +18,7 @@ func TestAShard(t *testing.T) {
 
 	shardDB, err := NewShardDB(Directory, 1, 3)
 	assert.NoError(t, err, "failed to create a shardDB")
-	shard := shardDB.Shards[0]
+	shard := shardDB.BFiles[0]
 	start := time.Now()
 	fr := NewFastRandom([]byte{1, 2, 3})
 	for i := 0; i < NumKeyValues; i++ {
@@ -26,7 +26,7 @@ func TestAShard(t *testing.T) {
 		value := fr.RandBuff(100, 500)
 		shard.Put(key, value)
 	}
-	fmt.Printf("Number of entries %d  %10.2f t/s\n",NumKeyValues,NumKeyValues/time.Since(start).Seconds())
+	fmt.Printf("Number of entries %d  %10.2f t/s\n", NumKeyValues, NumKeyValues/time.Since(start).Seconds())
 	err = shardDB.Close()
 	assert.NoError(t, err, "close failed")
 	_, err = OpenShardDB(Directory, 1)

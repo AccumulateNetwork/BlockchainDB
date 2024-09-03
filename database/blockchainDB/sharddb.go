@@ -12,9 +12,9 @@ import (
 // key value pairs even during compression and eventually multi-thread
 // transactions.
 type ShardDB struct {
-	PermBFile *BlockList // The BFile has the directory and file
-	BufferCnt int        // Buffer count used for BFiles
-	Shards    []*Shard   // List of all the Shards
+	State     SState   // Holds any state we keep on the ShardDB
+	BufferCnt int      // Buffer count used for BFiles
+	BFiles    []*BFile // List of all the Shards
 }
 
 // NewShardDB
@@ -24,7 +24,7 @@ func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err er
 	os.RemoveAll(Directory)
 
 	SDB = new(ShardDB)
-	SDB.Shards = make([]*Shard, ShardCnt)
+	SDB.BFiles = make([]*BFile, ShardCnt)
 	err = os.Mkdir(Directory, os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -39,14 +39,9 @@ func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err er
 	binary.BigEndian.PutUint16(BShardCnt[:], uint16(ShardCnt)) //
 	f.Write(BShardCnt[:])                                      //
 
-	PermList := filepath.Join(Directory, "permList")
-	if SDB.PermBFile, err = NewBlockList(PermList, 1); err != nil {
-		return nil, err
-	}
-
-	for i := 0; i < len(SDB.Shards); i++ {
-		ithShard := fmt.Sprintf("shard%03d-%03d", Partition, i)
-		SDB.Shards[i], err = NewShard(Directory, ithShard)
+	for i := 0; i < len(SDB.BFiles); i++ {
+		ithShard := filepath.Join(Directory, fmt.Sprintf("shard%03d-%03d", Partition, i))
+		SDB.BFiles[i], err = NewBFile(ithShard)
 		if err != nil {
 			os.RemoveAll(Directory)
 			return nil, err
@@ -59,29 +54,16 @@ func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err er
 // OpenShardDB
 // Opens an existing ShardDB.
 func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
-
-	// Get the ShardCnt from the ShardDB state.dat file.
-	var ShardCntBuff [2]byte
-	f, e1 := os.Open(filepath.Join(Directory, "state.dat"))
-	_, e2 := f.Read(ShardCntBuff[:])
-	switch {
-	case e1 != nil:
-		return nil, e1
-	case e2 != nil:
-		defer f.Close()
-		return nil, e2
-	}
-	defer f.Close()
-	ShardCnt := int(binary.BigEndian.Uint16(ShardCntBuff[:]))
-	_ = ShardCnt
-	// Open the shards
 	SDB = new(ShardDB)
-	permList := filepath.Join(Directory, "permList")
-	SDB.PermBFile, err = OpenBlockList(permList)
-	SDB.Shards = make([]*Shard, ShardCnt)
-	for i := 0; i < len(SDB.Shards); i++ {
-		sDir := fmt.Sprintf("shard%03d-%03d", Partition, i)
-		if SDB.Shards[i], err = OpenShard(Directory, sDir); err != nil {
+	state, err := NewState(filepath.Join(Directory, "state.dat"))
+	if err != nil {
+		return nil, err
+	}
+	SDB.State = *state
+	SDB.BFiles = make([]*BFile, SDB.State.ShardCnt)
+	for i := 0; i < len(SDB.BFiles); i++ {
+		shard := filepath.Join(Directory, fmt.Sprintf("shard%03d-%03d", Partition, i))
+		if SDB.BFiles[i], err = OpenBFile(shard); err != nil {
 			return nil, err
 		}
 	}
@@ -89,14 +71,9 @@ func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
 }
 
 func (s *ShardDB) Close() (err error) {
-	if s.PermBFile != nil {
-		if err = s.PermBFile.Close(); err != nil {
-			return err
-		}
-	}
-	for _, shard := range s.Shards {
-		if shard != nil {
-			if err = shard.BFile.Close(); err != nil { // Close everything we have opened
+	for _, bFile := range s.BFiles {
+		if bFile != nil {
+			if err = bFile.Close(); err != nil { // Close everything we have opened
 				return err
 			}
 		}
@@ -106,34 +83,23 @@ func (s *ShardDB) Close() (err error) {
 
 // GetShard
 // Get the shard responsible for a given key
-func (s *ShardDB) GetShard(key [32]byte) *Shard {
-	v := int(binary.BigEndian.Uint16(key[:2]))
-	i := v % len(s.Shards)
-	return s.Shards[i]
-}
-
-// PutH
-// Put an key/value pair where the key is the hash of the value.
-// Any entry that cannot change can be stored more efficiently with
-// PutH
-func (s *ShardDB) PutH(scratch bool, key [32]byte, value []byte) error {
-	return s.PermBFile.Put(key, value)
+func (s *ShardDB) GetShard(key [32]byte) *BFile {
+	v := int(binary.BigEndian.Uint16(key[2:4])) // Use the second 2 bytes of an address to
+	i := v % len(s.BFiles)                      // shard the database
+	return s.BFiles[i]
 }
 
 // Put
 // Put a key into the database
 func (s *ShardDB) Put(key [32]byte, value []byte) error {
 	shard := s.GetShard(key)
-	return shard.BFile.Put(key, value)
+	return shard.Put(key, value)
 }
 
 // Get
-// Get a key from the DB
+// Get a key from the DB.  Returns a nil on an error
 func (s *ShardDB) Get(key [32]byte) (value []byte) {
 	shard := s.GetShard(key)
-	v, err := shard.BFile.Get(key)
-	if err != nil && v == nil {
-		v, _ = s.PermBFile.Get(key) // If the err is not nil, v will be, so no need to check err
-	}
+	v, _ := shard.Get(key)
 	return v
 }

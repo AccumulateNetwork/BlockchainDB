@@ -15,10 +15,10 @@ type DBBKey struct {
 
 // Bytes
 // Writes out the address with the offset and length of the DBBKey
-func (d *DBBKey) Bytes(address [32]byte) []byte {
+func (d DBBKey) Bytes(address [32]byte) []byte {
 	var b [50]byte
 	copy(b[:], address[:])
-	binary.BigEndian.PutUint16(b[32:],d.Height)
+	binary.BigEndian.PutUint16(b[32:], d.Height)
 	binary.BigEndian.PutUint64(b[34:], d.Offset)
 	binary.BigEndian.PutUint64(b[42:], d.Length)
 	return b[:]

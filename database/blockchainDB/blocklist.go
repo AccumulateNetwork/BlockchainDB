@@ -93,7 +93,8 @@ func NewBlockList(Directory string, Partition int) (blockFile *BlockList, err er
 	bf.Partition = Partition
 	bf.BlockHeight = 1
 	bf.SaveState()
-	if bf.BFile, err = NewBFile(Directory, bf.GetFilename(bf.BlockHeight)); err != nil {
+	filename := filepath.Join(Directory, bf.GetFilename(bf.BlockHeight))
+	if bf.BFile, err = NewBFile(filename); err != nil {
 		return nil, err
 	}
 	return bf, nil
@@ -113,8 +114,8 @@ func (b *BlockList) NextBlockFile() (err error) {
 	}
 	b.BlockHeight++
 
-	filename := b.GetFilename(b.BlockHeight)
-	if b.BFile, err = NewBFile(b.Directory, filename); err != nil {
+	filename := filepath.Join(b.Directory, b.GetFilename(b.BlockHeight))
+	if b.BFile, err = NewBFile(filename); err != nil {
 		return err
 	}
 
@@ -130,8 +131,8 @@ func OpenBlockList(Directory string) (blockList *BlockList, err error) {
 	if err = blockList.LoadState(); err != nil {
 		return nil, err
 	}
-	filename := blockList.GetFilename(blockList.BlockHeight)
-	if blockList.BFile, err = OpenBFile(blockList.Directory, filename); err != nil {
+	filename := filepath.Join(Directory, blockList.GetFilename(blockList.BlockHeight))
+	if blockList.BFile, err = OpenBFile(filename); err != nil {
 		return nil, err
 	}
 
@@ -148,8 +149,8 @@ func (b *BlockList) OpenBFile(Height int) (bFile *BFile, err error) {
 		return nil, fmt.Errorf("height %d is invalid. current BlockList height is: %d",
 			Height, b.BlockHeight)
 	}
-	filename := b.GetFilename(Height)
-	if bFile, err = OpenBFile(b.Directory, filename); err != nil {
+	filename := filepath.Join(b.Directory, b.GetFilename(Height))
+	if bFile, err = OpenBFile(filename); err != nil {
 		return nil, err
 	}
 	if b.BFile != nil {

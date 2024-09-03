@@ -10,10 +10,10 @@ import (
 	"sort"
 )
 
-// BFile
-// A Buffered File for a Key/Value database
-// Writes are buffered and cached then written to disk on nice file system boundaries
-
+// bFile
+// A basic buffered file that supports keys and values
+const BufferSize = 1024 * 64 // Buffer size for values written to the BFile
+var NilKey [32]byte          // The Nil Key (all zeros)
 
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
