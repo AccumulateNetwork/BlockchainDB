@@ -17,7 +17,7 @@ type BlockList struct {
 	CurrentHeight int
 	Partition     int
 	BufferCnt     int
-	BFile         *BFile
+	BFile         *OldBFile
 }
 
 // GetFilename
@@ -144,7 +144,7 @@ func OpenBlockList(Directory string) (blockList *BlockList, err error) {
 // currently opened, then it is closed.  If the BFile being opened does not
 // exist (has a height > b.BlockHeight) then the provided Height must be
 // b.BlockHeight+1
-func (b *BlockList) OpenBFile(Height int) (bFile *BFile, err error) {
+func (b *BlockList) OpenBFile(Height int) (bFile *OldBFile, err error) {
 	if Height > b.BlockHeight+1 {
 		return nil, fmt.Errorf("height %d is invalid. current BlockList height is: %d",
 			Height, b.BlockHeight)

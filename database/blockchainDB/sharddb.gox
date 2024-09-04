@@ -12,9 +12,9 @@ import (
 // key value pairs even during compression and eventually multi-thread
 // transactions.
 type ShardDB struct {
-	State     SState   // Holds any state we keep on the ShardDB
-	BufferCnt int      // Buffer count used for BFiles
-	BFiles    []*BFile // List of all the Shards
+	State     SState      // Holds any state we keep on the ShardDB
+	BufferCnt int         // Buffer count used for BFiles
+	BFiles    []*OldBFile // List of all the Shards
 }
 
 // NewShardDB
@@ -24,7 +24,7 @@ func NewShardDB(Directory string, Partition, ShardCnt int) (SDB *ShardDB, err er
 	os.RemoveAll(Directory)
 
 	SDB = new(ShardDB)
-	SDB.BFiles = make([]*BFile, ShardCnt)
+	SDB.BFiles = make([]*OldBFile, ShardCnt)
 	err = os.Mkdir(Directory, os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -60,7 +60,7 @@ func OpenShardDB(Directory string, Partition int) (SDB *ShardDB, err error) {
 		return nil, err
 	}
 	SDB.State = *state
-	SDB.BFiles = make([]*BFile, SDB.State.ShardCnt)
+	SDB.BFiles = make([]*OldBFile, SDB.State.ShardCnt)
 	for i := 0; i < len(SDB.BFiles); i++ {
 		shard := filepath.Join(Directory, fmt.Sprintf("shard%03d-%03d", Partition, i))
 		if SDB.BFiles[i], err = OpenBFile(shard); err != nil {
@@ -83,7 +83,7 @@ func (s *ShardDB) Close() (err error) {
 
 // GetShard
 // Get the shard responsible for a given key
-func (s *ShardDB) GetShard(key [32]byte) *BFile {
+func (s *ShardDB) GetShard(key [32]byte) *OldBFile {
 	v := int(binary.BigEndian.Uint16(key[2:4])) // Use the second 2 bytes of an address to
 	i := v % len(s.BFiles)                      // shard the database
 	return s.BFiles[i]

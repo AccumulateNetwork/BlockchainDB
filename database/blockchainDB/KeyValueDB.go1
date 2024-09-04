@@ -1,0 +1,59 @@
+package blockchainDB
+
+// KeyValue files
+
+// Block File
+// Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
+type KeyValue struct {
+	VFile OldBFile // Values go here
+	KFile OldBFile // Keys go here
+}
+
+// Get
+// Return the value for a key
+func (k *KeyValue) Get(Key [32]byte) (value []byte, err error) {
+	dbKey, err := k.KFile.Get(Key)
+	if err != nil {
+		return nil, err
+	}
+	return k.VFile.Get(dbKey)
+}
+
+// Put
+// Put the Key Value into the database files
+func (k *KeyValue) Put(Key [32]byte, Value []byte) (err error) {
+	dbKey := new(DBBKey)
+	if dbKey.Offset, err = k.VFile.Add(Value); err != nil {
+		return err
+	}
+	dbKey.Length = uint64(len(Value))
+	return k.KFile.Add(Key, dbKey)
+
+}
+
+// NewKeyValue
+// Create a new Key Value store.  Note that the filename is a fully
+// qualified filename
+func NewKeyValue(filename string) (keyValue *KeyValue, err error) {
+	kv := new(KeyValue)
+	if kv.VFile, err = NewVFile(filename); err != nil {
+		return nil, err
+	}
+	return NewKFile(filename)
+}
+
+// OpenKeyValue
+// Open an existing Key Value store.
+func OpenKeyValue(filename string) (keyValue *KeyValue, err error) {
+	kv := new(KeyValue)
+	if kv.VFile, err = OpenVFile(filename); err != nil {
+		return nil, err
+	}
+	return OpenKFile(filename)
+}
+
+// Compress
+// Compress the Key Value store on the database
+func (k *KeyValue) Compress() (err error) {
+	return nil // ToDo: Actually implement it...
+}

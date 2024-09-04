@@ -3,10 +3,10 @@ package blockchainDB
 import "encoding/binary"
 
 const NumOffsets = 8
-const HeaderSize = 8+NumOffsets * 8 // Offset to values + 1024 offsets to keys
+const HeaderSize = NumOffsets * 8 // Offset to values + 1024 offsets to keys
 
+// Offset table for all the indexes in the KFile
 type Header struct {
-	EOD     uint64             // End of the values written, where keys begin
 	Offsets [NumOffsets]uint64 //
 }
 
@@ -21,10 +21,9 @@ func (h *Header) Index(key [32]byte) uint16 {
 func (h *Header) Marshal() []byte {
 	buffer := make([]byte, HeaderSize)
 	offset := 0
-	binary.BigEndian.PutUint64(buffer[:],h.EOD)
 	for _, v := range h.Offsets {
-		offset += 8
 		binary.BigEndian.PutUint64(buffer[offset:], v)
+		offset += 8
 	}
 	return buffer[:]
 }
@@ -32,9 +31,8 @@ func (h *Header) Marshal() []byte {
 // Unmarshal
 // Convert bytes to a header
 func (h *Header) Unmarshal(data []byte) {
-	h.EOD = binary.BigEndian.Uint64(data[:])
 	for i := range h.Offsets {
-		h.Offsets[i] = binary.BigEndian.Uint64(data[8+i*8:])
+		h.Offsets[i] = binary.BigEndian.Uint64(data[i*8:])
 	}
 }
 
@@ -42,10 +40,6 @@ func (h *Header) Unmarshal(data []byte) {
 // Create a new Header with all the initial offsets and entries created
 // for an empty BFile
 func NewHeader() Header {
-	h := new(Header)
-	h.EOD = HeaderSize
-	for i := range h.Offsets {
-		h.Offsets[i] = HeaderSize
-	}
-	return *h
+	h := new(Header) // If other fields are added to the header, this
+	return *h        // function is where that will be done.
 }
