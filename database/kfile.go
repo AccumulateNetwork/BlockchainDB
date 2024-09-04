@@ -125,7 +125,7 @@ func (k *KFile) Flush() (err error) {
 // Note that if an error occurs while updating the BFile, the BFile
 // will be trashed.
 func (k *KFile) Close() error {
-	
+
 	k.Flush()
 
 	// Pull in all the keys
@@ -136,7 +136,7 @@ func (k *KFile) Close() error {
 	// Create a slice to hold all unique keys, giving priority to NewKeys
 	allValues := make(map[[32]byte]DBBKey)
 	for ; len(allKeys) > 0; allKeys = allKeys[DBKeySize:] {
-        
+
 	}
 	// Collect all the key values that are not overwritten by b.NewKeys
 	for k, v := range b.Keys {

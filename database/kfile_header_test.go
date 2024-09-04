@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestHeader(t *testing.T){
+func TestHeader(t *testing.T) {
 	//filename, rm := MakeFilename("header.dat")
 	//defer rm()
 
@@ -17,6 +17,6 @@ func TestHeader(t *testing.T){
 	h2.Unmarshal(s1)
 	s2 := h2.Marshal()
 
-	assert.Equal(t,s1,s2,"Should get back what was in the header")
-	
+	assert.Equal(t, s1, s2, "Should get back what was in the header")
+
 }

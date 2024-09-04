@@ -87,20 +87,20 @@ func TestRandBuff(t *testing.T) {
 func TestNewFastRandom(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		start := time.Now()
-			fr:= NewFastRandom(nil)
+		fr := NewFastRandom(nil)
 		t := time.Since(start)
-		fmt.Printf("allocate na: %d mu: %d ms: %d seed: %x \n", t.Nanoseconds(),t.Microseconds(),t.Milliseconds(),fr.seed)
+		fmt.Printf("allocate na: %d mu: %d ms: %d seed: %x \n", t.Nanoseconds(), t.Microseconds(), t.Milliseconds(), fr.seed)
 	}
 }
 
-func TestReset(t *testing.T){
+func TestReset(t *testing.T) {
 	fr := NewFastRandom(nil)
 	var hashes [][32]byte
-	for i:= 0; i<1; i++{
-		hashes = append(hashes,fr.NextHash())
+	for i := 0; i < 1; i++ {
+		hashes = append(hashes, fr.NextHash())
 	}
 	fr.Reset()
-	for _,v:= range hashes{
-		assert.Equal(t,v,fr.NextHash(),"Not equal")
+	for _, v := range hashes {
+		assert.Equal(t, v, fr.NextHash(), "Not equal")
 	}
 }

@@ -20,7 +20,6 @@ type BFile struct {
 	EOB      uint64           // End within the buffer
 }
 
-
 // NewBFile
 // Any extension provided will be ignored in favor of ".dat"
 // A file name such as
@@ -30,7 +29,7 @@ type BFile struct {
 // will result in creating
 //
 //	"/tmp/523423/filename_keys.dat"
-func _NewBFile(filename string) (file *BFile, err error) {
+func NewBFile(filename string) (file *BFile, err error) {
 	file = new(BFile)
 	base := filepath.Base(filename)           // Get the base of the file
 	ext := filepath.Ext(base)                 // Get whatever extension given
@@ -132,9 +131,8 @@ func (b *BFile) Close() (err error) {
 //
 // update -- true if a actual file update occurs
 // err    -- nil on no error, the error if an error occurs
-//
 func (b *BFile) Write(Data []byte) (update bool, err error) {
-    
+
 	b.Open()
 
 	space := uint64(BufferSize - b.EOB)
@@ -161,7 +159,7 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 		}
 	}
 
-	if _, err := b.File.Seek(0,io.SeekEnd); err != nil {
+	if _, err := b.File.Seek(0, io.SeekEnd); err != nil {
 		return false, err
 	}
 

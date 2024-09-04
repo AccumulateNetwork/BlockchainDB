@@ -10,7 +10,7 @@ import (
 
 func TestView(t *testing.T) {
 
-	NumKeys := 1000          // Number of keys used in the test
+	NumKeys := 1000            // Number of keys used in the test
 	Timeout := time.Second * 1 // The timeout period
 
 	Directory, rm := MakeDir()
@@ -95,5 +95,3 @@ func TestView(t *testing.T) {
 	assert.True(t, len(sdbv.ActiveViews) == 0, "nothing should be in ActiveViews")
 
 }
-
-
