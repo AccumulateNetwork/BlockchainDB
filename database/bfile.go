@@ -3,8 +3,6 @@ package blockchainDB
 import (
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 )
 
 // Buffered File
@@ -21,31 +19,19 @@ type BFile struct {
 }
 
 // NewBFile
-// Any extension provided will be ignored in favor of ".dat"
-// A file name such as
-//
-//	"/tmp/523423/filename.txt"
-//
-// will result in creating
-//
-//	"/tmp/523423/filename_keys.dat"
+// Create a new BFile.  An existing one will be overwritten
 func NewBFile(filename string) (file *BFile, err error) {
 	file = new(BFile)
-	base := filepath.Base(filename)           // Get the base of the file
-	ext := filepath.Ext(base)                 // Get whatever extension given
-	baseName := strings.TrimSuffix(base, ext) // update name, add ".dat"
-	file.Filename = baseName + "_keys.dat"    // Set the Filename
+	file.Filename = filename
 	file.File, err = os.Create(file.Filename) // Create the file
 	return file, err                          //
 }
 
 // OpenBFile
+// Open an existing BFile.  Error if none exists.
 func OpenBFile(filename string) (file *BFile, err error) {
-	file = new(BFile)
-	base := filepath.Base(filename)           // Get the base of the file
-	ext := filepath.Ext(base)                 // Get whatever extension given
-	baseName := strings.TrimSuffix(base, ext) // update name, add ".dat"
-	file.Filename = baseName + "_keys.dat"    // Set the Filename
+	file = new(BFile)                         //
+	file.Filename = filename                  // Set the Filename
 	file.File, err = os.Create(file.Filename) // Create the file
 	return file, err                          //
 }
@@ -68,41 +54,6 @@ func (b *BFile) Open() (err error) {
 	return nil
 }
 
-// WriteAt
-// Seek to the offset from start and write data ito the BFile
-func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
-	if err = b.Open(); err != nil {
-		return err
-	}
-
-	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-
-	if _, err = b.File.Write(data); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ReadAt
-// Seek to the offset from start and read into the given data buffer
-func (b *BFile) ReadAt(offset int64, data []byte) (err error) {
-	if err = b.Open(); err != nil {
-		return err
-	}
-
-	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-
-	if _, err = b.File.Read(data); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // Flush
 // Write out the buffer, and reset the EOB
 func (b *BFile) Flush() (err error) {
@@ -120,7 +71,7 @@ func (b *BFile) Close() (err error) {
 	if err = b.Flush(); err != nil {
 		return err
 	}
-	if err = b.Close(); err != nil {
+	if err = b.File.Close(); err != nil {
 		return err
 	}
 	return nil
@@ -167,9 +118,46 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 		return false, err
 	}
 
-	b.EOB = 0          //       Start at the beginning of the buffer
-	if len(Data) > 0 { //       If more data to write, recurse
-		return b.Write(Data) // Write out the remaining data
+	b.EOB = 0          //         Start at the beginning of the buffer
+	if len(Data) > 0 { //         If more data to write, recurse
+		_, err = b.Write(Data) // Write out the remaining data
+		return err == nil, err // Return false if we get an error, true if not
 	}
-	return true, nil
+	return true, nil //           Everything worked out
+}
+
+// WriteAt
+// This is an unbuffered write; Does not involve the buffered writing
+// Seek to the offset from start and write data ito the BFile
+func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
+	if err = b.Open(); err != nil {
+		return err
+	}
+
+	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	if _, err = b.File.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadAt
+// Seek to the offset from start and read into the given data buffer
+func (b *BFile) ReadAt(offset int64, data []byte) (err error) {
+	if err = b.Open(); err != nil {
+		return err
+	}
+
+	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	if _, err = b.File.Read(data); err != nil {
+		return err
+	}
+
+	return nil
 }

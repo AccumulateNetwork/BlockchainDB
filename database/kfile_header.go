@@ -3,11 +3,12 @@ package blockchainDB
 import "encoding/binary"
 
 const NumOffsets = 8
-const HeaderSize = NumOffsets * 8 // Offset to values + 1024 offsets to keys
+const HeaderSize = NumOffsets*8 + 8 // Offset to key sections plus an end of keys value
 
 // Offset table for all the indexes in the KFile
 type Header struct {
-	Offsets [NumOffsets]uint64 //
+	Offsets   [NumOffsets]uint64 // List of offsets
+	EndOfList uint64             // Always zero
 }
 
 // Index
@@ -25,6 +26,7 @@ func (h *Header) Marshal() []byte {
 		binary.BigEndian.PutUint64(buffer[offset:], v)
 		offset += 8
 	}
+	binary.BigEndian.PutUint64(buffer[offset:], 0) // EndOfList
 	return buffer[:]
 }
 
@@ -32,7 +34,11 @@ func (h *Header) Marshal() []byte {
 // Convert bytes to a header
 func (h *Header) Unmarshal(data []byte) {
 	for i := range h.Offsets {
-		h.Offsets[i] = binary.BigEndian.Uint64(data[i*8:])
+		if v := binary.BigEndian.Uint64(data[i*8:]); v == 0 {
+			break
+		} else {
+			h.Offsets[i] = v
+		}
 	}
 }
 
