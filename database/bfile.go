@@ -8,6 +8,7 @@ import (
 // Buffered File
 
 const BufferSize = 1024 * 64 // Buffer size for values written to the BFile
+var nilKey [32]byte
 
 // Block BFile
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
