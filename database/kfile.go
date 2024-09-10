@@ -68,9 +68,6 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return value, nil
 	}
 
-	k.Close() // Make sure the file has all its keys/offsets in order
-	k.Open()  // Open the KFile
-
 	// The header reflects what is on disk.  Points keys to the section where it is.
 	index := k.Index(Key[:])
 	var start, end uint64                 // The header gives us offsets to key sections
@@ -163,7 +160,11 @@ func (k *KFile) Close() error {
 	if err != nil {
 		return err
 	}
-	if len(keyEntriesBytes) > 0 {
+	numKeys := len(keyEntriesBytes) / DBKeySize
+	v := numKeys*DBKeySize + HeaderSize
+	v2 := numKeys * DBKeySize
+	_ = v + v2
+	if numKeys > 0 {
 		// Create a slice to hold all unique keys, giving priority to NewKeys
 		keyValues := make(map[[32]byte]*DBBKey)
 		for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeySize:] {
@@ -172,17 +173,17 @@ func (k *KFile) Close() error {
 			if err != nil {
 				return err
 			}
-			keyValues[key] = dbbKey
+			if key != nilKey { // Should never happen, but don't allow the nil key
+				keyValues[key] = dbbKey
+			}
 		}
 
-		// Collect all the keys
+		// Collect all the keys and just the keys
 		KeyList := make([][32]byte, len(keyValues))
 		offset := 0
-		for k, v := range keyValues {
-			if k != nilKey {
-				copy(KeyList[offset][:], v.Bytes(k))
-				keyValues[k] = v
-			}
+		for k := range keyValues {
+			copy(KeyList[offset][:], k[:])
+			offset++
 		}
 
 		// Sort the keys into their offset bins.
@@ -214,26 +215,19 @@ func (k *KFile) Close() error {
 		for i := lastIndex + 1; i < NumOffsets; i++ {
 			k.Header.Offsets[i] = currentOffset
 		}
-		k.Header.EndOfList = currentOffset
+		k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
 
-		k.UpdateHeader() // Update the header on the disk
-
-		bf, err := NewBFile(filepath.Join(k.Directory, kTmpFileName))
-		if err != nil {
+		k.File.File.Close()
+		if k.File.File, err = os.Create(k.File.Filename); err != nil {
 			return err
 		}
-		header := k.Marshal()
-		if _, err = bf.Write(header); err != nil {
-			return err
+		k.UpdateHeader()
+		// Write all the keys following the Header
+		for _, key := range KeyList {
+			keyB := keyValues[key].Bytes(key)
+			k.File.File.Write(keyB)
 		}
-		for _, entry := range KeyList {
-			bf.Write(entry[:])
-		}
-		bf.File.Close()
-		k.File.Close()
-		os.Remove(k.File.Filename)
-		os.Rename(bf.Filename, k.File.Filename)
-		k.LoadHeader()
+
 	}
 	k.File.Close()
 	return nil

@@ -1,14 +1,18 @@
 package blockchainDB
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestKFile(t *testing.T) {
-	dir, rm := MakeDir()
-	defer rm()
+	//	dir, rm := MakeDir()
+	//	defer rm()
+	os.Remove("/tmp/KFileTest")
+	dir := "/tmp/KFileTest"
+	os.Mkdir(dir, os.ModePerm)
 
 	const numKeys = 10
 

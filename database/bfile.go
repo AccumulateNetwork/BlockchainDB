@@ -75,6 +75,7 @@ func (b *BFile) Close() (err error) {
 	if err = b.File.Close(); err != nil {
 		return err
 	}
+	b.File = nil
 	return nil
 }
 
