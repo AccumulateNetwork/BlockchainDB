@@ -42,10 +42,12 @@ func TestNewBFile(t *testing.T) {
 	filename, deferF := MakeFilename("BFile.dat")
 	defer deferF()
 
+	const numEntries = 1000
+
 	bFile, err := NewBFile(filename)
 	cnt := 1
-	f := "%10d This is something we are writing\n"
-	for i := 0; i < 100; i++ {
+	f := "%10d        This is something we are writing\nThis is something we are writing\nThis is something we are writing\nThis is something we are writing\nThis is something we are writing\n"
+	for i := 0; i < numEntries; i++ {
 		update, err := bFile.Write([]byte(fmt.Sprintf(f, cnt)))
 		assert.NoError(t, err, "write error")
 		if err != nil {

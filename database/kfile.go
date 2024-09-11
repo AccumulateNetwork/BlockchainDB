@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,18 +21,39 @@ type KFile struct {
 	Directory string               // Directory of the BFile
 	File      *BFile               // Key File
 	Cache     map[[32]byte]*DBBKey // Cache of DBBKey Offsets
+	Clean     bool                 // The KFile on disk is clean
 }
 
-// NewBFile
-// Creates a new Buffered file. A Header is created for an empty BFile
+func (k *KFile) PrintStatus(label string) {
+	s := k.File.Status()
+
+	fmt.Println(label)
+
+	fmt.Printf("Filename     %s\n", s.Filename)
+	fmt.Printf("FileStatus   %s\n", s.FileStatus)
+	fmt.Printf("Open         %v\n", s.Open)
+	fmt.Printf("FileSize     %v\n", s.FileSize)
+	fmt.Printf("EOB          %v\n", s.EOB)
+	fmt.Printf("Size         %v\n", s.Size)
+	fmt.Print("------------------------------\n\n")
+}
+
+// NewKFile
+// Creates a new KFile directory (holds a key file and a value file)
+// Overwrites any existing KFile directory
 func NewKFile(Directory string) (kFile *KFile, err error) {
 	kFile = new(KFile)
+	os.RemoveAll(Directory)                                 // Don't care if this fails; usually does
+	if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Do care if Mkdir fails
+		return nil, err
+	}
+
 	kFile.Directory = Directory
 	if kFile.File, err = NewBFile(filepath.Join(Directory, kFileName)); err != nil {
 		return nil, err
 	}
 	kFile.Header.Init()
-	kFile.UpdateHeader()
+	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
 	return kFile, err
 }
@@ -47,15 +69,18 @@ func (k *KFile) LoadHeader() (err error) {
 	return nil
 }
 
-// UpdateHeader
+// WriteHeader
 // Write the Header to the Key File
-func (k *KFile) UpdateHeader() (err error) {
+func (k *KFile) WriteHeader() (err error) {
 	h := k.Header.Marshal()
 	if err = k.File.WriteAt(0, h); err != nil {
 		return err
 	}
 	return nil
 }
+
+// LoadKeys
+// Loads all the keys
 
 // Get
 // Get the value for a given DBKeyFull.  The value returned
@@ -127,7 +152,7 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 // Flush
 // Flush the buffer to disk, and clear the cache
 func (k *KFile) Flush() (err error) {
-	if err = k.UpdateHeader(); err != nil {
+	if err = k.WriteHeader(); err != nil {
 		return err
 	}
 
@@ -150,85 +175,100 @@ func (k *KFile) Open() error {
 // Take everything in flight and write it to disk, then close the file.
 // Note that if an error occurs while updating the BFile, the BFile
 // will be trashed.
-func (k *KFile) Close() error {
+func (k *KFile) Close() (err error) {
 
 	k.Flush()
 
+	keyValues, keyList, err := k.GetKeyList()
+	if err != nil {
+		return err
+	}
+	if keyList == nil {
+		return nil
+	}
+
+	// Now we have a set of bin-sorted keys
+
+	var currentOffset uint64 = HeaderSize // Set to the location of the first key in the file
+	lastIndex := -1                       // This is the "last" offset processed. Start below 0
+	for _, key := range keyList {         // Note that this never updates the first offset. That's okay, it doesn't change
+		index := k.Index(key[:])    //       Use the first two bytes as the index
+		if lastIndex < int(index) { //       If this index is greater than the last
+			lastIndex++                                 //     Don't overwrite the previous offset
+			for ; lastIndex < int(index); lastIndex++ { //     Update any skipped offsets
+				k.Offsets[lastIndex] = currentOffset //
+			}
+			k.Offsets[lastIndex] = currentOffset //            Set this offset
+		}
+		currentOffset += DBKeySize //                          Add the size of the entry for next offset
+	}
+
+	// Fill in the rest of the offsets table;
+	for i := lastIndex + 1; i < NumOffsets; i++ {
+		k.Header.Offsets[i] = currentOffset
+	}
+	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
+
+	k.File.File.Close()
+	if k.File.File, err = os.Create(k.File.Filename); err != nil {
+		return err
+	}
+	k.WriteHeader()
+	// Write all the keys following the Header
+	for _, key := range keyList {
+		keyB := keyValues[key].Bytes(key)
+		k.File.File.Write(keyB)
+	}
+
+	k.File.Close()
+	return nil
+}
+
+// GetKeyList
+// Returns all the keys and their values, and a list of the keys sorted by
+// the key bins.
+func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte, err error) {
 	// Pull in all the keys
 	k.File.File.Seek(HeaderSize, io.SeekStart)
 	keyEntriesBytes, err := io.ReadAll(k.File.File)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	numKeys := len(keyEntriesBytes) / DBKeySize
-	v := numKeys*DBKeySize + HeaderSize
-	v2 := numKeys * DBKeySize
-	_ = v + v2
-	if numKeys > 0 {
-		// Create a slice to hold all unique keys, giving priority to NewKeys
-		keyValues := make(map[[32]byte]*DBBKey)
-		for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeySize:] {
-			dbbKey := new(DBBKey)
-			key, err := dbbKey.Unmarshal(keyEntriesBytes)
-			if err != nil {
-				return err
-			}
-			if key != nilKey { // Should never happen, but don't allow the nil key
-				keyValues[key] = dbbKey
-			}
-		}
-
-		// Collect all the keys and just the keys
-		KeyList := make([][32]byte, len(keyValues))
-		offset := 0
-		for k := range keyValues {
-			copy(KeyList[offset][:], k[:])
-			offset++
-		}
-
-		// Sort the keys into their offset bins.
-		// They won't be sorted inside the bins.
-		// The order will not be the same over multiple machines.
-		sort.Slice(KeyList, func(i, j int) bool {
-			a := k.Index(KeyList[i][:]) // Bin for a
-			b := k.Index(KeyList[j][:]) // Bin for b
-			return a < b
-		})
-
-		// Now we have a set of bin-sorted keys
-
-		var currentOffset uint64 = HeaderSize // Set to the location of the first key in the file
-		lastIndex := -1                       // This is the "last" offset processed. Start below 0
-		for _, key := range KeyList {         // Note that this never updates the first offset. That's okay, it doesn't change
-			index := k.Index(key[:])    //       Use the first two bytes as the index
-			if lastIndex < int(index) { //       If this index is greater than the last
-				lastIndex++                                 //     Don't overwrite the previous offset
-				for ; lastIndex < int(index); lastIndex++ { //     Update any skipped offsets
-					k.Offsets[lastIndex] = currentOffset //
-				}
-				k.Offsets[lastIndex] = currentOffset //            Set this offset
-			}
-			currentOffset += DBKeySize //                          Add the size of the entry for next offset
-		}
-
-		// Fill in the rest of the offsets table;
-		for i := lastIndex + 1; i < NumOffsets; i++ {
-			k.Header.Offsets[i] = currentOffset
-		}
-		k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
-
-		k.File.File.Close()
-		if k.File.File, err = os.Create(k.File.Filename); err != nil {
-			return err
-		}
-		k.UpdateHeader()
-		// Write all the keys following the Header
-		for _, key := range KeyList {
-			keyB := keyValues[key].Bytes(key)
-			k.File.File.Write(keyB)
-		}
-
+	if numKeys == 0 {
+		return nil, nil, err
 	}
-	k.File.Close()
-	return nil
+
+	// Create a slice to hold all unique keys, giving priority to NewKeys
+	keyValues = make(map[[32]byte]*DBBKey)
+	for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeySize:] {
+		dbbKey := new(DBBKey)
+		key, err := dbbKey.Unmarshal(keyEntriesBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		if key != nilKey { // Should never happen, but don't allow the nil key
+			keyValues[key] = dbbKey
+		}
+	}
+
+	// Collect all the keys and just the keys
+	KeyList = make([][32]byte, len(keyValues))
+	offset := 0
+	for k := range keyValues {
+		copy(KeyList[offset][:], k[:])
+		offset++
+	}
+
+	// Sort the keys into their offset bins.
+	// They won't be sorted inside the bins.
+	// The order will not be the same over multiple machines.
+	sort.Slice(KeyList, func(i, j int) bool {
+		a := k.Index(KeyList[i][:]) // Bin for a
+		b := k.Index(KeyList[j][:]) // Bin for b
+		return a < b
+	})
+
+	return keyValues, KeyList, nil
+
 }

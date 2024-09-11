@@ -2,7 +2,7 @@ package blockchainDB
 
 import "encoding/binary"
 
-const NumOffsets = 8
+const NumOffsets = 10240
 const HeaderSize = NumOffsets*8 + 8 // Offset to key sections plus an end of keys value
 
 // Offset table for all the indexes in the KFile
