@@ -104,3 +104,31 @@ func TestReset(t *testing.T) {
 		assert.Equal(t, v, fr.NextHash(), "Not equal")
 	}
 }
+
+func TestRandASCII(t *testing.T) {
+	fr := NewFastRandom([]byte{1})
+	for i := 0; i < 100000; i++ {
+		_ = string(fr.RandChar(10, 100))
+	}
+}
+
+func TestFRClone(t *testing.T) {
+	fr := NewFastRandom([]byte{1, 2, 3})
+
+	var values1, values2 []uint64
+	// Set up a common past
+	for i := 0; i < 10; i++ {
+		values1 = append(values1, fr.Uint64())
+		values2 = append(values2, values1[i])
+	}
+	fr2 := fr.Clone()
+	for i := 0; i < 10; i++ {
+		values1 = append(values1, fr.Uint64())
+	}
+	for i := 0; i < 10; i++ {
+		values2 = append(values2, fr2.Uint64())
+	}
+	for i := range values1 {
+		assert.Equalf(t, values1[i], values2[i], "Didn't work %d", i)
+	}
+}

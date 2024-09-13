@@ -62,7 +62,8 @@ func NewBFile(filename string) (file *BFile, err error) {
 func OpenBFile(filename string) (file *BFile, err error) {
 	file = new(BFile)        //
 	file.Filename = filename // Set the Filename
-	file.Open()
+	err = file.Open()
+	return file, err
 }
 
 // Open
@@ -77,8 +78,10 @@ func (b *BFile) Open() (err error) {
 	if b.File, err = os.OpenFile(b.Filename, os.O_RDWR, os.ModePerm); err != nil {
 		return err
 	}
-	if b.EOD, err = b.File.Seek(0, io.SeekEnd); err != nil {
+	if eod, err := b.File.Seek(0, io.SeekEnd); err != nil {
 		return err
+	} else {
+		b.EOD = uint64(eod)
 	}
 	return nil
 }
@@ -175,6 +178,9 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 // WriteAt
 // This is an unbuffered write; Does not involve the buffered writing
 // Seek to the offset from start and write data ito the BFile
+//
+// To Do: modify to allow writing to locations that overlap the buffer
+// (Not really required as yet, since it is used to update buffers...)
 func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
 	if err = b.Open(); err != nil {
 		return err
@@ -197,23 +203,31 @@ func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
 }
 
 // ReadAt
-// Seek to the offset from start and read into the given data buffer
-func (b *BFile) ReadAt(offset int64, data []byte) (err error) {
+// Seek to the offset from start and read into the given data buffer.  Note
+// that to avoid a flush to disk, ReadAt must be smart about what is in the buffer vs
+// what is on disk, and to open the file and read from it only if required.
+func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 	DataLastOffset := uint64(offset) + uint64(len(data))
-	if DataLastOffset > b.EOB+b.EOD {
-		return fmt.Errorf("attempt to read past the EOF(%d) attempt(%d)", b.EOB+b.EOD, DataLastOffset)
-	}
-	if err = b.Open(); err != nil {
-		return err
-	}
 
-	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
-		return err
+	switch {
+	case DataLastOffset <= b.EOD:
+		if err = b.Open(); err != nil {
+			return err
+		}
+		if _, err = b.File.Seek(int64(offset), io.SeekStart); err != nil {
+			return err
+		}
+		if _, err = b.File.Read(data); err != nil {
+			return err
+		}
+	case DataLastOffset > b.EOB+b.EOD:
+		err = fmt.Errorf("attempt to read past the EOF(%d) attempt(%d)", b.EOB+b.EOD, DataLastOffset)
+	case offset > b.EOD:
+		copy(data, b.Buffer[offset-b.EOD:])
+	default:
+		b.ReadAt(offset, data[:b.EOD-offset])
+		copy(data[b.EOD-offset:], b.Buffer[:])
+		err = b.Open()
 	}
-
-	if _, err = b.File.Read(data); err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }

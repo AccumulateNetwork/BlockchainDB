@@ -25,6 +25,12 @@ func (f *FastRandom) Step() {
 	f.index ^= f.sponge[f.state&0xFF]     // Avoid the fact that 32 is a factor of 256
 }
 
+// Make a clone of a FastRandom state as it currently exists
+func (f FastRandom) Clone() *FastRandom {
+	f.initialSeed = append([]byte{}, f.initialSeed...)
+	return &f
+}
+
 // Reset()
 // Reset the sequence produced by FastRandom to its initial state
 func (f *FastRandom) Reset() {
@@ -136,6 +142,24 @@ func (f *FastRandom) RandBuff(min uint, max uint) []byte {
 	}
 	for i := count8 * 8; i < byteCount; i++ {
 		buff[i] = byte(f.sponge[f.index&15])
+	}
+	return buff
+}
+
+// RandChar
+// Returns a buffer of random hex characters
+// If max > 100 MB, max is set to 100 MB
+// If max < 1, max is set to 1
+// If min > max, min is set to max
+func (f *FastRandom) RandChar(min uint, max uint) []byte {
+	if max <= min {
+		return []byte{}
+	}
+	cnt := f.UintN(max-min) + min
+	buff := make([]byte, cnt)
+	for i := range buff {
+		chr := f.UintN(126-33) + 33
+		buff[i] = byte(chr)
 	}
 	return buff
 }

@@ -10,18 +10,19 @@ import (
 )
 
 const (
-	kFileName    string = "kfile.dat"
-	kTmpFileName string = "kfile_tmp.dat"
+	kFileName       string = "kfile.dat"
+	kTmpFileName    string = "kfile_tmp.dat"
+	MaxCachedBlocks        = 20
 )
 
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type KFile struct {
 	Header
-	Directory string               // Directory of the BFile
-	File      *BFile               // Key File
-	Cache     map[[32]byte]*DBBKey // Cache of DBBKey Offsets
-	Clean     bool                 // The KFile on disk is clean
+	Directory    string               // Directory of the BFile
+	File         *BFile               // Key File
+	Cache        map[[32]byte]*DBBKey // Cache of DBBKey Offsets
+	BlocksCached int                  // Track blocks cached before rewritten
 }
 
 func (k *KFile) PrintStatus(label string) {
@@ -113,7 +114,7 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	keys := make([]byte, end-start) //       Create a buffer for the section
 
-	if err = k.File.ReadAt(int64(start), keys); err != nil { // Read the section
+	if err = k.File.ReadAt(start, keys); err != nil { // Read the section
 		return nil, err
 	}
 
@@ -141,12 +142,19 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
-	if update {                                    // If the key is ACTUALLY written to the file
-		clear(k.Cache) //                             Clear the cache
+	if update && k.BlocksCached == 0 {             // If the file was updated && time to clear cache
+		clear(k.Cache)                   //           Clear the cache and update the key offsets
+		if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
+			return err //                               the file has to be closed and opened to update
+		} //                                            the key offsets
+		if err = k.File.Open(); err != nil { //       Reopen the file
+			return err
+		}
+		k.BlocksCached = MaxCachedBlocks
 	}
-	k.Cache[Key] = dbBKey //                          Then add to the cache anyway, because this
-	//                                                key might span buffers
-	return err
+	k.BlocksCached--      // Count down until the cache is cleared again
+	k.Cache[Key] = dbBKey // Then add to the cache anyway, because this
+	return err            //   key might span buffers
 }
 
 // Flush

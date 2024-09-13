@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,32 +43,69 @@ func TestNewBFile(t *testing.T) {
 	filename, deferF := MakeFilename("BFile.dat")
 	defer deferF()
 
-	const numEntries = 1000
+	const numEntries = 50000
+	const min = 10
+	const max = 500
 
+	fr := NewFastRandom(nil)
 	bFile, err := NewBFile(filename)
-	cnt := 1
-	f := "%10d        This is something we are writing\nThis is something we are writing\nThis is something we are writing\nThis is something we are writing\nThis is something we are writing\n"
+	assert.NoError(t, err, "failed to create BFile")
+	cnt := 0
 	for i := 0; i < numEntries; i++ {
-		update, err := bFile.Write([]byte(fmt.Sprintf(f, cnt)))
+		data := fr.RandChar(min, max)
+		data[len(data)-1] = '\n'
+		update, err := bFile.Write(data)
 		assert.NoError(t, err, "write error")
 		if err != nil {
 			return
 		}
 		if update {
-			cnt = 0
+			cnt++
 
 		}
-		cnt++
 	}
-	bFile.Flush()
-	dLen := len([]byte(fmt.Sprintf(f, 0)))
-	data2 := make([]byte, dLen)
-	for i := 1; i < 1; i++ {
-		data := []byte(fmt.Sprintf(f, i))
-		bFile.ReadAt(int64(i*dLen), data2[:])
-		assert.Equal(t, data, data2[:], "didn't get my data back")
-	}
+	fmt.Printf("Total updates %d\n", cnt)
+
+	fr.Reset()
+	var offset uint64 = 0
 	assert.NoError(t, err, "failed to create BFile")
-	bFile.Close()
-	fmt.Println("Done!")
+	var buff [max]byte
+	for i := 0; i < numEntries; i++ {
+		data := fr.RandChar(min, max)
+		data[len(data)-1] = '\n'
+		err := bFile.ReadAt(offset, buff[:len(data)])
+		assert.NoError(t, err, "write error")
+		assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
+
+		if err != nil || !bytes.Equal(data, buff[:len(data)]) {
+			fmt.Printf("Failed at %d\n", i)
+			return
+		}
+
+		offset += uint64(len(data))
+	}
+
+	err = bFile.Close()
+	assert.NoError(t, err, "failed to close")
+	err = bFile.Open()
+	assert.NoError(t, err, "failed to close")
+
+	fr.Reset()
+	offset = 0
+	assert.NoError(t, err, "failed to create BFile")
+	for i := 0; i < numEntries; i++ {
+		data := fr.RandChar(min, max)
+		data[len(data)-1] = '\n'
+		err := bFile.ReadAt(offset, buff[:len(data)])
+		assert.NoError(t, err, "write error")
+		assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
+
+		if err != nil || !bytes.Equal(data, buff[:len(data)]) {
+			fmt.Printf("Failed at %d\n", i)
+			return
+		}
+
+		offset += uint64(len(data))
+	}
+
 }
