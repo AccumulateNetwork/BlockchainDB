@@ -35,6 +35,7 @@ func NewKV(directory string) (kv *KV, err error) {
 // Put
 // Put the key into the kFile, and the value in the vFile
 func (k *KV) Put(key [32]byte, value []byte) (err error) {
+
 	dbbKey := new(DBBKey)
 	dbbKey.Offset, err = k.vFile.Offset()
 	if err != nil {
@@ -88,8 +89,9 @@ func (k *KV) Open() (err error) {
 // Compress
 // Re-write the values file to remove trash values
 func (k *KV) Compress() (err error) {
-	k.kFile.Flush()
-	k.vFile.Close()
+	k.Open()
+	k.Close()
+	k.Open()
 
 	tvFile, err := NewBFile(filepath.Join(k.Directory, valueTmpFilename))
 	if err != nil {
@@ -104,19 +106,29 @@ func (k *KV) Compress() (err error) {
 	var buffer [10000]byte
 	for _, key := range ks {
 		dbbKey := kvs[key]
-
-		err := k.vFile.ReadAt(dbbKey.Offset, buffer[dbbKey.Length:])
+		// Read the current key value
+		if err := k.vFile.ReadAt(dbbKey.Offset, buffer[:dbbKey.Length]); err != nil {
+			return err
+		}
+		// Put the new offset in the tvFile into the dbbKey (length does not change)
 		dbbKey.Offset, err = tvFile.Offset()
 		if err != nil {
 			return err
 		}
-		if _, err = tvFile.Write(buffer[dbbKey.Length:]); err != nil {
+		// Update the key in the kFile
+		if err = k.kFile.Put(key, dbbKey); err != nil {
+			return err
+		}
+		// Write the value into the tvFile
+		if _, err = tvFile.Write(buffer[:dbbKey.Length]); err != nil {
 			return err
 		}
 	}
+
+	k.vFile.Close()
 	tvFile.Close()
 	k.kFile.Close()
-	os.Remove(k.kFile.File.Filename)
-	os.Rename(tvFile.Filename, k.kFile.File.Filename)
+	os.Remove(k.vFile.Filename)
+	os.Rename(tvFile.Filename, k.vFile.Filename)
 	return nil
 }

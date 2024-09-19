@@ -34,11 +34,6 @@ func MakeFilename(filename string) (Filename string, deferF func()) {
 	return Filename, rm
 }
 
-func TestFP(t *testing.T) {
-	path := "/tmp/xxx/yyy.dat"
-	fmt.Println(filepath.Base(path))
-}
-
 func TestNewBFile(t *testing.T) {
 	filename, deferF := MakeFilename("BFile.dat")
 	defer deferF()

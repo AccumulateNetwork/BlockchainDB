@@ -129,8 +129,6 @@ func (b *BFile) Offset() (offset uint64, err error) {
 // err    -- nil on no error, the error if an error occurs
 func (b *BFile) Write(Data []byte) (update bool, err error) {
 
-	b.Open()
-
 	space := uint64(BufferSize - b.EOB)
 
 	// Write to the current buffer
@@ -140,6 +138,8 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 		b.EOB += uint64(dLen)        // Well, after updating offsets...
 		return false, nil
 	}
+
+	b.Open()
 
 	if space > 0 {
 		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer

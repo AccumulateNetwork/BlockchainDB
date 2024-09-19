@@ -89,7 +89,7 @@ func TestNewFastRandom(t *testing.T) {
 		start := time.Now()
 		fr := NewFastRandom(nil)
 		t := time.Since(start)
-		fmt.Printf("allocate na: %d mu: %d ms: %d seed: %x \n", t.Nanoseconds(), t.Microseconds(), t.Milliseconds(), fr.seed)
+		fmt.Printf("allocate na: %d seed: %x \n", t.Nanoseconds(), fr.seed)
 	}
 }
 
@@ -130,5 +130,13 @@ func TestFRClone(t *testing.T) {
 	}
 	for i := range values1 {
 		assert.Equalf(t, values1[i], values2[i], "Didn't work %d", i)
+	}
+}
+
+func TestComputeTimePerOp(t *testing.T) {
+	var value float64 = 10_000_000_000
+	for i := 0; i < 12; i++ {
+		fmt.Printf("%16.3f value => %s\n", value, ComputeTimePerOp(value))
+		value = value / 10
 	}
 }

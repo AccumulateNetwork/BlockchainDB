@@ -12,7 +12,7 @@ import (
 const (
 	kFileName       string = "kfile.dat"
 	kTmpFileName    string = "kfile_tmp.dat"
-	MaxCachedBlocks        = 20
+	MaxCachedBlocks        = 50
 )
 
 // Block File
@@ -142,17 +142,20 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
-	if update && k.BlocksCached == 0 {             // If the file was updated && time to clear cache
-		clear(k.Cache)                   //           Clear the cache and update the key offsets
-		if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
-			return err //                               the file has to be closed and opened to update
-		} //                                            the key offsets
-		if err = k.File.Open(); err != nil { //       Reopen the file
-			return err
+	if update {                                    // If the file was updated && time to clear cache
+		if k.BlocksCached <= 0 {
+			clear(k.Cache)                   //           Clear the cache and update the key offsets
+			if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
+				return err //                               the file has to be closed and opened to update
+			} //                                            the key offsets
+			if err = k.File.Open(); err != nil { //       Reopen the file
+				return err
+			}
+			k.BlocksCached = MaxCachedBlocks
+		} else {
+			k.BlocksCached--
 		}
-		k.BlocksCached = MaxCachedBlocks
 	}
-	k.BlocksCached--      // Count down until the cache is cleared again
 	k.Cache[Key] = dbBKey // Then add to the cache anyway, because this
 	return err            //   key might span buffers
 }
@@ -185,8 +188,6 @@ func (k *KFile) Open() error {
 // will be trashed.
 func (k *KFile) Close() (err error) {
 
-	k.Flush()
-
 	keyValues, keyList, err := k.GetKeyList()
 	if err != nil {
 		return err
@@ -218,6 +219,7 @@ func (k *KFile) Close() (err error) {
 	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
 
 	k.File.File.Close()
+	os.Remove(k.File.Filename)
 	if k.File.File, err = os.Create(k.File.Filename); err != nil {
 		return err
 	}
@@ -225,7 +227,7 @@ func (k *KFile) Close() (err error) {
 	// Write all the keys following the Header
 	for _, key := range keyList {
 		keyB := keyValues[key].Bytes(key)
-		k.File.File.Write(keyB)
+		k.File.Write(keyB)
 	}
 
 	k.File.Close()
@@ -237,6 +239,11 @@ func (k *KFile) Close() (err error) {
 // the key bins.
 func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte, err error) {
 	// Pull in all the keys
+
+	if err = k.Flush(); err != nil {
+		return nil, nil, err
+	}
+
 	k.File.File.Seek(HeaderSize, io.SeekStart)
 	keyEntriesBytes, err := io.ReadAll(k.File.File)
 	if err != nil {

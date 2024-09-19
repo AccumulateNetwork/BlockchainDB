@@ -12,7 +12,7 @@ func TestKFile(t *testing.T) {
 	dir, rm := MakeDir()
 	defer rm()
 
-	const numKeys = 1000
+	const numKeys = 1_000_000
 
 	fr := NewFastRandom([]byte{1})
 
@@ -69,6 +69,7 @@ func TestKFile(t *testing.T) {
 	readsPerSec := float64(numReads) / time.Since(start).Seconds()
 
 	fmt.Printf("writes %10.3f/s  Reads %10.3f/s\n", writesPerSec, readsPerSec)
-
+	fmt.Printf("write time : %s\n", ComputeTimePerOp(writesPerSec))
+	fmt.Printf("read time  : %s\n", ComputeTimePerOp(readsPerSec))
 	assert.NoError(t, err, "failed to close KFile")
 }

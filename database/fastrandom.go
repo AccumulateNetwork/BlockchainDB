@@ -1,28 +1,36 @@
 package blockchainDB
 
 import (
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
+	"fmt"
 	"time"
+)
+
+const (
+	spongeSize = 256            // Must be a power of two
+	mask       = spongeSize - 1 // Any power of 2 int less 1 yields a mask
+	seedSize   = 512            // Seed in bits
+	seedBytes  = seedSize / 8   // Seed in bytes
 )
 
 type FastRandom struct {
 	initialSeed []byte
-	sponge      [256]uint64
-	seed        [32]byte
+	sponge      [spongeSize]uint64
+	seed        [seedBytes]byte
 	index       uint64
 	state       uint64
 }
 
 func (f *FastRandom) Step() {
-	f.state ^= f.sponge[f.index&0xFF]     // fold in the sponge
-	f.state ^= f.index                    // fold in the index
-	f.state ^= f.state << 11              // Do the Xor shift thing
-	f.state ^= f.state >> 15              //
-	f.state ^= f.state << 3               //
-	f.sponge[f.index&0xFF] ^= f.state     // Fold in the state
-	f.seed[f.index&0x1F] ^= byte(f.state) // Xor in the f.state
-	f.index ^= f.sponge[f.state&0xFF]     // Avoid the fact that 32 is a factor of 256
+	f.state ^= f.sponge[f.index&mask]                // fold into the state sponge[index%256]
+	f.state ^= f.index                               // Also fold into the state the index
+	f.state ^= f.state << 11                         // Do the Xor shift thing
+	f.state ^= f.state >> 15                         //
+	f.state ^= f.state << 3                          //
+	f.sponge[(f.index+spongeSize/2)&mask] ^= f.state // Fold in the state
+	f.seed[f.index&(seedBytes-1)] ^= byte(f.state)   // Xor in the f.state
+	f.index ^= f.sponge[f.state&mask]                // Avoid the fact that 32 is a factor of 256
 }
 
 // Make a clone of a FastRandom state as it currently exists
@@ -38,7 +46,7 @@ func (f *FastRandom) Reset() {
 	for i := range f.sponge {
 		f.sponge[i] = 0
 	}
-	f.seed = [32]byte{}
+	f.seed = [seedBytes]byte{}
 	f.index = 0
 	f.state = 0
 
@@ -67,18 +75,22 @@ func (f *FastRandom) init(seed []byte) {
 		t := time.Now().UnixNano()
 		seed = make([]byte, 1024)
 		for i := 0; i < 1024; i += 8 {
+			go func() { time.Sleep(time.Microsecond) }()
 			t = time.Now().UnixNano() ^ t<<15 ^ t>>7
+			time.Sleep(time.Microsecond) // Sleep a micro second to make other processes mess
 			t = time.Now().UnixNano() ^ t<<13 ^ t>>9
+			time.Sleep(time.Microsecond) // Sleep a micro second to make other processes mess
 			t = time.Now().UnixNano() ^ t<<17 ^ t>>3
+			time.Sleep(time.Microsecond) // Sleep a micro second to make other processes mess
 			binary.BigEndian.PutUint64(seed[i%1024:], uint64(t))
 		}
-	}
+	} //                                with the timing
 
 	f.initialSeed = append([]byte{}, seed...) // Copy the initial seed (allow reset)
-	f.seed = sha256.Sum256(seed)              // Use the hash of the seed as the seed
+	f.seed = sha512.Sum512(seed)              // Use the hash of the seed as the seed
 
 	for i := range f.sponge { // Fill the sponge with parts of hashes of hashes
-		f.seed = sha256.Sum256(f.seed[:])
+		f.seed = sha512.Sum512(f.seed[:])
 		f.sponge[i] = binary.BigEndian.Uint64(f.seed[:])
 	}
 	for i := 0; i < 512; i++ {
@@ -107,7 +119,8 @@ func (f *FastRandom) NextHash() (hash [32]byte) {
 		hash[i] = byte(f.state)
 		f.Step()
 	}
-	var a [32]byte = f.seed
+	var a [32]byte
+	copy(a[:], f.seed[:32])
 	return a
 }
 
@@ -152,14 +165,34 @@ func (f *FastRandom) RandBuff(min uint, max uint) []byte {
 // If max < 1, max is set to 1
 // If min > max, min is set to max
 func (f *FastRandom) RandChar(min uint, max uint) []byte {
-	if max <= min {
-		return []byte{}
+	if max <= 0 {
+		max = 1
 	}
-	cnt := f.UintN(max-min) + min
-	buff := make([]byte, cnt)
+	if min >= max {
+		min = max
+	}
+	byteCount := max
+	if min != max {
+		byteCount = f.UintN(max-min) + min
+	}
+	buff := make([]byte, byteCount)
 	for i := range buff {
 		chr := f.UintN(126-33) + 33
 		buff[i] = byte(chr)
 	}
 	return buff
+}
+
+func ComputeTimePerOp(tps float64) string {
+	opn := 1 / tps * 1e9 // Operations Per ns
+	switch {
+	case opn < 1e3:
+		return fmt.Sprintf("%4.3f n", opn)
+	case opn < 1e6:
+		return fmt.Sprintf("%4.3f us", opn/1e3)
+	case opn < 1e9:
+		return fmt.Sprintf("%4.3f ms", opn/1e6)
+	default:
+		return fmt.Sprintf("%4.3f s", opn/1e9)
+	}
 }
