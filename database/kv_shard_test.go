@@ -213,7 +213,7 @@ func TestBuildBig(t *testing.T) {
 		if (i+1)%(numPermKeys/100) == 0 {
 			wps := cntWrites / time.Since(start).Seconds()
 			tpw := ComputeTimePerOp(wps)
-			fmt.Printf("perm entries %d puts/s %8.3f average put %s\n", i+1, wps, tpw)
+			fmt.Printf("perm entries %10d puts/s %10.0f average put %7s\n", i+1, wps, tpw)
 		}
 		key := frP.NextHash()
 		value := frPV.RandBuff(minData, maxData)

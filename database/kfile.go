@@ -118,9 +118,9 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	// The header reflects what is on disk.  Points keys to the section where it is.
 	index := OffsetIndex(Key[:])
-	var start, end uint64                 // The header gives us offsets to key sections
-	start = k.Offsets[index]              // The index is where the section starts
-	if index < uint16(len(k.Offsets)-1) { // Handle the last Offset special
+	var start, end uint64         // The header gives us offsets to key sections
+	start = k.Offsets[index]      // The index is where the section starts
+	if index < len(k.Offsets)-1 { // Handle the last Offset special
 		end = k.Offsets[index+1] //
 	} else { //                              The last section ends at EOF
 		if eofOffset, err := k.File.File.Seek(0, io.SeekEnd); err != nil {

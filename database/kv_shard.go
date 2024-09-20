@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-const NumShards = 256
+const NumShards = 1024
 
 type KVShard struct {
 	Directory string
