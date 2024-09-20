@@ -2,8 +2,10 @@ package blockchainDB
 
 import "encoding/binary"
 
-const NumOffsets = 10240
+const NumOffsets = 64000
 const HeaderSize = NumOffsets*8 + 8 // Offset to key sections plus an end of keys value
+const IndexOffsets = 0              // byte index to a 16 bit int used to define keysets in a KFile
+const IndexShards = 2               // byte index to a 16 bit int used to define a shard for a key
 
 // Offset table for all the indexes in the KFile
 // EndOfList is necessary because when we close the KFile, the list
@@ -15,10 +17,16 @@ type Header struct {
 	EndOfList uint64             // Offset marking end of the last Key section
 }
 
-// Index
+// OffsetIndex
 // Returns the index of into the header for the given key
-func (h *Header) Index(key []byte) uint16 {
-	return binary.BigEndian.Uint16(key) % NumOffsets
+func OffsetIndex(key []byte) uint16 {
+	return binary.BigEndian.Uint16(key[IndexOffsets:]) % NumOffsets
+}
+
+// ShardIndex
+// Returns the index of into the header for the given key
+func ShardIndex(key []byte) uint16 {
+	return binary.BigEndian.Uint16(key[IndexShards:]) % NumShards
 }
 
 // Marshal

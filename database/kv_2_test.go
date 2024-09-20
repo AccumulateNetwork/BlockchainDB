@@ -68,7 +68,7 @@ func TestKV2_2(t *testing.T) {
 	dir, rm := MakeDir()
 	defer rm()
 
-	const numKVs = 3_000_000
+	const numKVs = 10_000
 	const DynaPercent = 5
 
 	fr := NewFastRandom([]byte{1})

@@ -8,7 +8,7 @@ import (
 
 // Buffered File
 
-const BufferSize = 1024 * 64 // Buffer size for values written to the BFile
+const BufferSize = 1024 * 8 // Buffer size for values written to the BFile
 var nilKey [32]byte
 
 // Block BFile
@@ -24,10 +24,26 @@ type BFile struct {
 type BFileStatus struct {
 	Filename   string
 	FileStatus string
-	Open       bool
 	FileSize   uint64
 	EOB        uint64
 	Size       uint64
+}
+
+// Open
+// Open an existing BFile given a fully qualified filename
+func OpenBFile(filename string) (bFile *BFile, err error) {
+	bFile = new(BFile)
+	bFile.Filename = filename
+	if bFile.File, err = os.OpenFile(filename, os.O_RDWR, os.ModePerm); err != nil {
+		return nil, err
+	}
+	if fileInfo, err := os.Stat(filename); err != nil {
+		return nil, err
+	} else {
+		bFile.EOD = uint64(fileInfo.Size())
+	}
+	bFile.EOB = 0
+	return bFile, err
 }
 
 // Status
@@ -35,7 +51,6 @@ type BFileStatus struct {
 func (b *BFile) Status() *BFileStatus {
 	bs := new(BFileStatus)
 	bs.Filename = b.Filename
-	bs.Open = b.File != nil
 	if fileInfo, err := os.Stat(bs.Filename); err != nil {
 		bs.FileSize = 0
 		bs.FileStatus = err.Error()
@@ -55,15 +70,6 @@ func NewBFile(filename string) (file *BFile, err error) {
 	file.Filename = filename
 	file.File, err = os.Create(file.Filename) // Create the file
 	return file, err                          //
-}
-
-// OpenBFile
-// Open an existing BFile.  Error if none exists.
-func OpenBFile(filename string) (file *BFile, err error) {
-	file = new(BFile)        //
-	file.Filename = filename // Set the Filename
-	err = file.Open()
-	return file, err
 }
 
 // Open

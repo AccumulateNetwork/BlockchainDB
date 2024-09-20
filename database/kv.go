@@ -15,7 +15,7 @@ type KV struct {
 }
 
 // NewKV
-// Overwrites any existing directory
+// Overwrites any existing directory; directories are created for the vFile and kFile
 func NewKV(directory string) (kv *KV, err error) {
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
@@ -30,6 +30,21 @@ func NewKV(directory string) (kv *KV, err error) {
 		return nil, err
 	}
 	return kv, nil
+}
+
+// OpenKV
+// Open an existing Key/Value Database that uses separate BFiles to hold values and keys.
+func OpenKV(directory string) (kv *KV, err error) {
+	kv = new(KV)
+	kv.Directory = directory
+	filename := filepath.Join(directory, valueFilename)
+	if kv.vFile, err = OpenBFile(filename); err != nil {
+		return nil, err
+	}
+	if kv.kFile, err = OpenKFile(directory); err != nil {
+		return nil, err
+	}
+	return kv, err
 }
 
 // Put

@@ -12,7 +12,7 @@ import (
 const (
 	kFileName       string = "kfile.dat"
 	kTmpFileName    string = "kfile_tmp.dat"
-	MaxCachedBlocks        = 50
+	MaxCachedBlocks        = 20
 )
 
 // Block File
@@ -32,11 +32,26 @@ func (k *KFile) PrintStatus(label string) {
 
 	fmt.Printf("Filename     %s\n", s.Filename)
 	fmt.Printf("FileStatus   %s\n", s.FileStatus)
-	fmt.Printf("Open         %v\n", s.Open)
 	fmt.Printf("FileSize     %v\n", s.FileSize)
 	fmt.Printf("EOB          %v\n", s.EOB)
 	fmt.Printf("Size         %v\n", s.Size)
 	fmt.Print("------------------------------\n\n")
+}
+
+// Open
+// Open an existing k.File
+func OpenKFile(directory string) (kFile *KFile, err error) {
+	kFile = new(KFile)
+
+	kFile.Directory = directory
+	filename := filepath.Join(directory, kFileName)
+	if kFile.File, err = OpenBFile(filename); err != nil {
+		return nil, err
+	}
+	kFile.Cache = make(map[[32]byte]*DBBKey)
+	kFile.BlocksCached = 0
+
+	return kFile, nil
 }
 
 // NewKFile
@@ -57,6 +72,13 @@ func NewKFile(Directory string) (kFile *KFile, err error) {
 	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
 	return kFile, err
+}
+
+// Open
+// Make sure the underlying File is open for adding keys.  Sets the
+// location in the file for writing to the end of the file.
+func (k *KFile) Open() error {
+	return k.File.Open()
 }
 
 // LoadHeader
@@ -95,7 +117,7 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	}
 
 	// The header reflects what is on disk.  Points keys to the section where it is.
-	index := k.Index(Key[:])
+	index := OffsetIndex(Key[:])
 	var start, end uint64                 // The header gives us offsets to key sections
 	start = k.Offsets[index]              // The index is where the section starts
 	if index < uint16(len(k.Offsets)-1) { // Handle the last Offset special
@@ -175,13 +197,6 @@ func (k *KFile) Flush() (err error) {
 	return nil
 }
 
-// Open
-// Make sure the underlying File is open for adding keys.  Sets the
-// location in the file for writing to the end of the file.
-func (k *KFile) Open() error {
-	return k.File.Open()
-}
-
 // Close
 // Take everything in flight and write it to disk, then close the file.
 // Note that if an error occurs while updating the BFile, the BFile
@@ -201,8 +216,8 @@ func (k *KFile) Close() (err error) {
 	var currentOffset uint64 = HeaderSize // Set to the location of the first key in the file
 	lastIndex := -1                       // This is the "last" offset processed. Start below 0
 	for _, key := range keyList {         // Note that this never updates the first offset. That's okay, it doesn't change
-		index := k.Index(key[:])    //       Use the first two bytes as the index
-		if lastIndex < int(index) { //       If this index is greater than the last
+		index := OffsetIndex(key[:]) //       Use the first two bytes as the index
+		if lastIndex < int(index) {  //       If this index is greater than the last
 			lastIndex++                                 //     Don't overwrite the previous offset
 			for ; lastIndex < int(index); lastIndex++ { //     Update any skipped offsets
 				k.Offsets[lastIndex] = currentOffset //
@@ -279,8 +294,8 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	// They won't be sorted inside the bins.
 	// The order will not be the same over multiple machines.
 	sort.Slice(KeyList, func(i, j int) bool {
-		a := k.Index(KeyList[i][:]) // Bin for a
-		b := k.Index(KeyList[j][:]) // Bin for b
+		a := OffsetIndex(KeyList[i][:]) // Bin for a
+		b := OffsetIndex(KeyList[j][:]) // Bin for b
 		return a < b
 	})
 

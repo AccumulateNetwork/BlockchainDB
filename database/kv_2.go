@@ -6,9 +6,21 @@ import (
 	"path/filepath"
 )
 
+const PermDirName = "perm"
+const DynaDirName = "dyna"
+
 // KV2
 // Maintains 2 layers of key value pairs.  The low level KVFile holds key/value pairs that don't change
 // The high level KVFile holds keys that do change.  We only compress the high level KVFile
+//
+// ToDo:  Because KV2 can be used as a shard in a sharded database, and because the PermKV values don't
+// change and that database does not benefit from sharding, then KV2 might ought to accept a *KV for the
+// the PermKV. That way, only the DynaKV is really sharded, while all the permanent key/values are kept in
+// one KV database.
+//
+// ToDo furthermore, the PermKV can build databases that are blocked (by major blocks). Those separate KFiles
+// could then be used to rapidly sync partially synced nodes
+
 type KV2 struct {
 	Directory string // Directory where the PermKV and DynaKV directories are
 	PermKV    *KV    // The Perm KV
@@ -28,10 +40,24 @@ func NewKV2(directory string) (kv2 *KV2, err error) {
 
 	kv2 = new(KV2)
 	kv2.Directory = directory
-	if kv2.PermKV, err = NewKV(filepath.Join(directory, "perm")); err != nil {
+	if kv2.PermKV, err = NewKV(filepath.Join(directory, PermDirName)); err != nil {
 		return nil, err
 	}
-	if kv2.DynaKV, err = NewKV(filepath.Join(directory, "dyna")); err != nil {
+	if kv2.DynaKV, err = NewKV(filepath.Join(directory, DynaDirName)); err != nil {
+		return nil, err
+	}
+	return kv2, nil
+}
+
+func OpenKV2(directory string) (kv2 *KV2, err error) {
+	kv2 = new(KV2)
+	kv2.Directory = directory
+	permDirName := filepath.Join(directory, PermDirName) // Add directory names
+	dynaDirName := filepath.Join(directory, DynaDirName) // Add directory names
+	if kv2.PermKV, err = OpenKV(permDirName); err != nil {
+		return nil, err
+	}
+	if kv2.DynaKV, err = OpenKV(dynaDirName); err != nil {
 		return nil, err
 	}
 	return kv2, nil
