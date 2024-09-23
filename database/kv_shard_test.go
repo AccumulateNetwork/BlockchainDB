@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	humanize "github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -186,7 +187,7 @@ func TestKVShard_2(t *testing.T) {
 func TestBuildBig(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
-	const numPermKeys = 100_000_000
+	const numPermKeys = 200_000_000
 	const numModKeys = 100_000
 	const minData = 100
 	const maxData = 2000
@@ -196,7 +197,7 @@ func TestBuildBig(t *testing.T) {
 	kvs, err := NewKVShard(dir)
 	assert.NoError(t, err, "create kv")
 
-	fmt.Print("Generating Keys\n")
+	fmt.Print("Writing Keys to the Databases\n")
 
 	frD := NewFastRandom([]byte{1})
 	frDV := NewFastRandom([]byte{1, 1})
@@ -213,7 +214,9 @@ func TestBuildBig(t *testing.T) {
 		if (i+1)%(numPermKeys/100) == 0 {
 			wps := cntWrites / time.Since(start).Seconds()
 			tpw := ComputeTimePerOp(wps)
-			fmt.Printf("perm entries %10d puts/s %10.0f average put %7s\n", i+1, wps, tpw)
+			wpss := humanize.Comma(int64(wps))
+			tps := humanize.Comma(int64(i + 1))
+			fmt.Printf("perm entries: %11s | puts/s: %8s | average put: %7s\n", tps, wpss, tpw)
 		}
 		key := frP.NextHash()
 		value := frPV.RandBuff(minData, maxData)
@@ -221,7 +224,7 @@ func TestBuildBig(t *testing.T) {
 		cntWrites++
 	}
 
-	frD = NewFastRandom([]byte{1})
+	frD.Reset()
 	for i := 0; i < numModKeys; i++ {
 		key := frD.NextHash()
 		value := frDV.RandBuff(minData, maxData)

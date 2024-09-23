@@ -18,9 +18,9 @@ type DBBKey struct {
 func (d DBBKey) Bytes(address [32]byte) []byte {
 	var b [50]byte
 	copy(b[:], address[:])
-	binary.BigEndian.PutUint16(b[32:], d.Height)
 	binary.BigEndian.PutUint64(b[34:], d.Offset)
 	binary.BigEndian.PutUint64(b[42:], d.Length)
+	binary.BigEndian.PutUint16(b[32:], d.Height)
 	return b[:]
 }
 

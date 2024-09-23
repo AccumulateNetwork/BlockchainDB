@@ -21,14 +21,6 @@ type BFile struct {
 	EOD      uint64           // Current EOD
 }
 
-type BFileStatus struct {
-	Filename   string
-	FileStatus string
-	FileSize   uint64
-	EOB        uint64
-	Size       uint64
-}
-
 // Open
 // Open an existing BFile given a fully qualified filename
 func OpenBFile(filename string) (bFile *BFile, err error) {
@@ -44,23 +36,6 @@ func OpenBFile(filename string) (bFile *BFile, err error) {
 	}
 	bFile.EOB = 0
 	return bFile, err
-}
-
-// Status
-// Status of the BFile including size on disk,
-func (b *BFile) Status() *BFileStatus {
-	bs := new(BFileStatus)
-	bs.Filename = b.Filename
-	if fileInfo, err := os.Stat(bs.Filename); err != nil {
-		bs.FileSize = 0
-		bs.FileStatus = err.Error()
-	} else {
-		bs.FileSize = uint64(fileInfo.Size())
-		bs.FileStatus = "ok"
-	}
-	bs.EOB = b.EOB
-	bs.Size = bs.EOB + bs.FileSize
-	return bs
 }
 
 // NewBFile
@@ -96,13 +71,17 @@ func (b *BFile) Open() (err error) {
 // Write out the buffer, and reset the EOB
 func (b *BFile) Flush() (err error) {
 	b.Open()
-	if _, err = b.File.Seek(0, io.SeekEnd); err != nil {
+	eod, err := b.File.Seek(0, io.SeekEnd)
+	b.EOD = uint64(eod)
+	if err != nil {
 		return err
 	}
-	if _, err = b.File.Write(b.Buffer[:b.EOB]); err != nil {
+	delta, err := b.File.Write(b.Buffer[:b.EOB])
+	if err != nil {
 		return err
 	}
 	b.EOB = 0
+	b.EOD += uint64(delta)
 	return err
 }
 
@@ -151,14 +130,6 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
 		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
 		Data = Data[space:]
-	}
-
-	// Write out the current buffer, and put the rest of the Data into the buffer
-
-	if b.File == nil {
-		if b.File, err = os.OpenFile(b.Filename, os.O_RDWR, os.ModePerm); err != nil {
-			return false, err
-		}
 	}
 
 	if eod, err := b.File.Seek(0, io.SeekEnd); err != nil {
@@ -231,9 +202,8 @@ func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 	case offset > b.EOD:
 		copy(data, b.Buffer[offset-b.EOD:])
 	default:
-		b.ReadAt(offset, data[:b.EOD-offset])
+		err = b.ReadAt(offset, data[:b.EOD-offset])
 		copy(data[b.EOD-offset:], b.Buffer[:])
-		err = b.Open()
 	}
 	return err
 }

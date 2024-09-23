@@ -1,8 +1,8 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -23,19 +23,6 @@ type KFile struct {
 	File         *BFile               // Key File
 	Cache        map[[32]byte]*DBBKey // Cache of DBBKey Offsets
 	BlocksCached int                  // Track blocks cached before rewritten
-}
-
-func (k *KFile) PrintStatus(label string) {
-	s := k.File.Status()
-
-	fmt.Println(label)
-
-	fmt.Printf("Filename     %s\n", s.Filename)
-	fmt.Printf("FileStatus   %s\n", s.FileStatus)
-	fmt.Printf("FileSize     %v\n", s.FileSize)
-	fmt.Printf("EOB          %v\n", s.EOB)
-	fmt.Printf("Size         %v\n", s.Size)
-	fmt.Print("------------------------------\n\n")
 }
 
 // Open
@@ -122,12 +109,9 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	start = k.Offsets[index]      // The index is where the section starts
 	if index < len(k.Offsets)-1 { // Handle the last Offset special
 		end = k.Offsets[index+1] //
-	} else { //                              The last section ends at EOF
-		if eofOffset, err := k.File.File.Seek(0, io.SeekEnd); err != nil {
-			return nil, err //
-		} else {
-			end = uint64(eofOffset) //
-		}
+	} else { //                              The last section ends at EOD
+		end = k.File.EOD //
+
 	}
 
 	if start == end { //                     If the start is the end, the section is empty
@@ -142,20 +126,14 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	var dbKey DBBKey             //          Search the keys by unmarshaling each key as we search
 	for len(keys) >= DBKeySize { //          Search all DBBKey entries, note they are not sorted.
-		adr, err := dbKey.Unmarshal(keys) //
-		if err != nil {
-			return nil, err
-		}
-		switch {
-
-		case adr == Key: //                  Is this the key sought?
+		if bytes.Equal(keys[:32], Key[:]) {
+			if _, err := dbKey.Unmarshal(keys); err != nil {
+				return nil, err
+			}
 			return &dbKey, nil
-
-		default:
-			keys = keys[DBKeySize:] //       Move to the next DBBKey
 		}
+		keys = keys[DBKeySize:] //       Move to the next DBBKey
 	}
-
 	return nil, errors.New("not found")
 }
 
