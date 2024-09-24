@@ -238,3 +238,58 @@ func TestBuildBig(t *testing.T) {
 	cntReads++
 
 }
+
+func TestBuildBig2(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), "BigDB")
+
+	const numPermKeys = 200_000_000
+	const numModKeys = 100_000
+	const minData = 100
+	const maxData = 2000
+	start := time.Now()
+	var cntWrites, cntReads float64
+
+	kvs, err := NewKVShard(dir)
+	assert.NoError(t, err, "create kv")
+
+	fmt.Print("Writing Keys to the Databases\n")
+
+	frD := NewFastRandom([]byte{1})
+	frDV := NewFastRandom([]byte{1, 1})
+	for i := 0; i < numModKeys; i++ {
+		key := frD.NextHash()
+		value := frDV.RandBuff(minData, maxData)
+		kvs.PutDyna(key, value)
+		cntWrites++
+	}
+
+	frP := NewFastRandom([]byte{2})
+	frPV := NewFastRandom([]byte{1, 1})
+	for i := 0; i < numPermKeys; i++ {
+		if (i+1)%(numPermKeys/100) == 0 {
+			wps := cntWrites / time.Since(start).Seconds()
+			tpw := ComputeTimePerOp(wps)
+			wpss := humanize.Comma(int64(wps))
+			tps := humanize.Comma(int64(i + 1))
+			fmt.Printf("perm entries: %11s | puts/s: %8s | average put: %12s\n", tps, wpss, tpw)
+		}
+		key := frP.NextHash()
+		value := frPV.RandBuff(minData, maxData)
+		kvs.PutPerm(key, value)
+		cntWrites++
+	}
+
+	frD.Reset()
+	for i := 0; i < numModKeys; i++ {
+		key := frD.NextHash()
+		value := frDV.RandBuff(minData, maxData)
+		kvs.PutDyna(key, value)
+		cntWrites++
+	}
+
+	wps := cntWrites / time.Since(start).Seconds()
+	tpw := ComputeTimePerOp(wps)
+	fmt.Printf("wps %8.3f %s\n", wps, tpw)
+	cntReads++
+
+}

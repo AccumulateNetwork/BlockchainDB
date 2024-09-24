@@ -56,6 +56,32 @@ func NewKVShard(directory string) (kvs *KVShard, err error) {
 	return kvs, nil
 }
 
+// PutDyna
+// Find the right shard, and put the key/value in the DynaKV in the shard
+func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
+	index := ShardIndex(key[:])
+	k.Shards[index].Open()
+	if writes, err := k.Shards[index].PutDyna(key, value); err != nil {
+		return err
+	} else if writes > 5000 {
+		k.Shards[index].Compress()
+	}
+	return nil
+}
+
+// PutPerm
+// Find the right shard, and put the key/value in the PermKV in the shard
+func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
+	index := ShardIndex(key[:])
+	k.Shards[index].Open()
+	if writes, err := k.Shards[index].PutPerm(key, value); err != nil {
+		return err
+	} else if writes > 5000 {
+		k.Shards[index].Compress()
+	}
+	return nil
+}
+
 // Put
 // Find the right shard, and put the key/value in said shard
 func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
@@ -67,6 +93,28 @@ func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 		k.Shards[index].Compress()
 	}
 	return nil
+}
+
+// GetDyna
+// Find the right shard, and extract the value from the DynaKV in the shard
+func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
+	index := ShardIndex(key[:])
+	k.Shards[index].Open()
+	if value, err = k.Shards[index].GetDyna(key); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+// GetPerm
+// Find the right shard, and extract the value from the PermKV in the shard
+func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {
+	index := ShardIndex(key[:])
+	k.Shards[index].Open()
+	if value, err = k.Shards[index].GetPerm(key); err != nil {
+		return nil, err
+	}
+	return value, nil
 }
 
 // Get

@@ -8,7 +8,8 @@ import (
 
 // Buffered File
 
-const BufferSize = 1024 * 8 // Buffer size for values written to the BFile
+const BufferSize = 1024 * 16 // Buffer size for values written to the BFile
+
 var nilKey [32]byte
 
 // Block BFile
