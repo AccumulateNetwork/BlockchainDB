@@ -17,11 +17,19 @@ type DBBKey struct {
 // Writes out the address with the offset and length of the DBBKey
 func (d DBBKey) Bytes(address [32]byte) []byte {
 	var b [50]byte
+	d.WriteTo(address, &b)
+	return b[:]
+}
+
+func (d DBBKey) WriteTo(address [32]byte, b *[50]byte) {
+	// This is ~6.5ns vs ~55ns for Bytes due to avoiding an allocation. That
+	// could matter in a tight loop with millions of keys. Unless the compiler
+	// inlines Bytes and eliminates the allocation, in which case there's no
+	// difference.
 	copy(b[:], address[:])
 	binary.BigEndian.PutUint64(b[34:], d.Offset)
 	binary.BigEndian.PutUint64(b[42:], d.Length)
 	binary.BigEndian.PutUint16(b[32:], d.Height)
-	return b[:]
 }
 
 // GetDBBKey

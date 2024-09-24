@@ -1,7 +1,6 @@
 package blockchainDB
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -46,6 +45,7 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 // Overwrites any existing KFile directory
 func NewKFile(Directory string) (kFile *KFile, err error) {
 	kFile = new(KFile)
+	kFile.Cache = make(map[[32]byte]*DBBKey)
 	os.RemoveAll(Directory)                                 // Don't care if this fails; usually does
 	if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Do care if Mkdir fails
 		return nil, err
@@ -56,8 +56,7 @@ func NewKFile(Directory string) (kFile *KFile, err error) {
 		return nil, err
 	}
 	kFile.Header.Init()
-	kFile.WriteHeader()
-	kFile.Cache = make(map[[32]byte]*DBBKey)
+	err = kFile.WriteHeader()
 	return kFile, err
 }
 
@@ -83,10 +82,7 @@ func (k *KFile) LoadHeader() (err error) {
 // Write the Header to the Key File
 func (k *KFile) WriteHeader() (err error) {
 	h := k.Header.Marshal()
-	if err = k.File.WriteAt(0, h); err != nil {
-		return err
-	}
-	return nil
+	return k.File.WriteAt(0, h)
 }
 
 // LoadKeys
@@ -126,7 +122,7 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	var dbKey DBBKey             //          Search the keys by unmarshaling each key as we search
 	for len(keys) >= DBKeySize { //          Search all DBBKey entries, note they are not sorted.
-		if bytes.Equal(keys[:32], Key[:]) {
+		if [32]byte(keys) == Key {
 			if _, err := dbKey.Unmarshal(keys); err != nil {
 				return nil, err
 			}
@@ -211,20 +207,31 @@ func (k *KFile) Close() (err error) {
 	}
 	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
 
-	k.File.File.Close()
-	os.Remove(k.File.Filename)
+	err = k.File.File.Close()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(k.File.Filename)
+	if err != nil {
+		return err
+	}
 	if k.File.File, err = os.Create(k.File.Filename); err != nil {
 		return err
 	}
-	k.WriteHeader()
+	err = k.WriteHeader()
+	if err != nil {
+		return err
+	}
 	// Write all the keys following the Header
 	for _, key := range keyList {
 		keyB := keyValues[key].Bytes(key)
-		k.File.Write(keyB)
+		_, err = k.File.Write(keyB)
+		if err != nil {
+			return err
+		}
 	}
 
-	k.File.Close()
-	return nil
+	return k.File.Close()
 }
 
 // GetKeyList
@@ -237,7 +244,11 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 		return nil, nil, err
 	}
 
-	k.File.File.Seek(HeaderSize, io.SeekStart)
+	// TODO: Use ReadAt
+	_, err = k.File.File.Seek(HeaderSize, io.SeekStart)
+	if err != nil {
+		return nil, nil, err
+	}
 	keyEntriesBytes, err := io.ReadAll(k.File.File)
 	if err != nil {
 		return nil, nil, err
