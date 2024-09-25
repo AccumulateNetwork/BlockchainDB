@@ -145,7 +145,7 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	if !k.Bloom.Test(key) { // If not in the Bloom, then k/v goes into perm
 		k.PWrites++
 		err = k.PermKV.Put(key, value)
-		if err != nil {
+		if err == nil {
 			k.Bloom.Set(key) // Now that we have this key, set key in the bloom filter
 		}
 		return k.DWrites, err // NOTE: We do not compress the PermKV... Only report DWrites

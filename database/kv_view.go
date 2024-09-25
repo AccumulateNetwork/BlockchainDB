@@ -25,13 +25,18 @@ type View struct {
 	KeyValues  map[[32]byte][]byte // key value pairs
 	LastAccess time.Time           // time that the view was created
 	Closed     bool                // true if the View is closed
+	KVView     *KVView             // The KV database with views
 }
 
-// ShardDBViews
+func (v *View) Get(key [32]byte) (value []byte, err error) {
+	return v.KVView.ViewGet(v, key)
+}
+
+// KVView
 // A wrapper around a sharded DB that implements Views.  Views are created in a stack.
 // More recent views lookup values in their cache, and then in the views that come
 // before.  Later views are ignored.
-type ShardDBViews struct {
+type KVView struct {
 	DB          *KVShard      // The underlying DB
 	ViewID      int           // The next ViewID
 	ActiveViews []*View       // List of all active Views, newest first
@@ -43,9 +48,9 @@ func NewShardDBViews(
 	Directory string,
 	Timeout time.Duration,
 	Partition, ShardCnt,
-	BufferCnt int) (sdbV *ShardDBViews, err error) {
+	BufferCnt int) (sdbV *KVView, err error) {
 
-	sdbV = new(ShardDBViews)
+	sdbV = new(KVView)
 	sdbV.Timeout = Timeout
 	if sdbV.DB, err = NewKVShard(Directory); err == nil {
 		return sdbV, nil
@@ -57,9 +62,9 @@ func OpenShardDBViews(
 	Directory string,
 	Timeout time.Duration,
 	Partition,
-	BufferCnt int) (sdbV *ShardDBViews, err error) {
+	BufferCnt int) (sdbV *KVView, err error) {
 
-	sdbV = new(ShardDBViews)
+	sdbV = new(KVView)
 	sdbV.Timeout = Timeout
 	if sdbV.DB, err = OpenKVShard(Directory); err == nil {
 		return sdbV, nil
@@ -67,7 +72,7 @@ func OpenShardDBViews(
 	return nil, err
 }
 
-func (s *ShardDBViews) Close() {
+func (s *KVView) Close() {
 	s.ActiveViews = nil
 	s.Map = nil
 	s.DB.Close()
@@ -76,7 +81,7 @@ func (s *ShardDBViews) Close() {
 // Active Views
 // Returns true if a valid active view exists.  If old views
 // exist, but none are active, the active views are tossed.
-func (s *ShardDBViews) IsViewActive() bool {
+func (s *KVView) IsViewActive() bool {
 	// The first entry in the ActiveViews is the View Cache
 	// ActiveViews with a length less than two means no active views
 	if len(s.ActiveViews) < 2 {
@@ -87,7 +92,7 @@ func (s *ShardDBViews) IsViewActive() bool {
 	return len(s.ActiveViews) > 0    // If any remain, then a View is Active
 }
 
-func (s *ShardDBViews) Put(key [32]byte, value []byte) error {
+func (s *KVView) Put(key [32]byte, value []byte) error {
 
 	// If not view is active, then write to the DB
 	if !s.IsViewActive() {
@@ -99,7 +104,7 @@ func (s *ShardDBViews) Put(key [32]byte, value []byte) error {
 	return nil
 }
 
-func (s *ShardDBViews) Get(key [32]byte) (value []byte) {
+func (s *KVView) Get(key [32]byte) (value []byte, err error) {
 
 	// If no view is active, just get the DB value
 	if !s.IsViewActive() {
@@ -109,13 +114,13 @@ func (s *ShardDBViews) Get(key [32]byte) (value []byte) {
 	// If a view is active, we need to check the view cache first
 	value, ok := s.ActiveViews[0].KeyValues[key]
 	if ok {
-		return value
+		return value, nil
 	}
 
 	return s.DB.Get(key) // Nothing in the view cache? Pull from the DB
 }
 
-func (s *ShardDBViews) NewView() *View {
+func (s *KVView) NewView() *View {
 	// If no view is active, we have to cache DB updates so
 	// create a "DB Update View" at s.ActiveViews[0]
 	if !s.IsViewActive() {
@@ -129,6 +134,7 @@ func (s *ShardDBViews) NewView() *View {
 	// the newest views to the end of the list.
 	view := new(View)
 	s.ViewID++
+	view.KVView = s
 	view.ID = s.ViewID
 	view.LastAccess = time.Now()
 	view.KeyValues = make(map[[32]byte][]byte)
@@ -138,7 +144,7 @@ func (s *ShardDBViews) NewView() *View {
 
 // GetViewIndex
 // Returns the view index for a view.  Returns 0 if no valid view exists
-func (s *ShardDBViews) GetViewIndex(view *View) int {
+func (s *KVView) GetViewIndex(view *View) int {
 	if len(s.ActiveViews) == 0 {
 		return 0
 	}
@@ -181,7 +187,7 @@ func (s *ShardDBViews) GetViewIndex(view *View) int {
 // To a get of a key value pair using a view.  The view is searched first, and all
 // active views that were created before this view are searched in turn.  If no
 // key value pair is found in the view or older views, then return what the DB has
-func (s *ShardDBViews) ViewGet(view *View, key [32]byte) (value []byte, err error) {
+func (s *KVView) ViewGet(view *View, key [32]byte) (value []byte, err error) {
 	//
 	view.LastAccess = time.Now()
 	// Check if the view provided is active.  If not, return an error that the
@@ -200,5 +206,5 @@ func (s *ShardDBViews) ViewGet(view *View, key [32]byte) (value []byte, err erro
 		}
 	}
 
-	return s.DB.Get(key), nil // If no key value pair exists, return whatever the DB has.
+	return s.DB.Get(key) // If no key value pair exists, return whatever the DB has.
 }
