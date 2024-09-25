@@ -1,7 +1,6 @@
 package blockchainDB
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -126,7 +125,7 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	var dbKey DBBKey             //          Search the keys by unmarshaling each key as we search
 	for len(keys) >= DBKeySize { //          Search all DBBKey entries, note they are not sorted.
-		if bytes.Equal(keys[:32], Key[:]) {
+		if [32]byte(keys) == Key {
 			if _, err := dbKey.Unmarshal(keys); err != nil {
 				return nil, err
 			}
