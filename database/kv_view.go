@@ -52,7 +52,7 @@ func NewShardDBViews(
 
 	sdbV = new(KVView)
 	sdbV.Timeout = Timeout
-	if sdbV.DB, err = NewKVShard(Directory); err == nil {
+	if sdbV.DB, err = NewKVShard(0, Directory, 1024); err == nil {
 		return sdbV, nil
 	}
 	return nil, err
@@ -143,9 +143,9 @@ func (s *KVView) NewView() *View {
 }
 
 // GetViewIndex
-// Returns the view index for a view.  Returns 0 if no valid view exists
+// Returns the view index for a view.  Returns 0 if view is closed.
 func (s *KVView) GetViewIndex(view *View) int {
-	if len(s.ActiveViews) == 0 {
+	if view.Closed || len(s.ActiveViews) == 0 {
 		return 0
 	}
 

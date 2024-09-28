@@ -144,27 +144,40 @@ func TestView(t *testing.T) {
 		assert.NoError(t, err, "put failed")
 	}
 
-	// None of the keys modified in the loop above should change in the view.
-	Kr.Reset()
-	Vr.Reset()
-	for i := 0; i < NumKeys/2; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		v, err := view.Get(key)
-		assert.NoError(t, err, "get failed")
-		assert.Equal(t, value, v, "failed to get data")
-	}
-
-	// Check the DB
+	// No values changed above should change in the view
 	Kr.Reset()
 	Vr.Reset()
 	for i := 0; i < NumKeys; i++ {
 		key := Kr.NextHash()
 		value := Vr.RandBuff(10, 10)
 		v, err := view.Get(key)
+		assert.NoError(t, err, "get failed")
+		assert.Equal(t, value, v, "failed to get data")
+	}
+	assert.Equal(t, 1, len(sdbv.ActiveViews), "Should have one active view")
+	sdbv.Close()
+
+	// Check the DB; first half should have changed values, last half not changed
+	Kr.Reset()
+	Vr.Reset()
+	for i := 0; i < NumKeys; i++ {
+		key := Kr.NextHash()
+		value := Vr.RandBuff(10, 10)
+		v, err := view.Get(key)
+		assert.NoError(t, err, "get failed")
 		if i >= NumKeys/2 {
-			assert.NoError(t, err, "get failed")
 			assert.Equal(t, value, v, "failed to get data")
+		} else {
+			assert.NotEqual(t, value, v, "failed to update value")
 		}
+	}
+	// Check the first half to be equal to the changed values
+	Kr.Reset()
+	for i := 0; i < NumKeys/2; i++ {
+		key := Kr.NextHash()
+		value := Vr.RandBuff(10, 10)
+		v, err := sdbv.Get(key)
+		assert.NoError(t, err, "put failed")
+		assert.Equal(t, value, v, "failed to get data")
 	}
 }

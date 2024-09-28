@@ -10,7 +10,7 @@ func TestHeader(t *testing.T) {
 	//filename, rm := MakeFilename("header.dat")
 	//defer rm()
 
-	h1 := new(Header).Init()
+	h1 := new(Header).Init(0, 1024)
 	s1 := h1.Marshal()
 	h2 := new(Header)
 	h2.Unmarshal(s1)

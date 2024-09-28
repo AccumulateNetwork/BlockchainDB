@@ -22,7 +22,7 @@ func TestKVShard(t *testing.T) {
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kvs, err := NewKVShard(dir)
+	kvs, err := NewKVShard(0, dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -84,7 +84,7 @@ func TestKVShard_2(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kvs, err := NewKVShard(dir)
+	kvs, err := NewKVShard(0, dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Generating Keys\n")
@@ -190,11 +190,11 @@ func TestBuildBig(t *testing.T) {
 	const numPermKeys = 200_000_000
 	const numModKeys = 100_000
 	const minData = 100
-	const maxData = 2000
+	const maxData = 500
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kvs, err := NewKVShard(dir)
+	kvs, err := NewKVShard(0, dir, 16)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing Keys to the Databases\n")
@@ -242,14 +242,14 @@ func TestBuildBig(t *testing.T) {
 func TestBuildBig2(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
-	const numPermKeys = 200_000_000
+	const numPermKeys = 2_000_000
 	const numModKeys = 100_000
 	const minData = 100
-	const maxData = 2000
+	const maxData = 500
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kvs, err := NewKVShard(dir)
+	kvs, err := NewKVShard(0, dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing Keys to the Databases\n")

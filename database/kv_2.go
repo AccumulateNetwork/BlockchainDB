@@ -9,7 +9,7 @@ import (
 
 const PermDirName = "perm"
 const DynaDirName = "dyna"
-const BloomSize = 0.25 // Bloom size in MB
+const BloomSize = 0.05 // Bloom size in MB
 
 // KV2
 // Maintains 2 layers of key value pairs.  The low level KVFile holds key/value pairs that don't change
@@ -35,7 +35,7 @@ type KV2 struct {
 // NewKV2
 // Create a two level KV file, where one KV file holds k/v pairs that don't change,
 // and another where k/v pairs do change
-func NewKV2(directory string) (kv2 *KV2, err error) {
+func NewKV2(height int, directory string, offsetsCnt int) (kv2 *KV2, err error) {
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
 		return nil, err
@@ -44,10 +44,10 @@ func NewKV2(directory string) (kv2 *KV2, err error) {
 	kv2 = new(KV2)
 	kv2.Directory = directory
 	kv2.Bloom = NewBloom(BloomSize)
-	if kv2.PermKV, err = NewKV(filepath.Join(directory, PermDirName)); err != nil {
+	if kv2.PermKV, err = NewKV(height, filepath.Join(directory, PermDirName), offsetsCnt); err != nil {
 		return nil, err
 	}
-	if kv2.DynaKV, err = NewKV(filepath.Join(directory, DynaDirName)); err != nil {
+	if kv2.DynaKV, err = NewKV(height, filepath.Join(directory, DynaDirName), offsetsCnt); err != nil {
 		return nil, err
 	}
 	return kv2, nil

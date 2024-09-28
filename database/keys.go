@@ -5,10 +5,9 @@ import (
 	"fmt"
 )
 
-const DBKeySize = 50
+const DBKeySize = 48
 
 type DBBKey struct {
-	Height uint16 // For index for a blockList
 	Offset uint64
 	Length uint64
 }
@@ -20,7 +19,6 @@ func (d DBBKey) Bytes(address [32]byte) []byte {
 	copy(b[:], address[:])
 	binary.BigEndian.PutUint64(b[34:], d.Offset)
 	binary.BigEndian.PutUint64(b[42:], d.Length)
-	binary.BigEndian.PutUint16(b[32:], d.Height)
 	return b[:]
 }
 
@@ -39,7 +37,6 @@ func (d *DBBKey) Unmarshal(data []byte) (address [32]byte, err error) {
 		return address, fmt.Errorf("data source is short %d", len(data))
 	}
 	copy(address[:], data[:32])
-	d.Height = binary.BigEndian.Uint16(data[32:])
 	d.Offset = binary.BigEndian.Uint64(data[34:])
 	d.Length = binary.BigEndian.Uint64(data[42:])
 	return address, nil
