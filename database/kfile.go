@@ -183,15 +183,15 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, err
 	}
 
-	var dbKey DBBKey             //          Search the keys by unmarshaling each key as we search
-	for len(keys) >= DBKeySize { //          Search all DBBKey entries, note they are not sorted.
+	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
+	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
 		if [32]byte(keys) == Key {
 			if _, err := dbKey.Unmarshal(keys); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
 		}
-		keys = keys[DBKeySize:] //       Move to the next DBBKey
+		keys = keys[DBKeyFullSize:] //       Move to the next DBBKey
 	}
 	return nil, errors.New("not found")
 }
@@ -267,7 +267,7 @@ func (k *KFile) Close() (err error) {
 			}
 			k.Offsets[lastIndex] = currentOffset //        Set this offset
 		}
-		currentOffset += DBKeySize //                      Add the size of the entry for next offset
+		currentOffset += DBKeyFullSize //                      Add the size of the entry for next offset
 	}
 
 	// Fill in the rest of the offsets table;
@@ -307,14 +307,14 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	if err != nil {
 		return nil, nil, err
 	}
-	numKeys := len(keyEntriesBytes) / DBKeySize
+	numKeys := len(keyEntriesBytes) / DBKeyFullSize
 	if numKeys == 0 {
 		return nil, nil, err
 	}
 
 	// Create a slice to hold all unique keys, giving priority to NewKeys
 	keyValues = make(map[[32]byte]*DBBKey)
-	for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeySize:] {
+	for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeyFullSize:] {
 		dbbKey := new(DBBKey)
 		key, err := dbbKey.Unmarshal(keyEntriesBytes)
 		if err != nil {
