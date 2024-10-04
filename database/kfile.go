@@ -6,22 +6,28 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 const (
-	kFileName       string = "kfile.dat"
-	kTmpFileName    string = "kfile_tmp.dat"
-	MaxCachedBlocks        = 20
+	kFileName       string = "kfile.dat"        // Name of Key File
+	kTmpFileName    string = "kfile_tmp.dat"    // Name of the tmp file
+	kHistory        string = "kfileHistory.dat" // Holds key history
+	MaxCachedBlocks        = 10                 // How many blocks to be cached before updating keys
+	KeyBreak               = 2000               // How many keys go into a kfile
 )
 
 // Block File
 // Holds the buffers and ID stuff needed to build DBBlocks (Database Blocks)
 type KFile struct {
-	Header
+	Header                            // kFile header (what is pushed to disk)
 	Directory    string               // Directory of the BFile
 	File         *BFile               // Key File
 	Cache        map[[32]byte]*DBBKey // Cache of DBBKey Offsets
 	BlocksCached int                  // Track blocks cached before rewritten
+	KFileHistory *KFile               // Holds Key History
+	HistoryMutex sync.Mutex           // Allow the History to be merged in background
+	KeyCnt       int                  // Number of keys in the current KFile
 }
 
 // Open
@@ -43,21 +49,75 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 // NewKFile
 // Creates a new KFile directory (holds a key file and a value file)
 // Overwrites any existing KFile directory
-func NewKFile(Directory string) (kFile *KFile, err error) {
+//
+// If Height is negative, then create a history kfile. Otherwise create
+// a kfile.dat.
+//
+// When height is increased, the old kfile is renamed, and a new kfile
+// is created.  The old kfile is then merged into the kFileHistory.dat
+
+func NewKFile(Height int, Directory string, offsetCnt int) (kFile *KFile, err error) {
 	kFile = new(KFile)
-	kFile.Cache = make(map[[32]byte]*DBBKey)
-	os.RemoveAll(Directory)                                 // Don't care if this fails; usually does
-	if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Do care if Mkdir fails
+	if Height >= 0 {
+		os.RemoveAll(Directory)                                 // Don't care if this fails; usually does
+		if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Do care if Mkdir fails
+			return nil, err
+		}
+	}
+	filename := kFileName
+	if Height < 0 {
+		filename = kHistory
+	}
+	kFile.Directory = Directory
+	if kFile.File, err = NewBFile(filepath.Join(Directory, filename)); err != nil {
 		return nil, err
+	}
+	kFile.Header.Init(Height, offsetCnt)
+	kFile.WriteHeader()
+	kFile.Cache = make(map[[32]byte]*DBBKey)
+
+	if Height >= 0 {
+		if kFile.KFileHistory, err = NewKFile(-1, Directory, 10240); err != nil {
+			return nil, err
+		}
 	}
 
-	kFile.Directory = Directory
-	if kFile.File, err = NewBFile(filepath.Join(Directory, kFileName)); err != nil {
-		return nil, err
-	}
-	kFile.Header.Init()
-	err = kFile.WriteHeader()
 	return kFile, err
+}
+
+// PushHistory
+// Creates a new kFile height.  Merges the keys of the current kFile into the History.
+// Resets the KFile to accept more keys.
+func (k *KFile) PushHistory() (err error) {
+	if k.Height < 0 {
+		return nil
+	}
+	if err = k.Close(); err != nil {
+		return err
+	}
+	keyValues, _, err := k.GetKeyList()
+	if err != nil {
+		return err
+	}
+	if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
+		return err
+	}
+	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
+		return err
+	}
+	k.Header.Init(int(k.HeaderSize), int(k.OffsetsCnt))
+	k.Close()
+	k.Open()
+	go func() {
+		k.HistoryMutex.Lock()
+		k.KFileHistory.Open()
+		for key, dbbKey := range keyValues {
+			k.KFileHistory.File.Write(dbbKey.Bytes(key))
+		}
+		k.HistoryMutex.Unlock()
+	}()
+
+	return nil
 }
 
 // Open
@@ -70,7 +130,7 @@ func (k *KFile) Open() error {
 // LoadHeader
 // Load the Header out of the Key File
 func (k *KFile) LoadHeader() (err error) {
-	h := make([]byte, HeaderSize)
+	h := make([]byte, k.HeaderSize)
 	if err = k.File.ReadAt(0, h); err != nil {
 		return err
 	}
@@ -100,7 +160,7 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	}
 
 	// The header reflects what is on disk.  Points keys to the section where it is.
-	index := OffsetIndex(Key[:])
+	index := k.OffsetIndex(Key[:])
 	var start, end uint64         // The header gives us offsets to key sections
 	start = k.Offsets[index]      // The index is where the section starts
 	if index < len(k.Offsets)-1 { // Handle the last Offset special
@@ -120,23 +180,25 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, err
 	}
 
-	var dbKey DBBKey             //          Search the keys by unmarshaling each key as we search
-	for len(keys) >= DBKeySize { //          Search all DBBKey entries, note they are not sorted.
+	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
+	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
 		if [32]byte(keys) == Key {
 			if _, err := dbKey.Unmarshal(keys); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
 		}
-		keys = keys[DBKeySize:] //       Move to the next DBBKey
+		keys = keys[DBKeyFullSize:] //       Move to the next DBBKey
 	}
 	return nil, errors.New("not found")
 }
 
+var fr = NewFastRandom([]byte{1})
+
 // Put
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
-
+	k.KeyCnt++
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
 	if update {                                    // If the file was updated && time to clear cache
 		if k.BlocksCached <= 0 {
@@ -151,6 +213,10 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 		} else {
 			k.BlocksCached--
 		}
+	}
+	if k.KeyCnt > 100+int(fr.UintN(KeyBreak)) {
+		k.KeyCnt = 0
+		k.PushHistory()
 	}
 	k.Cache[Key] = dbBKey // Then add to the cache anyway, because this
 	return err            //   key might span buffers
@@ -187,22 +253,22 @@ func (k *KFile) Close() (err error) {
 
 	// Now we have a set of bin-sorted keys
 
-	var currentOffset uint64 = HeaderSize // Set to the location of the first key in the file
-	lastIndex := -1                       // This is the "last" offset processed. Start below 0
-	for _, key := range keyList {         // Note that this never updates the first offset. That's okay, it doesn't change
-		index := OffsetIndex(key[:]) //       Use the first two bytes as the index
-		if lastIndex < int(index) {  //       If this index is greater than the last
-			lastIndex++                                 //     Don't overwrite the previous offset
-			for ; lastIndex < int(index); lastIndex++ { //     Update any skipped offsets
+	var currentOffset uint64 = uint64(k.HeaderSize) // Set to the location of the first key in the file
+	lastIndex := -1                                 // This is the "last" offset processed. Start below 0
+	for _, key := range keyList {                   // Note that this never updates the first offset. That's okay, it doesn't change
+		index := k.OffsetIndex(key[:]) //       Use the first two bytes as the index
+		if lastIndex < int(index) {    //       If this index is greater than the last
+			lastIndex++                                 // Don't overwrite the previous offset
+			for ; lastIndex < int(index); lastIndex++ { // Update any skipped offsets
 				k.Offsets[lastIndex] = currentOffset //
 			}
-			k.Offsets[lastIndex] = currentOffset //            Set this offset
+			k.Offsets[lastIndex] = currentOffset //        Set this offset
 		}
-		currentOffset += DBKeySize //                          Add the size of the entry for next offset
+		currentOffset += DBKeyFullSize //                      Add the size of the entry for next offset
 	}
 
 	// Fill in the rest of the offsets table;
-	for i := lastIndex + 1; i < NumOffsets; i++ {
+	for i := lastIndex + 1; i < int(k.OffsetsCnt); i++ {
 		k.Header.Offsets[i] = currentOffset
 	}
 	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
@@ -245,7 +311,7 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	}
 
 	// TODO: Use ReadAt
-	_, err = k.File.File.Seek(HeaderSize, io.SeekStart)
+	_, err = k.File.File.Seek(int64(k.HeaderSize), io.SeekStart)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -253,14 +319,14 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	if err != nil {
 		return nil, nil, err
 	}
-	numKeys := len(keyEntriesBytes) / DBKeySize
+	numKeys := len(keyEntriesBytes) / DBKeyFullSize
 	if numKeys == 0 {
 		return nil, nil, err
 	}
 
 	// Create a slice to hold all unique keys, giving priority to NewKeys
 	keyValues = make(map[[32]byte]*DBBKey)
-	for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeySize:] {
+	for ; len(keyEntriesBytes) > 0; keyEntriesBytes = keyEntriesBytes[DBKeyFullSize:] {
 		dbbKey := new(DBBKey)
 		key, err := dbbKey.Unmarshal(keyEntriesBytes)
 		if err != nil {
@@ -283,8 +349,8 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	// They won't be sorted inside the bins.
 	// The order will not be the same over multiple machines.
 	sort.Slice(KeyList, func(i, j int) bool {
-		a := OffsetIndex(KeyList[i][:]) // Bin for a
-		b := OffsetIndex(KeyList[j][:]) // Bin for b
+		a := k.OffsetIndex(KeyList[i][:]) // Bin for a
+		b := k.OffsetIndex(KeyList[j][:]) // Bin for b
 		return a < b
 	})
 

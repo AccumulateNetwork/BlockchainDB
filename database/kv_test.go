@@ -19,7 +19,7 @@ func TestKV(t *testing.T) {
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kv, err := NewKV(dir)
+	kv, err := NewKVShard(0, dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -76,7 +76,7 @@ func TestKV_2(t *testing.T) {
 	frKeys := NewFastRandom([]byte{1})
 	frValues := NewFastRandom([]byte{2})
 
-	kv, err := NewKV(dir)
+	kv2, err := NewKV2(0, dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -86,14 +86,14 @@ func TestKV_2(t *testing.T) {
 		key := frKeys.NextHash()
 		value := frValues.RandChar(100, 200)
 
-		err = kv.Put(key, value)
+		_, err = kv2.Put(key, value)
 		assert.NoErrorf(t, err, "Failed to put %d", i)
 		if err != nil {
 			return
 		}
 		if i%10000 == 0 {
-			kv.Compress()
-			kv.Open()
+			kv2.Compress()
+			kv2.Open()
 		}
 
 		cntWrites++
@@ -105,14 +105,14 @@ func TestKV_2(t *testing.T) {
 	for i := 0; i < numKVs; i++ {
 		key := frKeys.NextHash()
 		value := frValues.RandChar(100, 200)
-		err = kv.Put(key, value)
+		_, err = kv2.Put(key, value)
 		assert.NoError(t, err, "Failed to put")
 		if err != nil {
 			return
 		}
 		if i%10000 == 0 {
-			kv.Compress()
-			kv.Open()
+			kv2.Compress()
+			kv2.Open()
 		}
 
 		cntWrites++
@@ -132,7 +132,7 @@ func TestKV_2(t *testing.T) {
 		key := frKeys.NextHash()
 		value := frValues.RandChar(100, 200)
 
-		value2, err := kv.Get(key)
+		value2, err := kv2.Get(key)
 		assert.NoError(t, err, "Should be not found")
 		assert.NotEqual(t, value, value2, "Should not match")
 		if bytes.Equal(value, value2) || err != nil {
@@ -150,7 +150,7 @@ func TestKV_2(t *testing.T) {
 		key := frKeys.NextHash()
 		value := frValues.RandChar(100, 200)
 
-		value2, err := kv.Get(key)
+		value2, err := kv2.Get(key)
 		assert.NoError(t, err, "Failed to put")
 		assert.Equal(t, value, value2, "Didn't the the value back")
 		if !bytes.Equal(value, value2) || err != nil {
@@ -165,7 +165,7 @@ func TestKV_2(t *testing.T) {
 	for i := 0; i < numKVs; i += int(frKeys.UintN(20)) {
 		key := frKeys.NextHash()
 
-		value2, err := kv.Get(key)
+		value2, err := kv2.Get(key)
 		assert.Error(t, err, "Failed to put")
 		assert.Nil(t, value2, "Should return nothing")
 		if value2 != nil || err == nil {
@@ -175,8 +175,8 @@ func TestKV_2(t *testing.T) {
 		cntReads++
 	}
 
-	kv.Compress()
-	kv.Open()
+	kv2.Compress()
+	kv2.Open()
 
 	fmt.Println("Test post-compression")
 
@@ -188,7 +188,7 @@ func TestKV_2(t *testing.T) {
 		key := frKeys.NextHash()
 		value := frValues2.RandChar(100, 200) // Use the frValues clone
 
-		value2, err := kv.Get(key)
+		value2, err := kv2.Get(key)
 		assert.NoError(t, err, "Failed to put")
 		assert.Equal(t, value, value2, "Didn't the the value back")
 		if !bytes.Equal(value, value2) || err != nil {

@@ -5,31 +5,26 @@ import (
 	"fmt"
 )
 
-const DBKeySize = 50
+const DBKeyFullSize = 48
 
 type DBBKey struct {
-	Height uint16 // For index for a blockList
 	Offset uint64
 	Length uint64
+}
+
+type DBBKeyFull struct {
+	Key    [32]byte //The Key
+	DBBKey          // And its offset and Length
 }
 
 // Bytes
 // Writes out the address with the offset and length of the DBBKey
 func (d DBBKey) Bytes(address [32]byte) []byte {
-	var b [50]byte
-	d.WriteTo(address, &b)
-	return b[:]
-}
-
-func (d DBBKey) WriteTo(address [32]byte, b *[50]byte) {
-	// This is ~6.5ns vs ~55ns for Bytes due to avoiding an allocation. That
-	// could matter in a tight loop with millions of keys. Unless the compiler
-	// inlines Bytes and eliminates the allocation, in which case there's no
-	// difference.
+	var b [DBKeyFullSize]byte
 	copy(b[:], address[:])
-	binary.BigEndian.PutUint64(b[34:], d.Offset)
-	binary.BigEndian.PutUint64(b[42:], d.Length)
-	binary.BigEndian.PutUint16(b[32:], d.Height)
+	binary.BigEndian.PutUint64(b[32:], d.Offset)
+	binary.BigEndian.PutUint64(b[40:], d.Length)
+	return b[:]
 }
 
 // GetDBBKey
@@ -43,12 +38,11 @@ func GetDBBKey(data []byte) (address [32]byte, dBBKey *DBBKey, err error) {
 // Unmarshal
 // Returns the address and the DBBKey from a slice of bytes
 func (d *DBBKey) Unmarshal(data []byte) (address [32]byte, err error) {
-	if len(data) < 50 {
+	if len(data) < DBKeyFullSize {
 		return address, fmt.Errorf("data source is short %d", len(data))
 	}
 	copy(address[:], data[:32])
-	d.Height = binary.BigEndian.Uint16(data[32:])
-	d.Offset = binary.BigEndian.Uint64(data[34:])
-	d.Length = binary.BigEndian.Uint64(data[42:])
+	d.Offset = binary.BigEndian.Uint64(data[32:])
+	d.Length = binary.BigEndian.Uint64(data[40:])
 	return address, nil
 }

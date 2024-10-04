@@ -16,7 +16,7 @@ func TestKFile(t *testing.T) {
 
 	fr := NewFastRandom([]byte{1})
 
-	kf, err := NewKFile(dir)
+	kf, err := NewKFile(0, dir, 10)
 	assert.NoError(t, err, "failed to create KFile")
 
 	fmt.Printf("Adding Keys\n")
@@ -28,7 +28,6 @@ func TestKFile(t *testing.T) {
 	for i := 0; i < numKeys; i++ {
 		k := fr.NextHash()
 		dbbKey := new(DBBKey)
-		dbbKey.Height = 0
 		dbbKey.Offset = uint64(i) * 100
 		dbbKey.Length = 1000
 		err = kf.Put(k, dbbKey)
@@ -53,7 +52,6 @@ func TestKFile(t *testing.T) {
 		}
 		k := fr.NextHash()
 		dbbKey := new(DBBKey)
-		dbbKey.Height = 0
 		dbbKey.Offset = uint64(i) * 100
 		dbbKey.Length = 1000
 		if dbk, err := kf.Get(k); err == nil {
