@@ -19,7 +19,7 @@ func TestKV2(t *testing.T) {
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kv2, err := NewKV2(0, dir, 1024)
+	kv2, err := NewKV2(dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -79,7 +79,7 @@ func TestKV2_2(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kv2, err := NewKV2(0, dir, 1024)
+	kv2, err := NewKV2(dir, 1024)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")

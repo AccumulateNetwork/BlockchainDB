@@ -187,7 +187,7 @@ func ComputeTimePerOp(tps float64) string {
 	opn := 1 / tps * 1e9 // Operations Per ns
 	switch {
 	case opn < 1e3:
-		return fmt.Sprintf("%4.3f n", opn)
+		return fmt.Sprintf("%4.3f ns", opn)
 	case opn < 1e6:
 		return fmt.Sprintf("%4.3f us", opn/1e3)
 	case opn < 1e9:

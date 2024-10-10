@@ -9,25 +9,32 @@ const valueFilename = "values.dat"
 const valueTmpFilename = "values_tmp.dat"
 
 type KV struct {
-	Directory string
-	vFile     *BFile
-	kFile     *KFile
+	Directory   string
+	vFile       *BFile
+	kFile       *KFile
+	HistoryFile *HistoryFile
+	UseHistory  bool
 }
 
 // NewKV
 // Overwrites any existing directory; directories are created for the vFile and kFile
-func NewKV(height int, directory string, offsetsCnt int) (kv *KV, err error) {
+func NewKV(history bool, directory string, offsetsCnt int) (kv *KV, err error) {
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
 		return nil, err
 	}
 	kv = new(KV)
 	kv.Directory = directory
-	if kv.kFile, err = NewKFile(height, directory, offsetsCnt); err != nil {
+	if kv.kFile, err = NewKFile(history, directory, offsetsCnt); err != nil {
 		return nil, err
 	}
 	if kv.vFile, err = NewBFile(filepath.Join(directory, valueFilename)); err != nil {
 		return nil, err
+	}
+	if history {
+		if kv.HistoryFile, err = NewHistoryFile(1024, directory); err != nil {
+			return nil, err
+		}
 	}
 	return kv, nil
 }

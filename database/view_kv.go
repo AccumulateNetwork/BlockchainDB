@@ -52,7 +52,7 @@ func NewShardDBViews(
 
 	sdbV = new(KVView)
 	sdbV.Timeout = Timeout
-	if sdbV.DB, err = NewKVShard(0, Directory, 1024); err == nil {
+	if sdbV.DB, err = NewKVShard(Directory, 1024); err == nil {
 		return sdbV, nil
 	}
 	return nil, err

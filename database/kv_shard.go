@@ -38,7 +38,7 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 // NewKVShard
 // Create a new KVShard database.  This database creates database shards to
 // reduce the overhead of compressing large database files.
-func NewKVShard(height int, directory string, offsetsCnt int) (kvs *KVShard, err error) {
+func NewKVShard(directory string, offsetsCnt int) (kvs *KVShard, err error) {
 	os.RemoveAll(directory)                                    // Get rid of any existing directory
 	if err = os.MkdirAll(directory, os.ModePerm); err != nil { // Make the directory
 		return nil, err
@@ -48,7 +48,7 @@ func NewKVShard(height int, directory string, offsetsCnt int) (kvs *KVShard, err
 	kvs.Directory = directory   // Keep the directory
 	for i := range kvs.Shards { // Then create all the shards
 		shardDir := kvs.ShardDir(i)
-		if kvs.Shards[i], err = NewKV2(height, shardDir, offsetsCnt); err != nil { // Create the KV2 for each shard
+		if kvs.Shards[i], err = NewKV2(shardDir, offsetsCnt); err != nil { // Create the KV2 for each shard
 			return nil, err
 		}
 	}

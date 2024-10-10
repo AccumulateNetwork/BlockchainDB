@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func TestKFile(t *testing.T) {
 
 	fr := NewFastRandom([]byte{1})
 
-	kf, err := NewKFile(0, dir, 10)
+	kf, err := NewKFile(true, dir, 1024)
 	assert.NoError(t, err, "failed to create KFile")
 
 	fmt.Printf("Adding Keys\n")
@@ -24,13 +25,12 @@ func TestKFile(t *testing.T) {
 	numWrites := 0
 	numReads := 0
 	start := time.Now()
-
+	var dbbKey DBBKey
 	for i := 0; i < numKeys; i++ {
 		k := fr.NextHash()
-		dbbKey := new(DBBKey)
 		dbbKey.Offset = uint64(i) * 100
 		dbbKey.Length = 1000
-		err = kf.Put(k, dbbKey)
+		err = kf.Put(k, &dbbKey)
 		numWrites++
 		assert.NoError(t, err, "failed to put")
 	}
@@ -47,19 +47,21 @@ func TestKFile(t *testing.T) {
 	fmt.Printf("Check Keys\n")
 
 	for i := 0; i < numKeys; i++ {
-		if (i+1)%(numKeys/10) == 0 {
+		cnt := numKeys                        // stupid cnt necessary, because if numKeys == 1
+		if cnt > 100 && (i+1)%(cnt/10) == 0 { // this line still throws a div by 0 on numKeys/10
 			fmt.Printf("Processing %d\n", i+1)
 		}
 		k := fr.NextHash()
 		dbbKey := new(DBBKey)
 		dbbKey.Offset = uint64(i) * 100
 		dbbKey.Length = 1000
-		if dbk, err := kf.Get(k); err == nil {
-			d1b := dbbKey.Bytes(k)
-			d2b := dbk.Bytes(k)
-			assert.Equal(t, d1b, d2b, "didn't get the dbbKey back")
-		} else {
-			assert.NoErrorf(t, err, "failed to Get %x %d", k[:4], i)
+		dbk, err := kf.Get(k)
+		assert.NoErrorf(t, err, "key %d", i)
+		if err != nil {
+			return
+		}
+		assert.Equalf(t, dbbKey.Bytes(k), dbk.Bytes(k), "dbbKey not same. key %d", i)
+		if !bytes.Equal(dbbKey.Bytes(k), dbk.Bytes(k)) {
 			return
 		}
 		numReads++

@@ -19,7 +19,7 @@ type DBBKeyFull struct {
 
 // Bytes
 // Writes out the address with the offset and length of the DBBKey
-func (d DBBKey) Bytes(address [32]byte) []byte {
+func (d *DBBKey) Bytes(address [32]byte) []byte {
 	var b [DBKeyFullSize]byte
 	copy(b[:], address[:])
 	binary.BigEndian.PutUint64(b[32:], d.Offset)

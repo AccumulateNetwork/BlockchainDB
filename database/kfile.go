@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,11 +11,11 @@ import (
 )
 
 const (
-	kFileName       string = "kfile.dat"        // Name of Key File
-	kTmpFileName    string = "kfile_tmp.dat"    // Name of the tmp file
-	kHistory        string = "kfileHistory.dat" // Holds key history
-	MaxCachedBlocks        = 10                 // How many blocks to be cached before updating keys
-	KeyBreak               = 2000               // How many keys go into a kfile
+	kFileName       string = "kfile.dat"     // Name of Key File
+	kTmpFileName    string = "kfile_tmp.dat" // Name of the tmp file
+	MaxCachedBlocks        = 10              // How many blocks to be cached before updating keys
+	KeyLimit               = 10_000          // How many keys go into a kfile before they are sent to History
+	kOffsetCnt             = 1024            // Entries in the kFile offset table
 )
 
 // Block File
@@ -23,11 +24,12 @@ type KFile struct {
 	Header                            // kFile header (what is pushed to disk)
 	Directory    string               // Directory of the BFile
 	File         *BFile               // Key File
+	History      *HistoryFile         // The History Database
 	Cache        map[[32]byte]*DBBKey // Cache of DBBKey Offsets
 	BlocksCached int                  // Track blocks cached before rewritten
-	KFileHistory *KFile               // Holds Key History
 	HistoryMutex sync.Mutex           // Allow the History to be merged in background
 	KeyCnt       int                  // Number of keys in the current KFile
+	TotalCnt     int                  // Total number of keys processed
 }
 
 // Open
@@ -50,37 +52,23 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 // Creates a new KFile directory (holds a key file and a value file)
 // Overwrites any existing KFile directory
 //
-// If Height is negative, then create a history kfile. Otherwise create
-// a kfile.dat.
-//
 // When height is increased, the old kfile is renamed, and a new kfile
 // is created.  The old kfile is then merged into the kFileHistory.dat
 
-func NewKFile(Height int, Directory string, offsetCnt int) (kFile *KFile, err error) {
+func NewKFile(History bool, Directory string, offsetCnt int) (kFile *KFile, err error) {
 	kFile = new(KFile)
-	if Height >= 0 {
-		os.RemoveAll(Directory)                                 // Don't care if this fails; usually does
-		if err = os.Mkdir(Directory, os.ModePerm); err != nil { // Do care if Mkdir fails
-			return nil, err
-		}
-	}
+
 	filename := kFileName
-	if Height < 0 {
-		filename = kHistory
-	}
 	kFile.Directory = Directory
 	if kFile.File, err = NewBFile(filepath.Join(Directory, filename)); err != nil {
 		return nil, err
 	}
-	kFile.Header.Init(Height, offsetCnt)
+	if kFile.History, err = NewHistoryFile(offsetCnt, Directory); err != nil {
+		return nil, err
+	}
+	kFile.Header.Init(offsetCnt)
 	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
-
-	if Height >= 0 {
-		if kFile.KFileHistory, err = NewKFile(-1, Directory, 10240); err != nil {
-			return nil, err
-		}
-	}
 
 	return kFile, err
 }
@@ -89,13 +77,14 @@ func NewKFile(Height int, Directory string, offsetCnt int) (kFile *KFile, err er
 // Creates a new kFile height.  Merges the keys of the current kFile into the History.
 // Resets the KFile to accept more keys.
 func (k *KFile) PushHistory() (err error) {
-	if k.Height < 0 {
+	fmt.Printf("Total: %d processed, current %d --Add to History\n", k.TotalCnt, k.KeyCnt)
+	if k.History == nil {
 		return nil
 	}
 	if err = k.Close(); err != nil {
 		return err
 	}
-	keyValues, _, err := k.GetKeyList()
+	keyValues, keyList, err := k.GetKeyList()
 	if err != nil {
 		return err
 	}
@@ -105,18 +94,22 @@ func (k *KFile) PushHistory() (err error) {
 	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
 		return err
 	}
-	k.Header.Init(int(k.HeaderSize), int(k.OffsetsCnt))
+	k.Header.Init(int(k.OffsetsCnt))
 	k.Close()
 	k.Open()
 	go func() {
-		k.HistoryMutex.Lock()
-		k.KFileHistory.Open()
-		for key, dbbKey := range keyValues {
-			k.KFileHistory.File.Write(dbbKey.Bytes(key))
+		buff := make([]byte, len(keyList)*DBKeyFullSize)
+		buffPtr := buff
+		for _, k := range keyList {
+			copy(buffPtr, (*keyValues[k]).Bytes(k))
+			buffPtr = buffPtr[DBKeyFullSize:]
 		}
-		k.HistoryMutex.Unlock()
+		k.HistoryMutex.Lock()
+		defer k.HistoryMutex.Unlock()
+		if err = k.History.AddKeys(buff); err != nil {
+			panic("error sending data to history")
+		}
 	}()
-
 	return nil
 }
 
@@ -148,14 +141,31 @@ func (k *KFile) WriteHeader() (err error) {
 	return nil
 }
 
+// Get
+// first tries kGet.  If not found, and a History exists, then
+// look at the history.
+func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
+	dbBKey, err = k.kGet(Key)
+	switch {
+	case err == nil:
+		return dbBKey, nil
+	case k.History != nil:
+		k.History.Mutex.Lock()
+		defer k.History.Mutex.Unlock()
+		return k.History.Get(Key)
+	default:
+		return dbBKey, err
+	}
+}
+
 // LoadKeys
 // Loads all the keys
 
-// Get
+// kGet
 // Get the value for a given DBKeyFull.  The value returned
 // is free for the user to use (i.e. not part of a buffer used
 // by the BFile)
-func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
+func (k *KFile) kGet(Key [32]byte) (dbBKey *DBBKey, err error) {
 
 	// Return the value if it is in the cache waiting to be written
 	if value, ok := k.Cache[Key]; ok {
@@ -196,12 +206,11 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	return nil, errors.New("not found")
 }
 
-var fr = NewFastRandom([]byte{1})
-
 // Put
 // Put a key value pair into the BFile, return the *DBBKeyFull
 func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 	k.KeyCnt++
+	k.TotalCnt++
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
 	if update {                                    // If the file was updated && time to clear cache
 		if k.BlocksCached <= 0 {
@@ -217,7 +226,7 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 			k.BlocksCached--
 		}
 	}
-	if k.KeyCnt > 100+int(fr.UintN(KeyBreak)) {
+	if k.KeyCnt > KeyLimit {
 		k.KeyCnt = 0
 		k.PushHistory()
 	}

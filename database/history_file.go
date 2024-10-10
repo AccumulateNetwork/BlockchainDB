@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -126,10 +126,7 @@ func (hf *HistoryFile) Unmarshal(data []byte) {
 		hf.KeySets[i] = ks
 		hf.KeySetOffset[i] = ks
 	}
-	// Sort KeySetOffset entries by where their file offsets
-	sort.Slice(hf.KeySetOffset, func(i, j int) bool {
-		return hf.KeySetOffset[i].Start < hf.KeySetOffset[j].Start
-	})
+	hf.OffsetSort()
 }
 
 // Index
@@ -182,8 +179,17 @@ func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 // Sort the indexes by HistoryFile Offsets; Sort by the end, because
 // empty keySets can have the same Start as one keySet...
 func (hf *HistoryFile) OffsetSort() {
-	sort.Slice(hf.KeySetOffset, func(i, j int) bool {
-		return hf.KeySetOffset[i].End < hf.KeySetOffset[j].End
+	ret := 0
+	slices.SortFunc(hf.KeySetOffset, func(a, b *KeySet) int {
+		switch {
+		case a.End < b.End:
+			ret = -1
+		case a.End == b.End:
+			ret = 0
+		default:
+			ret = 1
+		}
+		return ret
 	})
 	for i, keySet := range hf.KeySetOffset {
 		keySet.OffsetIndex = i
