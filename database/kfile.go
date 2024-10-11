@@ -135,10 +135,7 @@ func (k *KFile) LoadHeader() (err error) {
 // Write the Header to the Key File
 func (k *KFile) WriteHeader() (err error) {
 	h := k.Header.Marshal()
-	if err = k.File.WriteAt(0, h); err != nil {
-		return err
-	}
-	return nil
+	return k.File.WriteAt(0, h)
 }
 
 // Get
@@ -285,20 +282,31 @@ func (k *KFile) Close() (err error) {
 	}
 	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
 
-	k.File.File.Close()
-	os.Remove(k.File.Filename)
+	err = k.File.File.Close()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(k.File.Filename)
+	if err != nil {
+		return err
+	}
 	if k.File.File, err = os.Create(k.File.Filename); err != nil {
 		return err
 	}
-	k.WriteHeader()
+	err = k.WriteHeader()
+	if err != nil {
+		return err
+	}
 	// Write all the keys following the Header
 	for _, key := range keyList {
 		keyB := keyValues[key].Bytes(key)
-		k.File.Write(keyB)
+		_, err = k.File.Write(keyB)
+		if err != nil {
+			return err
+		}
 	}
 
-	k.File.Close()
-	return nil
+	return k.File.Close()
 }
 
 // GetKeyList
@@ -311,7 +319,11 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 		return nil, nil, err
 	}
 
-	k.File.File.Seek(int64(k.HeaderSize), io.SeekStart)
+	// TODO: Use ReadAt
+	_, err = k.File.File.Seek(int64(k.HeaderSize), io.SeekStart)
+	if err != nil {
+		return nil, nil, err
+	}
 	keyEntriesBytes, err := io.ReadAll(k.File.File)
 	if err != nil {
 		return nil, nil, err

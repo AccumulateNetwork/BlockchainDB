@@ -14,6 +14,8 @@ const (
 	seedBytes  = seedSize / 8   // Seed in bytes
 )
 
+// TODO: Move this into a _test file since it's only used by tests
+
 type FastRandom struct {
 	initialSeed []byte
 	sponge      [spongeSize]uint64

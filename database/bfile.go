@@ -71,7 +71,10 @@ func (b *BFile) Open() (err error) {
 // Flush
 // Write out the buffer, and reset the EOB
 func (b *BFile) Flush() (err error) {
-	b.Open()
+	err = b.Open()
+	if err != nil {
+		return err
+	}
 	eod, err := b.File.Seek(0, io.SeekEnd)
 	b.EOD = uint64(eod)
 	if err != nil {
@@ -92,14 +95,15 @@ func (b *BFile) Close() (err error) {
 	if err = b.Flush(); err != nil {
 		return err
 	}
-	b.File.Close()
+	err = b.File.Close()
 	b.File = nil
-	return nil
+	return err
 }
 
 // Offset
 // Returns the current real size (file + EOB) of the BFile
 func (b *BFile) Offset() (offset uint64, err error) {
+	// Question: Why isn't b.EOD + b.EOB sufficient?
 	fileInfo, err := b.File.Stat()
 	if err != nil {
 		return 0, err
@@ -125,14 +129,18 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 		return false, nil
 	}
 
-	b.Open()
-
-	if space > 0 {
-		copy(b.Buffer[b.EOB:], Data[:space]) // Copy what fits into the current buffer
-		b.EOB += space                       // Update b.EOB (should be equal to BufferSize)
-		Data = Data[space:]
+	err = b.Open()
+	if err != nil {
+		return false, err
 	}
 
+	if space > 0 {
+		n := copy(b.Buffer[b.EOB:], Data) // Copy what fits into the current buffer
+		b.EOB += uint64(n)                // Update b.EOB (should be equal to BufferSize)
+		Data = Data[n:]
+	}
+
+	// Question: Why is it necessary to seek?
 	if eod, err := b.File.Seek(0, io.SeekEnd); err != nil {
 		return false, err
 	} else {
@@ -160,6 +168,8 @@ func (b *BFile) Write(Data []byte) (update bool, err error) {
 // To Do: modify to allow writing to locations that overlap the buffer
 // (Not really required as yet, since it is used to update buffers...)
 func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
+	// Question: This is only ever used by WriteHeader - is there a reason to
+	// preserve this as a separate function?
 	if err = b.Open(); err != nil {
 		return err
 	}
@@ -168,6 +178,8 @@ func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
 		return err
 	}
 
+	// Question: Can we remove the call to Stat by simply comparing the value
+	// returned by Write to EOD?
 	if _, err = b.File.Write(data); err != nil {
 		return err
 	}
@@ -192,6 +204,8 @@ func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 		if err = b.Open(); err != nil {
 			return err
 		}
+		// Question: Why not call File.ReadAt and avoid the call to Seek and
+		// avoid clobbering the file offset?
 		if _, err = b.File.Seek(int64(offset), io.SeekStart); err != nil {
 			return err
 		}
@@ -199,7 +213,8 @@ func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 			return err
 		}
 	case DataLastOffset > b.EOB+b.EOD:
-		err = fmt.Errorf("attempt to read past the EOF(%d) attempt(%d)", b.EOB+b.EOD, DataLastOffset)
+		// Include `io.EOF` so `errors.Is(err, io.EOF)` works
+		err = fmt.Errorf("%w: attempt to read past the EOF(%d) attempt(%d)", io.EOF, b.EOB+b.EOD, DataLastOffset)
 	case offset > b.EOD:
 		copy(data, b.Buffer[offset-b.EOD:])
 	default:
