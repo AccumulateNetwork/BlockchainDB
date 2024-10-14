@@ -260,10 +260,13 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	end := hf.KeySets[index].End
 
 	if start == end { //                     If the start is the end, the section is empty
-		return nil, errors.New("not found")
+		return nil, errors.New("not found") // TODO use buffer...
 	}
 
-	keys := make([]byte, end-start) //       Create a buffer for the section
+	if len(hf.Buffer) < int(end-start) {
+		hf.Buffer = make([]byte, end-start+10240) // Grow the buffer by 10k if needed
+	}
+	keys := hf.Buffer[:end-start]
 
 	if _, err = hf.File.ReadAt(keys, int64(start)); err != nil { // Read the section
 		return nil, err
@@ -272,7 +275,7 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
 	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
 		if [32]byte(keys) == Key {
-			if _, err := dbKey.Unmarshal(keys); err != nil {
+			if _, err := dbKey.Unmarshal(keys[:end-start]); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
