@@ -46,3 +46,9 @@ func (d *DBBKey) Unmarshal(data []byte) (address [32]byte, err error) {
 	d.Length = binary.BigEndian.Uint64(data[40:])
 	return address, nil
 }
+
+// Print
+// Debugging thing.  Return the string representation of the Key & DBBKey
+func (d *DBBKey) Print(key [32]byte) string {
+	return fmt.Sprintf(" Key %x\n Off %d\n Len %d\n", key, d.Offset, d.Length)
+}

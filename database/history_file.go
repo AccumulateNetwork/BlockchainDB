@@ -64,7 +64,7 @@ type HistoryFile struct {
 // Creates and initializes a HistoryFile.  If one already exists, it is replaced with
 // a fresh, new, empty HistoryFile
 func NewHistoryFile(OffsetCnt int, Directory string) (historyFile *HistoryFile, err error) {
-	if OffsetCnt < 0 || OffsetCnt > 10240 {
+	if OffsetCnt < 0 || OffsetCnt > 102400 {
 		return nil, fmt.Errorf("index must be less than or equal to 10240, received %d", OffsetCnt)
 	}
 	hf := new(HistoryFile)
@@ -258,15 +258,16 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	index := hf.Index(Key)
 	start := hf.KeySets[index].Start // The index is where the section starts
 	end := hf.KeySets[index].End
+	keysLen := end - start
 
-	if start == end { //                     If the start is the end, the section is empty
+	if keysLen == 0 { //                     If the start is the end, the section is empty
 		return nil, errors.New("not found") // TODO use buffer...
 	}
 
-	if len(hf.Buffer) < int(end-start) {
+	if len(hf.Buffer) < int(keysLen) {
 		hf.Buffer = make([]byte, end-start+10240) // Grow the buffer by 10k if needed
 	}
-	keys := hf.Buffer[:end-start]
+	keys := hf.Buffer[:keysLen]
 
 	if _, err = hf.File.ReadAt(keys, int64(start)); err != nil { // Read the section
 		return nil, err
@@ -275,7 +276,7 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
 	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
 		if [32]byte(keys) == Key {
-			if _, err := dbKey.Unmarshal(keys[:end-start]); err != nil {
+			if _, err := dbKey.Unmarshal(keys[:DBKeyFullSize]); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil

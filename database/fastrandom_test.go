@@ -8,6 +8,23 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestForSmoke
+// Not a particularly useful test, but checks to make sure 1000 FastRandom Random
+// number generators with different seeds don't produce the same values.
+// Collisions Could occur for 64 bit values, but it should be highly unlikely.
+func TestForSmoke(t *testing.T) {
+	const numberOfGens = 1000
+	var gens [numberOfGens]*FastRandom
+	for i := 0; i < numberOfGens; i++ {
+		gens[i] = NewFastRandom([]byte(fmt.Sprintf("%d", i)))
+	}
+	for i := 0; i < numberOfGens-1; i++ {
+		for j := 1; j < numberOfGens; j++ {
+			assert.NotEqual(t, gens[i].Uint64(), gens[j].Uint64(), "Should not be equal")
+		}
+	}
+}
+
 func TestUint64(t *testing.T) {
 	collision1 := make(map[[32]byte]int)
 	collision2 := make(map[uint64]int)
@@ -138,5 +155,29 @@ func TestComputeTimePerOp(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		fmt.Printf("%16.3f value => %s\n", value, ComputeTimePerOp(value))
 		value = value / 10
+	}
+}
+
+func TestClone(t *testing.T) {
+
+	const batches = 5
+	const batchSize = 1_000
+
+	fr := NewFastRandom([]byte{1})
+	var saveFr *FastRandom
+	var values [batchSize * batches]uint64
+	for i := 0; i < batches; i++ {
+		saveFr = fr.Clone()
+		for j := 0; j < batchSize; j++ {
+			values[i*batchSize+j] = fr.Uint64()
+		}
+	}
+	for j := 0; j < batchSize; j++ {
+		a := saveFr.Uint64()
+		b := values[(batches-1)*batchSize+j]
+		if a != b {
+			assert.Equalf(t, a, b, "Not equal at %d", j)
+			return
+		}
 	}
 }

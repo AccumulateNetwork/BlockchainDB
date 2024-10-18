@@ -247,7 +247,7 @@ func TestBuildBig2(t *testing.T) {
 	const minData = 100
 	const maxData = 500
 	start := time.Now()
-	var cntWrites, cntReads float64
+	var cntWrites float64
 
 	kvs, err := NewKVShard(dir, 1024)
 	assert.NoError(t, err, "create kv")

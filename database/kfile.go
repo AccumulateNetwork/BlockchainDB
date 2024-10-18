@@ -2,7 +2,6 @@ package blockchainDB
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -77,7 +76,6 @@ func NewKFile(History bool, Directory string, offsetCnt int) (kFile *KFile, err 
 // Creates a new kFile height.  Merges the keys of the current kFile into the History.
 // Resets the KFile to accept more keys.
 func (k *KFile) PushHistory() (err error) {
-	fmt.Printf("Total: %d processed, current %d --Add to History\n", k.TotalCnt, k.KeyCnt)
 	if k.History == nil {
 		return nil
 	}
@@ -211,10 +209,10 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
 	if update {                                    // If the file was updated && time to clear cache
 		if k.BlocksCached <= 0 {
-			clear(k.Cache)                   //           Clear the cache and update the key offsets
 			if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
 				return err //                               the file has to be closed and opened to update
 			} //                                            the key offsets
+			clear(k.Cache)                       //           Clear the cache and update the key offsets
 			if err = k.File.Open(); err != nil { //       Reopen the file
 				return err
 			}
@@ -360,7 +358,7 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	sort.Slice(KeyList, func(i, j int) bool {
 		a := k.OffsetIndex(KeyList[i][:]) // Bin for a
 		b := k.OffsetIndex(KeyList[j][:]) // Bin for b
-		return a < b
+		return a > b
 	})
 
 	return keyValues, KeyList, nil
