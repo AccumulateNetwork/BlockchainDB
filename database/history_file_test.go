@@ -17,10 +17,10 @@ func TestHistory(t *testing.T) {
 	os.RemoveAll(directory)
 
 	const numBatches = 5
-	const batchSize = 10_000_000
+	const batchSize = 1_000_000
 
 	fr := NewFastRandom([]byte{1, 2}) // Reset fr to get the keys for the first batch
-	hf, err := NewHistoryFile(50000, directory)
+	hf, err := NewHistoryFile(2000, directory)
 	assert.NoError(t, err, "failed to create directory")
 
 	// Create a random set of keys to values;

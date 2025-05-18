@@ -8,7 +8,7 @@ import (
 
 // Buffered File
 
-const BufferSize = 1024 * 16 // Buffer size for values written to the BFile
+const BufferSize = 1024 * 32 // Buffer size for values written to the BFile
 
 var nilKey [32]byte
 
@@ -174,15 +174,12 @@ func (b *BFile) WriteAt(offset int64, data []byte) (err error) {
 		return err
 	}
 
-	if _, err = b.File.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-
 	// Question: Can we remove the call to Stat by simply comparing the value
 	// returned by Write to EOD?
-	if _, err = b.File.Write(data); err != nil {
+	if _, err = b.File.WriteAt(data, offset); err != nil {
 		return err
 	}
+	// This might increase the file size.  Make sure b.EOD is correct
 	if fileInfo, err := b.File.Stat(); err != nil {
 		return err
 	} else {

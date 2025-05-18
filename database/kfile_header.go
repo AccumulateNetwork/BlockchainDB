@@ -53,16 +53,25 @@ func (h *Header) Unmarshal(data []byte) {
 	data = data[4:]
 	h.HeaderSize = binary.BigEndian.Uint32(data)
 	data = data[4:]
+	
+	// Initialize the Offsets slice if it's nil or has the wrong length
+	if h.Offsets == nil || len(h.Offsets) != int(h.OffsetsCnt) {
+		h.Offsets = make([]uint64, h.OffsetsCnt)
+	}
+	
+	// Read the offsets
 	for i := range h.Offsets {
 		h.Offsets[i] = binary.BigEndian.Uint64(data[i*8:])
 	}
-	h.EndOfList = uint64(binary.BigEndian.Uint64(data[h.HeaderSize-8:]))
+	
+	// Read the EndOfList value
+	h.EndOfList = binary.BigEndian.Uint64(data[len(h.Offsets)*8:])
 }
 
 // Init
 // Initiate a header to its default value
 // for an empty BFile
-func (h *Header) Init(OffsetsCnt int) *Header {
+func (h *Header) Init(OffsetsCnt uint64) *Header {
 	h.OffsetsCnt = uint32(OffsetsCnt)
 	h.HeaderSize = uint32(OffsetsCnt)*8 + 4 + 4 + 8
 	h.Offsets = make([]uint64, OffsetsCnt)

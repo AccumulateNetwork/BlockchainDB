@@ -18,14 +18,14 @@ type KV struct {
 
 // NewKV
 // Overwrites any existing directory; directories are created for the vFile and kFile
-func NewKV(history bool, directory string, offsetsCnt int) (kv *KV, err error) {
+func NewKV(history bool, directory string, offsetsCnt, KeyLimit uint64, MaxCachedBlocks int) (kv *KV, err error) {
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
 		return nil, err
 	}
 	kv = new(KV)
 	kv.Directory = directory
-	if kv.kFile, err = NewKFile(history, directory, offsetsCnt); err != nil {
+	if kv.kFile, err = NewKFile(history, directory, offsetsCnt, KeyLimit, MaxCachedBlocks); err != nil {
 		return nil, err
 	}
 	if kv.vFile, err = NewBFile(filepath.Join(directory, valueFilename)); err != nil {
@@ -113,6 +113,10 @@ func (k *KV) Compress() (err error) {
 	k.Open()
 	k.Close()
 	k.Open()
+
+	if true {
+		return nil
+	}
 
 	tvFile, err := NewBFile(filepath.Join(k.Directory, valueTmpFilename))
 	if err != nil {

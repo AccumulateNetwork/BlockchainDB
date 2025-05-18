@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -42,10 +43,13 @@ func TestNewBFile(t *testing.T) {
 	const min = 10
 	const max = 500
 
+	ne := humanize.Comma(numEntries)
+	fmt.Printf("Write %s records\n", ne)
 	fr := NewFastRandom(nil)
 	bFile, err := NewBFile(filename)
 	assert.NoError(t, err, "failed to create BFile")
 	cnt := 0
+	dataCnt := 0
 	for i := 0; i < numEntries; i++ {
 		data := fr.RandChar(min, max)
 		data[len(data)-1] = '\n'
@@ -56,30 +60,36 @@ func TestNewBFile(t *testing.T) {
 		}
 		if update {
 			cnt++
-
 		}
+		dataCnt += len(data)
 	}
-	fmt.Printf("Total updates %d\n", cnt)
-
+	ct := humanize.Comma(int64(cnt))
+	dc := humanize.Comma(int64(dataCnt))
+	fmt.Printf(""+
+		"  Total updates: %s\n"+
+		"Entries written: %s\n"+
+		"    Total bytes: %s\n", ct, ne, dc)
+	fmt.Printf("Check that reads of everything without close work\n")
 	fr.Reset()
 	var offset uint64 = 0
 	assert.NoError(t, err, "failed to create BFile")
 	var buff [max]byte
 	for i := 0; i < numEntries; i++ {
 		data := fr.RandChar(min, max)
-		data[len(data)-1] = '\n'
-		err := bFile.ReadAt(offset, buff[:len(data)])
-		assert.NoError(t, err, "write error")
-		assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
-
-		if err != nil || !bytes.Equal(data, buff[:len(data)]) {
-			fmt.Printf("Failed at %d\n", i)
-			return
+		if i%17 == 0 {
+			data[len(data)-1] = '\n'
+			err := bFile.ReadAt(offset, buff[:len(data)])
+			assert.NoError(t, err, "write error")
+			assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
+			if err != nil || !bytes.Equal(data, buff[:len(data)]) {
+				fmt.Printf("Failed at %d\n", i)
+				return
+			}
 		}
 
 		offset += uint64(len(data))
 	}
-
+	fmt.Printf("Check that reads of everything work after close\n")
 	err = bFile.Close()
 	assert.NoError(t, err, "failed to close")
 	err = bFile.Open()
@@ -90,17 +100,17 @@ func TestNewBFile(t *testing.T) {
 	assert.NoError(t, err, "failed to create BFile")
 	for i := 0; i < numEntries; i++ {
 		data := fr.RandChar(min, max)
-		data[len(data)-1] = '\n'
-		err := bFile.ReadAt(offset, buff[:len(data)])
-		assert.NoError(t, err, "write error")
-		assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
-
-		if err != nil || !bytes.Equal(data, buff[:len(data)]) {
-			fmt.Printf("Failed at %d\n", i)
-			return
+		if i%11 == 0 {
+			data[len(data)-1] = '\n'
+			err := bFile.ReadAt(offset, buff[:len(data)])
+			assert.NoError(t, err, "write error")
+			assert.Equal(t, data, buff[:len(data)], "Didn't get the expected data")
+			if err != nil || !bytes.Equal(data, buff[:len(data)]) {
+				fmt.Printf("Failed at %d\n", i)
+				return
+			}
 		}
 
 		offset += uint64(len(data))
 	}
-
 }

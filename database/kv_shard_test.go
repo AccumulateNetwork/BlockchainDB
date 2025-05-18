@@ -22,7 +22,7 @@ func TestKVShard(t *testing.T) {
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kvs, err := NewKVShard(dir, 1024)
+	kvs, err := NewKVShard(dir, 1024, 100_000, 50)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -84,7 +84,7 @@ func TestKVShard_2(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kvs, err := NewKVShard(dir, 1024)
+	kvs, err := NewKVShard(dir, 1024, 100_000, 50)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Generating Keys\n")
@@ -194,7 +194,7 @@ func TestBuildBig(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kvs, err := NewKVShard(dir, 16)
+	kvs, err := NewKVShard(dir, 1024, 100_000, 50)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing Keys to the Databases\n")
@@ -249,7 +249,7 @@ func TestBuildBig2(t *testing.T) {
 	start := time.Now()
 	var cntWrites float64
 
-	kvs, err := NewKVShard(dir, 1024)
+	kvs, err := NewKVShard(dir, 1024, 100_000, 50)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing Keys to the Databases\n")

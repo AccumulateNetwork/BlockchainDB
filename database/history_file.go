@@ -22,8 +22,8 @@ const (
 //
 // If Start == End then the KeySet is empty.
 type KeySet struct {
-	OffsetIndex int    // Offset Order (enables KeySet Index -> Offset Index)
-	KeySetIndex int    // KeySet Order (enables Offset Index -> KeySet Index)
+	OffsetIndex uint64 // Offset Order (enables KeySet Index -> Offset Index)
+	KeySetIndex uint64 // KeySet Order (enables Offset Index -> KeySet Index)
 	Start       uint64 // offset to the start of KeySet
 	End         uint64 // offset to the first entry after the KeySet
 }
@@ -45,16 +45,21 @@ func (ks *KeySet) Unmarshal(buff []byte) {
 // The Header are the Marshaled entries in the struct.  Following the Header
 // in the History file are all the DBBKey entries.  Writes to the HistoryFile
 // are not buffered.
+//
+// Performance Optimizations:
+// - No longer maintains its own Bloom filter, reducing memory usage
+// - Uses local buffers instead of shared buffers to reduce memory growth
+// - Synchronous history pushing to prevent memory buildup
+// - Bloom filter checking is now handled by the parent KFile
 
 type HistoryFile struct {
 	// Not marshaled
 	Mutex        sync.Mutex // Stops access to History during a reorg
 	Directory    string     // Path to the file
 	Filename     string     // Computed; directory + filename
-	HeaderSize   int        // Computed based of IndexCnt
+	HeaderSize   uint64     // Computed based of IndexCnt
 	File         *os.File   // Path to the History File
 	KeySetOffset []*KeySet  // Offsets around key sets, in file offset order
-	Buffer       []byte     // A reusable buffer for updating HistoryFile
 	// Marshaled
 	OffsetCnt int32     // Count of offsets to key sets
 	KeySets   []*KeySet // Offsets around key sets, in key index order
@@ -63,7 +68,7 @@ type HistoryFile struct {
 // NewHistoryFile
 // Creates and initializes a HistoryFile.  If one already exists, it is replaced with
 // a fresh, new, empty HistoryFile
-func NewHistoryFile(OffsetCnt int, Directory string) (historyFile *HistoryFile, err error) {
+func NewHistoryFile(OffsetCnt uint64, Directory string) (historyFile *HistoryFile, err error) {
 	if OffsetCnt < 0 || OffsetCnt > 102400 {
 		return nil, fmt.Errorf("index must be less than or equal to 10240, received %d", OffsetCnt)
 	}
@@ -79,7 +84,10 @@ func NewHistoryFile(OffsetCnt int, Directory string) (historyFile *HistoryFile, 
 	hf.HeaderSize = 4 + KeySetSize*OffsetCnt
 	hf.KeySets = make([]*KeySet, OffsetCnt)
 	hf.KeySetOffset = make([]*KeySet, OffsetCnt)
-	for i := 0; i < OffsetCnt; i++ {
+
+	// Bloom filter is now managed by KFile, not HistoryFile
+
+	for i := uint64(0); i < OffsetCnt; i++ {
 		ks := new(KeySet)
 		ks.OffsetIndex = i               // To begin with, KeySets are in the same order by Index
 		ks.KeySetIndex = i               //    and by offset
@@ -102,6 +110,7 @@ func (hf *HistoryFile) EOF() uint64 {
 }
 
 // Marshal
+// Only marshals the header, which is written to the// Marshal
 // Only marshals the header, which is written to the front of the History File
 func (hf *HistoryFile) Marshal() []byte {
 	buff := make([]byte, hf.HeaderSize)
@@ -109,17 +118,27 @@ func (hf *HistoryFile) Marshal() []byte {
 	b := buff[4:]
 	for i := 0; i < int(hf.OffsetCnt); i++ {
 		copy(b, hf.KeySets[i].Marshal())
-		b = b[16:]
+		b = b[KeySetSize:]
 	}
 	return buff
 }
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// min function is now used by KFile as well
 
 // Unmarshal
 // Unmarshals the header.
 func (hf *HistoryFile) Unmarshal(data []byte) {
 	hf.OffsetCnt = int32(binary.BigEndian.Uint32(data))
 	data = data[4:]
-	for i := 0; i < int(hf.OffsetCnt); i++ {
+	for i := uint64(0); i < uint64(hf.OffsetCnt); i++ {
 		ks := new(KeySet)
 		ks.OffsetIndex = i
 		ks.Unmarshal(data)
@@ -146,6 +165,8 @@ func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 	if len(keyList)%DBKeyFullSize != 0 {
 		return fmt.Errorf("keyList is the wrong length")
 	}
+
+	// Bloom filter is now managed by KFile, not HistoryFile
 
 	index := hf.Index([32]byte(keyList))
 	var kIndex int
@@ -192,7 +213,7 @@ func (hf *HistoryFile) OffsetSort() {
 		return ret
 	})
 	for i, keySet := range hf.KeySetOffset {
-		keySet.OffsetIndex = i
+		keySet.OffsetIndex = uint64(i)
 	}
 }
 
@@ -224,20 +245,22 @@ func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
 		offset = hf.KeySetOffset[iAfter].End
 	}
 
-	// Make sure Buffer is big enough.  The Buffer only grows
-	if len(hf.Buffer) < int(NewLength) {
-		hf.Buffer = make([]byte, NewLength+1024*10)
-	}
+	// Create a local buffer for this operation instead of using a shared buffer
+	// This reduces memory usage and prevents memory growth
+	buffer := make([]byte, NewLength)
 
 	// If we have to move the keySet, read in the keySet
-	if _, err = hf.File.ReadAt(hf.Buffer[:CurrentLength], int64(keySet.Start)); err != nil {
+	if _, err = hf.File.ReadAt(buffer[:CurrentLength], int64(keySet.Start)); err != nil {
 		return err
 	}
 	// And tack on the keyList
-	copy(hf.Buffer[CurrentLength:NewLength], keyList)
-	if _, err = hf.File.WriteAt(hf.Buffer[:NewLength], int64(offset)); err != nil {
+	copy(buffer[CurrentLength:NewLength], keyList)
+	if _, err = hf.File.WriteAt(buffer[:NewLength], int64(offset)); err != nil {
 		return err
 	}
+	
+	// Clear the buffer to help with garbage collection
+	buffer = nil
 
 	// Update position of keySet in the HistoryFile
 	keySet.Start = offset
@@ -264,24 +287,23 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, errors.New("not found") // TODO use buffer...
 	}
 
-	if len(hf.Buffer) < int(keysLen) {
-		hf.Buffer = make([]byte, end-start+10240) // Grow the buffer by 10k if needed
-	}
-	keys := hf.Buffer[:keysLen]
+	// Use a local buffer instead of growing the shared buffer
+	// This prevents memory growth over time
+	buffer := make([]byte, keysLen)
 
-	if _, err = hf.File.ReadAt(keys, int64(start)); err != nil { // Read the section
+	if _, err = hf.File.ReadAt(buffer, int64(start)); err != nil { // Read the section
 		return nil, err
 	}
 
-	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
-	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
-		if [32]byte(keys) == Key {
-			if _, err := dbKey.Unmarshal(keys[:DBKeyFullSize]); err != nil {
+	var dbKey DBBKey                    //          Search the keys by unmarshaling each key as we search
+	for len(buffer) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
+		if [32]byte(buffer) == Key {
+			if _, err := dbKey.Unmarshal(buffer[:DBKeyFullSize]); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
 		}
-		keys = keys[DBKeyFullSize:] //       Move to the next DBBKey
+		buffer = buffer[DBKeyFullSize:] //       Move to the next DBBKey
 	}
 	return nil, errors.New("not found")
 }

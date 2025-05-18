@@ -16,7 +16,7 @@ func TestViews(t *testing.T) {
 
 	Directory, rm := MakeDir()
 	defer rm()
-	sdbv, err := NewShardDBViews(Directory, Timeout, 1, 256, 1)
+	sdbv, err := NewShardDBViews(Directory, Timeout, 1, 256, 1, 1024, 100_000, 50)
 	assert.NoError(t, err, "failed to open ShardDBViews")
 
 	// Collect NumKeys number of key/values, and populate the DB
@@ -107,7 +107,7 @@ func TestView(t *testing.T) {
 
 	Directory, rm := MakeDir()
 	defer rm()
-	sdbv, err := NewShardDBViews(Directory, Timeout, 1, 256, 1)
+	sdbv, err := NewShardDBViews(Directory, Timeout, 1, 256, 1, 1024, 100_000, 50)
 	assert.NoError(t, err, "failed to open ShardDBViews")
 
 	Kr := NewFastRandom([]byte{1, 2, 3})

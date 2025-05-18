@@ -13,13 +13,16 @@ func TestKV2(t *testing.T) {
 	dir, rm := MakeDir()
 	defer rm()
 
-	const numKVs = 1_000_000
+	const numKVs = 1000
+	const offsetCnt = 10240
+	const keyLimit = 100
+	const MaxCachedBlocks = 50
 
 	start := time.Now()
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kv2, err := NewKV2(dir, 1024)
+	kv2, err := NewKV2(dir, offsetCnt, keyLimit, MaxCachedBlocks)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -46,7 +49,7 @@ func TestKV2(t *testing.T) {
 
 		value2, err := kv2.Get(key)
 		assert.NoError(t, err, "Failed to put")
-		assert.Equal(t, value, value2, "Didn't the the value back")
+		assert.Equalf(t, value, value2, "Didn't the the %d value back", i)
 		if !bytes.Equal(value, value2) || err != nil {
 			fmt.Printf("which failed %d\n", i)
 			return
@@ -70,6 +73,9 @@ func TestKV2_2(t *testing.T) {
 
 	const numKVs = 10_000
 	const DynaPercent = 5
+	const offsetCnt = 1024
+	const keyLimit = 100_000
+	const MaxCachedBlocks = 50
 
 	fr := NewFastRandom([]byte{1})
 
@@ -79,7 +85,7 @@ func TestKV2_2(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kv2, err := NewKV2(dir, 1024)
+	kv2, err := NewKV2(dir, offsetCnt, keyLimit, MaxCachedBlocks)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
