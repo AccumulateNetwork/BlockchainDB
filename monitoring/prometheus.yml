@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # BlockchainDB metrics
+  - job_name: 'blockchaindb'
+    static_configs:
+      - targets: ['host.docker.internal:2112']  # Metrics endpoint
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+  # Node exporter for system metrics (optional)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
