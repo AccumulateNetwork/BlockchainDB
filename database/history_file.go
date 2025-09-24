@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -60,6 +61,9 @@ type HistoryFile struct {
 	HeaderSize   uint64     // Computed based of IndexCnt
 	File         *os.File   // Path to the History File
 	KeySetOffset []*KeySet  // Offsets around key sets, in file offset order
+	// Cache for KeySet data to reduce disk I/O
+	keySetCache     map[int][]byte // Maps KeySet index to cached data
+	keySetCacheLock sync.RWMutex   // Protects the cache
 	// Marshaled
 	OffsetCnt int32     // Count of offsets to key sets
 	KeySets   []*KeySet // Offsets around key sets, in key index order
@@ -84,6 +88,7 @@ func NewHistoryFile(OffsetCnt uint64, Directory string) (historyFile *HistoryFil
 	hf.HeaderSize = 4 + KeySetSize*OffsetCnt
 	hf.KeySets = make([]*KeySet, OffsetCnt)
 	hf.KeySetOffset = make([]*KeySet, OffsetCnt)
+	hf.keySetCache = make(map[int][]byte)
 
 	// Bloom filter is now managed by KFile, not HistoryFile
 
@@ -196,6 +201,70 @@ func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 	return err
 }
 
+// sortKeyBuffer sorts entries in the buffer by their 32-byte key
+// Each entry is DBKeyFullSize (48) bytes: [32]byte key + 16 bytes metadata
+func (hf *HistoryFile) sortKeyBuffer(buffer []byte) {
+	numEntries := len(buffer) / DBKeyFullSize
+	if numEntries <= 1 {
+		return
+	}
+
+	// Create a slice of entries for sorting
+	type entry struct {
+		data [DBKeyFullSize]byte
+	}
+	entries := make([]entry, numEntries)
+
+	// Copy buffer data into entries
+	for i := 0; i < numEntries; i++ {
+		copy(entries[i].data[:], buffer[i*DBKeyFullSize:(i+1)*DBKeyFullSize])
+	}
+
+	// Sort entries by the first 32 bytes (the key)
+	slices.SortFunc(entries, func(a, b entry) int {
+		return bytes.Compare(a.data[:32], b.data[:32])
+	})
+
+	// Copy sorted entries back to buffer
+	for i, e := range entries {
+		copy(buffer[i*DBKeyFullSize:], e.data[:])
+	}
+}
+
+// SortAllKeySets sorts all keys within each KeySet for binary search
+// This should be called after bulk loading is complete
+func (hf *HistoryFile) SortAllKeySets() error {
+	for i := 0; i < int(hf.OffsetCnt); i++ {
+		keySet := hf.KeySets[i]
+		keysLen := keySet.End - keySet.Start
+
+		if keysLen == 0 {
+			continue // Skip empty KeySets
+		}
+
+		// Read the KeySet
+		buffer := make([]byte, keysLen)
+		if _, err := hf.File.ReadAt(buffer, int64(keySet.Start)); err != nil {
+			return err
+		}
+
+		// Sort the keys in the buffer
+		hf.sortKeyBuffer(buffer)
+
+		// Write the sorted buffer back
+		if _, err := hf.File.WriteAt(buffer, int64(keySet.Start)); err != nil {
+			return err
+		}
+	}
+
+	// Clear the cache after sorting since all KeySets have been modified
+	hf.keySetCacheLock.Lock()
+	hf.keySetCache = make(map[int][]byte)
+	hf.keySetCacheLock.Unlock()
+
+	return nil
+}
+
 // OffsetSort
 // Sort the indexes by HistoryFile Offsets; Sort by the end, because
 // empty keySets can have the same Start as one keySet...
@@ -255,16 +324,22 @@ func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
 	}
 	// And tack on the keyList
 	copy(buffer[CurrentLength:NewLength], keyList)
+
 	if _, err = hf.File.WriteAt(buffer[:NewLength], int64(offset)); err != nil {
 		return err
 	}
-	
+
 	// Clear the buffer to help with garbage collection
 	buffer = nil
 
 	// Update position of keySet in the HistoryFile
 	keySet.Start = offset
 	keySet.End = offset + NewLength
+
+	// Invalidate cache for this KeySet since it was updated
+	hf.keySetCacheLock.Lock()
+	delete(hf.keySetCache, index)
+	hf.keySetCacheLock.Unlock()
 
 	hf.OffsetSort() // Ensure all the offset sorting is correct.
 
@@ -287,23 +362,50 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, errors.New("not found") // TODO use buffer...
 	}
 
-	// Use a local buffer instead of growing the shared buffer
-	// This prevents memory growth over time
-	buffer := make([]byte, keysLen)
+	// Try to get from cache first
+	hf.keySetCacheLock.RLock()
+	buffer, cached := hf.keySetCache[index]
+	hf.keySetCacheLock.RUnlock()
 
-	if _, err = hf.File.ReadAt(buffer, int64(start)); err != nil { // Read the section
-		return nil, err
+	if !cached {
+		// Not in cache, read from disk
+		buffer = make([]byte, keysLen)
+		if _, err = hf.File.ReadAt(buffer, int64(start)); err != nil { // Read the section
+			return nil, err
+		}
+
+		// Store in cache for future reads
+		hf.keySetCacheLock.Lock()
+		// Limit cache size to prevent excessive memory usage (e.g., cache up to 100 KeySets)
+		if len(hf.keySetCache) < 100 {
+			hf.keySetCache[index] = buffer
+		}
+		hf.keySetCacheLock.Unlock()
 	}
 
-	var dbKey DBBKey                    //          Search the keys by unmarshaling each key as we search
-	for len(buffer) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
-		if [32]byte(buffer) == Key {
-			if _, err := dbKey.Unmarshal(buffer[:DBKeyFullSize]); err != nil {
+	// Binary search for the key (keys are now sorted within each KeySet)
+	numEntries := len(buffer) / DBKeyFullSize
+	left, right := 0, numEntries-1
+
+	for left <= right {
+		mid := (left + right) / 2
+		midOffset := mid * DBKeyFullSize
+		midKey := [32]byte(buffer[midOffset : midOffset+32])
+
+		cmp := bytes.Compare(midKey[:], Key[:])
+		if cmp == 0 {
+			// Found the key
+			var dbKey DBBKey
+			if _, err := dbKey.Unmarshal(buffer[midOffset : midOffset+DBKeyFullSize]); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
+		} else if cmp < 0 {
+			left = mid + 1
+		} else {
+			right = mid - 1
 		}
-		buffer = buffer[DBKeyFullSize:] //       Move to the next DBBKey
 	}
+
 	return nil, errors.New("not found")
 }
