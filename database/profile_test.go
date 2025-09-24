@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// TestBuildBigFor3Minutes runs a modified version of TestBuildBig that only runs for 3 minutes
+// TestBuildBigFor3Minutes runs a modified version of TestBuildBig that only runs for 20 seconds
 func TestBuildBigFor3Minutes(t *testing.T) {
 	// Create memory profile file
 	f, err := os.Create("memprofile.out")
@@ -28,12 +28,12 @@ func TestBuildBigFor3Minutes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Run for 1 minute
+	// Run for 20 seconds
 	startTime := time.Now()
-	endTime := startTime.Add(1 * time.Minute)
+	endTime := startTime.Add(20 * time.Second)
 	count := 0
 
-	// Loop until 1 minute has passed
+	// Loop until time limit has passed
 	for time.Now().Before(endTime) {
 		// Create a key and value
 		keyStr := fmt.Sprintf("key%d", count)

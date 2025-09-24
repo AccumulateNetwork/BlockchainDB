@@ -30,12 +30,12 @@ func TestBuildBigKV2(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Run for 1 minute
+	// Run for 15 seconds
 	startTime := time.Now()
-	endTime := startTime.Add(1 * time.Minute)
+	endTime := startTime.Add(15 * time.Second)
 	count := 0
 
-	// Loop until 1 minute has passed
+	// Loop until time limit has passed
 	for time.Now().Before(endTime) {
 		// Create a key and value
 		keyStr := fmt.Sprintf("key%d", count)

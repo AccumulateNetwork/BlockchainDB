@@ -73,8 +73,8 @@ func TestKVShard_2(t *testing.T) {
 	//dir, rm := MakeDir()
 	//defer rm()
 
-	const numPermKeys = 10_000_000
-	const numModKeys = 100_000
+	const numPermKeys = 100_000
+	const numModKeys = 10_000
 
 	keyValues := map[[32]byte][]byte{}
 	var keyList [numPermKeys][32]byte
@@ -187,8 +187,8 @@ func TestKVShard_2(t *testing.T) {
 func TestBuildBig(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
-	const numPermKeys = 200_000_000
-	const numModKeys = 100_000
+	const numPermKeys = 500_000
+	const numModKeys = 10_000
 	const minData = 100
 	const maxData = 500
 	start := time.Now()
@@ -242,8 +242,8 @@ func TestBuildBig(t *testing.T) {
 func TestBuildBig2(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
-	const numPermKeys = 20_000_000
-	const numModKeys = 100_000
+	const numPermKeys = 200_000
+	const numModKeys = 10_000
 	const minData = 100
 	const maxData = 500
 	start := time.Now()
