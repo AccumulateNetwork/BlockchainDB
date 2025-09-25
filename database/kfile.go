@@ -142,7 +142,8 @@ func NewKFile(
 	kFile.Header.Init(offsetCnt)
 	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
-	
+	kFile.BlocksCached = maxCachedBlocks  // Initialize to avoid immediate close/reopen
+
 	// Initialize the Bloom filter with a reasonable size
 	// Using 10MB as a size, which is a good balance between memory usage and false positive rate
 	kFile.BloomFilter = NewBloomFilter(10.0, 3) // 10MB Bloom filter with 3 hash functions
@@ -180,10 +181,15 @@ func (k *KFile) PushHistory() (err error) {
 	}
 	
 	// Normal history-enabled flow
+	// First ensure everything is flushed
+	if err = k.Flush(); err != nil {
+		return err
+	}
+
 	if err = k.Close(); err != nil {
 		return err
 	}
-	
+
 	keyValues, keyList, err := k.GetKeyList()
 	if err != nil {
 		return err
@@ -230,6 +236,13 @@ func (k *KFile) PushHistory() (err error) {
 			if err = k.History.AddKeys(buff); err != nil {
 				k.HistoryMutex.Unlock()
 				return fmt.Errorf("Error sending data to history: %v", err)
+			}
+
+			// Sort all KeySets for binary search to work
+			// This is needed because keys are added incrementally and may not be sorted
+			if err = k.History.SortAllKeySets(); err != nil {
+				k.HistoryMutex.Unlock()
+				return fmt.Errorf("Error sorting history KeySets: %v", err)
 			}
 		}
 		
@@ -478,26 +491,19 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 	
 	if update {                                    // If the file was updated && time to clear cache
 		if k.BlocksCached <= 0 {
+			// Debug: print when close/reopen happens
+			// fmt.Printf("DEBUG: BlocksCached=%d, triggering close/reopen at key count=%d\n", k.BlocksCached, k.TotalCnt)
 			if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
 				return err //                               the file has to be closed and opened to update
 			} //                                            the key offsets
 			
-			// Save our cache
-			tempCache := make(map[[32]byte]*DBBKey)
-			for key, val := range k.Cache {
-				tempCache[key] = val
-			}
-			
-			// Clear the cache as required by the original implementation
+			// Clear the cache before close/reopen
+			// The offsets in cached DBBKey entries become invalid after Close
+			// rebuilds the file structure, so we must not restore them
 			clear(k.Cache)
-			
+
 			if err = k.File.Open(); err != nil { //       Reopen the file
 				return err
-			}
-			
-			// Restore our cache
-			for key, val := range tempCache {
-				k.Cache[key] = val
 			}
 			
 			k.BlocksCached = k.MaxCachedBlocks
@@ -638,21 +644,23 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	}
 
 	// Collect all the keys and just the keys
-	KeyList = make([][32]byte, len(keyValues))
-	offset := 0
+	// First collect keys into a slice for deterministic ordering
+	KeyList = make([][32]byte, 0, len(keyValues))
 	for k := range keyValues {
-		copy(KeyList[offset][:], k[:])
-		offset++
+		KeyList = append(KeyList, k)
 	}
 
 	// Sort the keys into their offset bins.
-	// They won't be sorted inside the bins.
-	// The order will not be the same over multiple machines.
+	// IMPORTANT: Keys must be sorted within each bin for binary search to work in HistoryFile
 	// Note: Keys must be sorted in ascending order by bin for HistoryFile.AddKeys to work correctly
 	sort.Slice(KeyList, func(i, j int) bool {
 		a := k.OffsetIndex(KeyList[i][:]) // Bin for a
 		b := k.OffsetIndex(KeyList[j][:]) // Bin for b
-		return a < b // Sort in ascending order
+		if a != b {
+			return a < b // Sort bins in ascending order
+		}
+		// Sort within bin by comparing the full key bytes
+		return bytes.Compare(KeyList[i][:], KeyList[j][:]) < 0
 	})
 
 	return keyValues, KeyList, nil

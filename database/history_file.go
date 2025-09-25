@@ -142,6 +142,10 @@ func min(a, b int) int {
 // Unmarshals the header.
 func (hf *HistoryFile) Unmarshal(data []byte) {
 	hf.OffsetCnt = int32(binary.BigEndian.Uint32(data))
+	// Initialize the slices with the correct size
+	hf.KeySets = make([]*KeySet, hf.OffsetCnt)
+	hf.KeySetOffset = make([]*KeySet, hf.OffsetCnt)
+
 	data = data[4:]
 	for i := uint64(0); i < uint64(hf.OffsetCnt); i++ {
 		ks := new(KeySet)
@@ -149,6 +153,7 @@ func (hf *HistoryFile) Unmarshal(data []byte) {
 		ks.Unmarshal(data)
 		hf.KeySets[i] = ks
 		hf.KeySetOffset[i] = ks
+		data = data[KeySetSize:] // Advance to next KeySet
 	}
 	hf.OffsetSort()
 }

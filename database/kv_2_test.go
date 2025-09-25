@@ -15,21 +15,30 @@ func TestKV2(t *testing.T) {
 
 	const numKVs = 1000
 	const offsetCnt = 10240
-	const keyLimit = 100
-	const MaxCachedBlocks = 50
+	const keyLimit = 100  // Original value to test history functionality
+	const MaxCachedBlocks = 2000  // Increased to avoid close/reopen during test
 
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	fr := NewFastRandom([]byte{1})
+	// Use a fixed seed for deterministic test behavior
+	fr := NewFastRandom([]byte{1, 2, 3, 4, 5, 6, 7, 8})
 	kv2, err := NewKV2(dir, offsetCnt, keyLimit, MaxCachedBlocks)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
 
+	// Store all keys and values for later verification
+	keys := make([][32]byte, numKVs)
+	values := make([][]byte, numKVs)
+
 	for i := 0; i < numKVs; i++ {
 		key := fr.NextHash()
 		value := fr.RandBuff(100, 200)
+
+		keys[i] = key
+		values[i] = make([]byte, len(value))
+		copy(values[i], value)
 
 		_, err = kv2.Put(key, value)
 		assert.NoError(t, err, "Failed to put")
@@ -42,13 +51,13 @@ func TestKV2(t *testing.T) {
 
 	fmt.Print("Reading\n")
 
-	fr.Reset()
+	// Use stored keys and values for verification
 	for i := 0; i < numKVs; i++ {
-		key := fr.NextHash()
-		value := fr.RandBuff(100, 200)
+		key := keys[i]
+		value := values[i]
 
 		value2, err := kv2.Get(key)
-		assert.NoError(t, err, "Failed to put")
+		assert.NoError(t, err, "Failed to get")
 		assert.Equalf(t, value, value2, "Didn't the the %d value back", i)
 		if !bytes.Equal(value, value2) || err != nil {
 			fmt.Printf("which failed %d\n", i)

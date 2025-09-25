@@ -16,7 +16,7 @@ func TestKVShard(t *testing.T) {
 	dir, rm := MakeDir()
 	defer rm()
 
-	const numKVs = 1_000_000
+	const numKVs = 10_000_000
 
 	start := time.Now()
 	var cntWrites, cntReads float64

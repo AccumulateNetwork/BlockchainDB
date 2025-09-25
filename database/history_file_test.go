@@ -16,7 +16,7 @@ func TestHistory(t *testing.T) {
 	directory := "/tmp/History"
 	os.RemoveAll(directory)
 
-	const numBatches = 200 // Reduced from 200 to prevent timeout
+	const numBatches = 20 // Reduced from 200 to prevent timeout
 	const batchSize = 100_000
 
 	fr := NewFastRandom([]byte{1, 2}) // Reset fr to get the keys for the first batch

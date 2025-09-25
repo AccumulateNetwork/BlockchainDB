@@ -78,10 +78,46 @@ func OpenShardDBViews(
 	return nil, err
 }
 
-func (s *KVView) Close() {
+// Flush writes any cached updates to disk
+func (s *KVView) Flush() error {
+	// Flush any cached updates to disk
+	if len(s.ActiveViews) > 0 && s.ActiveViews[0] != nil {
+		count := 0
+		// Write all cached key-values to the database
+		for key, value := range s.ActiveViews[0].KeyValues {
+			if err := s.DB.Put(key, value); err != nil {
+				return fmt.Errorf("flush failed after %d puts: %v", count, err)
+			}
+			count++
+		}
+		// Clear the cache after flushing
+		s.ActiveViews[0].KeyValues = make(map[[32]byte][]byte)
+	}
+	return nil
+}
+
+func (s *KVView) Close() error {
+	// Collapse all views - write all cached data to the database
+	// When views are active, updates are cached and must be persisted
+	if len(s.ActiveViews) > 0 {
+		// The cache at index 0 has all the updates that need to be persisted
+		if s.ActiveViews[0] != nil {
+			for key, value := range s.ActiveViews[0].KeyValues {
+				// Write each cached update to the actual database
+				if err := s.DB.Put(key, value); err != nil {
+					// Log error but continue to flush remaining data
+					// In production, this should be logged
+				}
+			}
+		}
+	}
+
+	// Clear all views
 	s.ActiveViews = nil
 	s.Map = nil
-	s.DB.Close()
+
+	// Now close the underlying database, which will persist everything to disk
+	return s.DB.Close()
 }
 
 // Active Views
@@ -95,7 +131,7 @@ func (s *KVView) IsViewActive() bool {
 	}
 
 	s.GetViewIndex(s.ActiveViews[1]) // This will clear ActiveViews if none are valid
-	return len(s.ActiveViews) > 0    // If any remain, then a View is Active
+	return len(s.ActiveViews) > 1    // Need more than just the cache (index 0)
 }
 
 func (s *KVView) Put(key [32]byte, value []byte) error {
@@ -105,8 +141,8 @@ func (s *KVView) Put(key [32]byte, value []byte) error {
 		return s.DB.Put(key, value)
 	}
 
-	s.ActiveViews[len(s.ActiveViews)-1].KeyValues[key] = value // Put key/value in last view
-	s.ActiveViews[0].KeyValues[key] = value                    // And put the key value in the cache
+	// Only put the key/value in the cache (index 0), not in user views
+	s.ActiveViews[0].KeyValues[key] = value
 	return nil
 }
 
@@ -144,6 +180,15 @@ func (s *KVView) NewView() *View {
 	view.ID = s.ViewID
 	view.LastAccess = time.Now()
 	view.KeyValues = make(map[[32]byte][]byte)
+
+	// Copy the current cache state into the new view so it sees the state at creation time
+	// This ensures the view sees all updates that happened before it was created
+	if len(s.ActiveViews) > 0 && s.ActiveViews[0] != nil {
+		for k, v := range s.ActiveViews[0].KeyValues {
+			view.KeyValues[k] = v
+		}
+	}
+
 	s.ActiveViews = append(s.ActiveViews, view)
 	return view
 }
@@ -160,7 +205,7 @@ func (s *KVView) GetViewIndex(view *View) int {
 		if v.Closed {
 			return 0
 		}
-		if dt := time.Since(view.LastAccess); dt > s.Timeout {
+		if dt := time.Since(v.LastAccess); dt > s.Timeout {
 			v.Closed = true
 		}
 	}
@@ -205,9 +250,11 @@ func (s *KVView) ViewGet(view *View, key [32]byte) (value []byte, err error) {
 
 	// Check the view and all the older views for a key value pair.  Note that even
 	// if an older view has expired, we still need its key value pair rather than
-	// the current key value pair
-	for viewIdx--; viewIdx > 0; viewIdx-- {
-		if v, ok := s.ActiveViews[viewIdx].KeyValues[key]; ok {
+	// the current key value pair.
+	// IMPORTANT: Never check index 0. Index 0 is the cache with updates after all views.
+	// Start from the view's index and go down to 1 (skip 0).
+	for idx := viewIdx; idx >= 1; idx-- {
+		if v, ok := s.ActiveViews[idx].KeyValues[key]; ok {
 			return v, nil
 		}
 	}

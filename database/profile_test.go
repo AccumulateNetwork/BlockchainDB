@@ -22,8 +22,10 @@ func TestBuildBigFor3Minutes(t *testing.T) {
 	os.RemoveAll(dir)
 	os.MkdirAll(dir, 0777)
 
-	// Create a KVShard
-	kvShard, err := NewKVShard(dir, 1024, 1024*10, 100) // offsetsCnt, keyLimit, MaxCachedBlocks
+	// Create a KVShard with better parameters for high-volume writes
+	// Increased keyLimit from 10K to 100K to reduce file rotations
+	// Reduced MaxCachedBlocks from 100 to 10 to reduce memory pressure (512 shards × 10 = 5120 blocks)
+	kvShard, err := NewKVShard(dir, 1024, 1024*100, 10) // offsetsCnt, keyLimit, MaxCachedBlocks
 	if err != nil {
 		t.Fatal(err)
 	}
