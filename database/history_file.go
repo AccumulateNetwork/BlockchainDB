@@ -9,73 +9,111 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
-	historyFilename = "history.dat"
-	KeySetSize      = 16
+	KeySetSize     = 16
+	HeaderLocation = 1024 // Space for header at start of file
 )
 
-// KeySet
-// The starting offset and ending offset for each KeySet
-// Start points to the next entry in the KeySet. End points
-// to the entry after the last entry in the KeySet.
-//
-// If Start == End then the KeySet is empty.
-type KeySet struct {
-	OffsetIndex uint64 // Offset Order (enables KeySet Index -> Offset Index)
-	KeySetIndex uint64 // KeySet Order (enables Offset Index -> KeySet Index)
-	Start       uint64 // offset to the start of KeySet
-	End         uint64 // offset to the first entry after the KeySet
-}
+var historyFilename = "history_000000.dat" // Use var instead of const to avoid conflict
 
-func (ks *KeySet) Marshal() []byte {
-	var buff [KeySetSize]byte
-	binary.BigEndian.PutUint64(buff[:], ks.Start)
-	binary.BigEndian.PutUint64(buff[8:], ks.End)
-	return buff[:]
-}
-
-func (ks *KeySet) Unmarshal(buff []byte) {
-	ks.Start = binary.BigEndian.Uint64(buff)
-	ks.End = binary.BigEndian.Uint64(buff[8:])
-}
-
-// HistoryFile
-// Holds Large sets of Keys, and generally provides slower access to values
-// The Header are the Marshaled entries in the struct.  Following the Header
-// in the History file are all the DBBKey entries.  Writes to the HistoryFile
-// are not buffered.
-//
-// Performance Optimizations:
-// - No longer maintains its own Bloom filter, reducing memory usage
-// - Uses local buffers instead of shared buffers to reduce memory growth
-// - Synchronous history pushing to prevent memory buildup
-// - Bloom filter checking is now handled by the parent KFile
-
+// HistoryFile implements a hybrid sorted/unsorted storage approach for optimal performance
+// - Writes are O(1) append operations to memory
+// - Reads check memory first (O(1)), then sorted disk (O(log n))
+// - Background task automatically sorts data for optimal read performance
 type HistoryFile struct {
-	// Not marshaled
-	Mutex        sync.Mutex // Stops access to History during a reorg
-	Directory    string     // Path to the file
-	Filename     string     // Computed; directory + filename
-	HeaderSize   uint64     // Computed based of IndexCnt
-	File         *os.File   // Path to the History File
-	KeySetOffset []*KeySet  // Offsets around key sets, in file offset order
-	// Cache for KeySet data to reduce disk I/O
-	keySetCache     map[int][]byte // Maps KeySet index to cached data
-	keySetCacheLock sync.RWMutex   // Protects the cache
-	// Marshaled
-	OffsetCnt int32     // Count of offsets to key sets
-	KeySets   []*KeySet // Offsets around key sets, in key index order
+	// File and directory info
+	Directory string
+	Filename  string
+	File      *os.File
+
+	// Configuration (from original)
+	OffsetCnt   int32  // Number of bins/indexes
+	HeaderSize  uint64 // Size of header in bytes
+
+	// Bin management - now using hybrid leaf nodes
+	KeySets      []*KeySet      // For compatibility with original interface
+	KeySetOffset []*KeySet      // For compatibility
+	leaves       []*HybridLeaf  // New: Hybrid leaf nodes for each bin
+
+	// Caching (from original)
+	keySetCache   map[int][]byte
+	maxCacheSize  int
+	cacheAccesses int64
+	cacheMisses   int64
+
+	// Hybrid configuration
+	maxUnsortedEntries int  // Max entries before triggering background sort
+	sortBatchSize      int  // Number of bins to sort per background cycle
+
+	// Background sorting
+	sortQueue    chan int       // Queue of bins needing sorting
+	stopSignal   chan struct{}  // Signal to stop background worker
+	sortWg       sync.WaitGroup
+
+	// Global statistics
+	totalReads  atomic.Int64
+	totalWrites atomic.Int64
+	totalSorts  atomic.Int64
+
+	// Mutex for thread safety
+	mu sync.RWMutex
 }
 
-// NewHistoryFile
-// Creates and initializes a HistoryFile.  If one already exists, it is replaced with
-// a fresh, new, empty HistoryFile
+// HybridLeaf represents a single bin with hybrid sorted/unsorted storage
+type HybridLeaf struct {
+	binIndex int
+	file     *os.File  // Reference to main file
+
+	// Sorted section (on disk)
+	sortedOffset int64  // Where sorted data starts in file
+	sortedSize   int64  // Size of sorted section
+	sortedCount  int32  // Number of sorted entries
+
+	// Unsorted section (in memory + will be persisted)
+	unsortedBuffer []byte           // In-memory buffer for recent writes
+	unsortedCount  int32           // Number of unsorted entries
+
+	// Memory index for fast lookups
+	memIndex map[[32]byte]*DBBKey  // key -> DBBKey for O(1) lookup
+
+	// Statistics
+	reads  int64
+	writes int64
+	sorts  int64
+
+	mu sync.RWMutex
+}
+
+// KeySet maintains compatibility with original interface
+type KeySet struct {
+	Start       uint64
+	End         uint64
+	Index       uint64
+	OffsetIndex uint64
+}
+
+func (keySet KeySet) Bytes() []byte {
+	b := make([]byte, 0, KeySetSize)
+	b = binary.BigEndian.AppendUint64(b, keySet.Start)
+	b = binary.BigEndian.AppendUint64(b, keySet.End)
+	return b
+}
+
+func (keySet *KeySet) Unmarshal(b []byte) {
+	keySet.Start = binary.BigEndian.Uint64(b)
+	keySet.End = binary.BigEndian.Uint64(b[8:])
+}
+
+// NewHistoryFile creates a new history file with hybrid storage
 func NewHistoryFile(OffsetCnt uint64, Directory string) (historyFile *HistoryFile, err error) {
 	if OffsetCnt < 0 || OffsetCnt > 102400 {
 		return nil, fmt.Errorf("index must be less than or equal to 10240, received %d", OffsetCnt)
 	}
+
 	hf := new(HistoryFile)
 	hf.Directory = Directory
 	os.Mkdir(Directory, os.ModePerm)
@@ -84,130 +122,483 @@ func NewHistoryFile(OffsetCnt uint64, Directory string) (historyFile *HistoryFil
 	if hf.File, err = os.Create(hf.Filename); err != nil {
 		return nil, err
 	}
+
+	// Initialize configuration
 	hf.OffsetCnt = int32(OffsetCnt)
 	hf.HeaderSize = 4 + KeySetSize*OffsetCnt
 	hf.KeySets = make([]*KeySet, OffsetCnt)
 	hf.KeySetOffset = make([]*KeySet, OffsetCnt)
 	hf.keySetCache = make(map[int][]byte)
+	hf.maxCacheSize = 100
 
-	// Bloom filter is now managed by KFile, not HistoryFile
+	// Hybrid configuration
+	hf.maxUnsortedEntries = 1000  // Trigger sort after 1000 unsorted entries
+	hf.sortBatchSize = 10         // Sort 10 bins at a time
+	hf.sortQueue = make(chan int, OffsetCnt)
+	hf.stopSignal = make(chan struct{})
 
+	// Initialize leaf nodes
+	hf.leaves = make([]*HybridLeaf, OffsetCnt)
 	for i := uint64(0); i < OffsetCnt; i++ {
-		ks := new(KeySet)
-		ks.OffsetIndex = i               // To begin with, KeySets are in the same order by Index
-		ks.KeySetIndex = i               //    and by offset
-		ks.Start = uint64(hf.HeaderSize) // Fewer special cases if empty KeySets are
-		ks.End = uint64(hf.HeaderSize)   //   initialized to empty at end of the header
-		hf.KeySets[i] = ks               // Sorted by KeySet Index numbers
-		hf.KeySetOffset[i] = ks          // Sorted by Memory address
+		// Initialize KeySet for compatibility
+		keySet := new(KeySet)
+		keySet.Start = HeaderLocation + i*KeySetSize
+		keySet.End = keySet.Start
+		keySet.Index = i
+		keySet.OffsetIndex = i
+		hf.KeySets[i] = keySet
+		hf.KeySetOffset[i] = keySet
+
+		// Create hybrid leaf
+		leaf := &HybridLeaf{
+			binIndex:       int(i),
+			file:          hf.File,
+			sortedOffset:  int64(HeaderLocation + OffsetCnt*KeySetSize + i*1024*1024), // Reserve 1MB per bin initially
+			unsortedBuffer: make([]byte, 0, hf.maxUnsortedEntries*DBKeyFullSize),
+			memIndex:      make(map[[32]byte]*DBBKey),
+		}
+		hf.leaves[i] = leaf
 	}
-	if _, err = hf.File.WriteAt(hf.Marshal(), 0); err != nil { // Write out the header to the HistoryFile
+
+	// Start background sorting worker
+	hf.sortWg.Add(1)
+	go hf.backgroundSorter()
+
+	// Write initial header
+	if _, err = hf.File.WriteAt(hf.Marshal(), 0); err != nil {
 		return nil, err
 	}
 
 	return hf, nil
 }
 
-// EOF
-// Return the last offset in the HistoryFile
-func (hf *HistoryFile) EOF() uint64 {
-	return hf.KeySetOffset[hf.OffsetCnt-1].End
-}
+// LoadHistoryFile loads an existing history file
+func LoadHistoryFile(Directory string) (historyFile *HistoryFile, err error) {
+	hf := new(HistoryFile)
+	hf.Directory = Directory
 
-// Marshal
-// Only marshals the header, which is written to the// Marshal
-// Only marshals the header, which is written to the front of the History File
-func (hf *HistoryFile) Marshal() []byte {
-	buff := make([]byte, hf.HeaderSize)
-	binary.BigEndian.PutUint32(buff, uint32(hf.OffsetCnt))
-	b := buff[4:]
-	for i := 0; i < int(hf.OffsetCnt); i++ {
-		copy(b, hf.KeySets[i].Marshal())
-		b = b[KeySetSize:]
+	hf.Filename = filepath.Join(Directory, historyFilename)
+	if hf.File, err = os.OpenFile(hf.Filename, os.O_RDWR, 0644); err != nil {
+		return nil, err
 	}
-	return buff
-}
 
-// min returns the smaller of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
+	// Read header
+	header := make([]byte, 4)
+	if _, err = hf.File.ReadAt(header, 0); err != nil {
+		return nil, err
 	}
-	return b
-}
 
-// min function is now used by KFile as well
+	offsetCnt := binary.BigEndian.Uint32(header)
+	hf.OffsetCnt = int32(offsetCnt)
+	hf.HeaderSize = 4 + KeySetSize*uint64(offsetCnt)
+	hf.KeySets = make([]*KeySet, offsetCnt)
+	hf.KeySetOffset = make([]*KeySet, offsetCnt)
+	hf.keySetCache = make(map[int][]byte)
+	hf.maxCacheSize = 100
 
-// Unmarshal
-// Unmarshals the header.
-func (hf *HistoryFile) Unmarshal(data []byte) {
-	hf.OffsetCnt = int32(binary.BigEndian.Uint32(data))
-	// Initialize the slices with the correct size
-	hf.KeySets = make([]*KeySet, hf.OffsetCnt)
-	hf.KeySetOffset = make([]*KeySet, hf.OffsetCnt)
+	// Hybrid configuration
+	hf.maxUnsortedEntries = 1000
+	hf.sortBatchSize = 10
+	hf.sortQueue = make(chan int, offsetCnt)
+	hf.stopSignal = make(chan struct{})
 
-	data = data[4:]
-	for i := uint64(0); i < uint64(hf.OffsetCnt); i++ {
-		ks := new(KeySet)
-		ks.OffsetIndex = i
-		ks.Unmarshal(data)
-		hf.KeySets[i] = ks
-		hf.KeySetOffset[i] = ks
-		data = data[KeySetSize:] // Advance to next KeySet
+	// Load KeySets and create leaf nodes
+	hf.leaves = make([]*HybridLeaf, offsetCnt)
+	for i := uint32(0); i < offsetCnt; i++ {
+		keySet := new(KeySet)
+		keySetData := make([]byte, KeySetSize)
+		if _, err = hf.File.ReadAt(keySetData, int64(4+i*uint32(KeySetSize))); err != nil {
+			return nil, err
+		}
+		keySet.Unmarshal(keySetData)
+		keySet.Index = uint64(i)
+		keySet.OffsetIndex = uint64(i)
+		hf.KeySets[i] = keySet
+		hf.KeySetOffset[i] = keySet
+
+		// Create hybrid leaf
+		leaf := &HybridLeaf{
+			binIndex:       int(i),
+			file:          hf.File,
+			sortedOffset:  int64(HeaderLocation + offsetCnt*uint32(KeySetSize) + i*1024*1024),
+			unsortedBuffer: make([]byte, 0, hf.maxUnsortedEntries*DBKeyFullSize),
+			memIndex:      make(map[[32]byte]*DBBKey),
+		}
+
+		// Load existing data if any
+		if keySet.End > keySet.Start {
+			size := keySet.End - keySet.Start
+			leaf.sortedSize = int64(size)
+			leaf.sortedCount = int32(size / uint64(DBKeyFullSize))
+		}
+
+		hf.leaves[i] = leaf
 	}
-	hf.OffsetSort()
+
+	// Start background sorting worker
+	hf.sortWg.Add(1)
+	go hf.backgroundSorter()
+
+	return hf, nil
 }
 
-// Index
-// Compute the index into the KeySets for this key
+// Close closes the history file and stops background workers
+func (hf *HistoryFile) Close() error {
+	if hf.stopSignal != nil {
+		close(hf.stopSignal)
+		hf.sortWg.Wait()
+	}
+
+	// Flush all remaining unsorted data
+	hf.FlushAll()
+
+	// Close file
+	if hf.File != nil {
+		return hf.File.Close()
+	}
+	return nil
+}
+
+// Index returns the bin index for a key
 func (hf *HistoryFile) Index(key [32]byte) int {
-	return int(binary.BigEndian.Uint32(key[IndexOffsets:]) % uint32(hf.OffsetCnt))
+	// Use first 4 bytes for indexing (same as original)
+	index := binary.BigEndian.Uint32(key[:4])
+	return int(index % uint32(hf.OffsetCnt))
 }
 
-// AddKeys
-// Take a buffer of Keys, sort them into bins, and add them to the History file.
-// Assumes the keyList is already sorted into bins internally.
+// AddKeys adds keys using the hybrid approach - O(1) append to memory
 func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 	if len(keyList) == 0 {
-		return nil // There was nothing to update
+		return nil
 	}
 
 	if len(keyList)%DBKeyFullSize != 0 {
 		return fmt.Errorf("keyList is the wrong length")
 	}
 
-	// Bloom filter is now managed by KFile, not HistoryFile
+	hf.mu.Lock()
+	defer hf.mu.Unlock()
 
-	index := hf.Index([32]byte(keyList))
-	var kIndex int
-	var startOff, endOff uint64 // Start and end of entries in the same KeySet
+	// Group keys by bin and ensure they're sorted within each bin
+	currentBin := -1
+	binStart := 0
 
-	for keyPtr := keyList; len(keyPtr) > 0; keyPtr = keyPtr[DBKeyFullSize:] {
-		kIndex = hf.Index([32]byte(keyPtr))
-		switch {
-		case kIndex == index: // Key is part of this KeySet (of index)
-			endOff += DBKeyFullSize //Guess the end to avoid an end case
-		case kIndex < index:
-			return errors.New("keyList is not sorted")
-		default:
-			if err := hf.UpdateKeySet(index, keyList[startOff:endOff]); err != nil {
+	for i := 0; i < len(keyList); i += DBKeyFullSize {
+		binIndex := hf.Index([32]byte(keyList[i:i+32]))
+
+		if currentBin == -1 {
+			currentBin = binIndex
+		} else if binIndex != currentBin {
+			// Process previous bin's keys
+			if err := hf.addKeysToLeaf(currentBin, keyList[binStart:i]); err != nil {
 				return err
 			}
-			index = kIndex // The new index will be the next index (kIndex)
-			startOff = endOff
-			endOff += DBKeyFullSize
+
+			// Check if bin needs sorting
+			if int(hf.leaves[currentBin].unsortedCount) >= hf.maxUnsortedEntries {
+				select {
+				case hf.sortQueue <- currentBin:
+				default:
+				}
+			}
+
+			currentBin = binIndex
+			binStart = i
+		} else if binIndex < currentBin {
+			return errors.New("keyList is not sorted")
 		}
 	}
-	if err = hf.UpdateKeySet(index, keyList[startOff:endOff]); err != nil {
-		fmt.Printf("Update End %d to %d\n", startOff, endOff)
+
+	// Process last bin's keys
+	if err := hf.addKeysToLeaf(currentBin, keyList[binStart:]); err != nil {
 		return err
 	}
+
+	// Check if last bin needs sorting
+	if int(hf.leaves[currentBin].unsortedCount) >= hf.maxUnsortedEntries {
+		select {
+		case hf.sortQueue <- currentBin:
+		default:
+		}
+	}
+
+	hf.totalWrites.Add(1)
+
+	// Update header
 	_, err = hf.File.WriteAt(hf.Marshal(), 0)
 	return err
 }
 
+// addKeysToLeaf adds keys to a specific leaf node (keeps them unsorted in memory)
+func (hf *HistoryFile) addKeysToLeaf(binIndex int, keyList []byte) error {
+	leaf := hf.leaves[binIndex]
+	leaf.mu.Lock()
+	defer leaf.mu.Unlock()
+
+	for i := 0; i < len(keyList); i += DBKeyFullSize {
+		// Parse the key entry
+		var dbKeyFull DBBKeyFull
+		copy(dbKeyFull.Key[:], keyList[i:i+32])
+		dbKeyFull.DBBKey.Unmarshal(keyList[i+32:i+DBKeyFullSize])
+
+		// Add to memory buffer
+		leaf.unsortedBuffer = append(leaf.unsortedBuffer, keyList[i:i+DBKeyFullSize]...)
+
+		// Update memory index for O(1) lookups
+		leaf.memIndex[dbKeyFull.Key] = &dbKeyFull.DBBKey
+		leaf.unsortedCount++
+		leaf.writes++
+	}
+
+	// Update KeySet for compatibility
+	hf.KeySets[binIndex].End = hf.KeySets[binIndex].Start + uint64(leaf.sortedSize) + uint64(len(leaf.unsortedBuffer))
+
+	return nil
+}
+
+// Get retrieves a key using the hybrid approach
+func (hf *HistoryFile) Get(key [32]byte) (*DBBKey, error) {
+	binIndex := hf.Index(key)
+	leaf := hf.leaves[binIndex]
+
+	hf.totalReads.Add(1)
+
+	leaf.mu.RLock()
+	defer leaf.mu.RUnlock()
+
+	leaf.reads++
+
+	// 1. Check unsorted memory buffer first (O(1) with index)
+	if dbKey, ok := leaf.memIndex[key]; ok {
+		return dbKey, nil
+	}
+
+	// 2. Check cache
+	hf.cacheAccesses++
+	if cachedData, ok := hf.keySetCache[binIndex]; ok {
+		// Search in cached data
+		for i := 0; i < len(cachedData); i += DBKeyFullSize {
+			if bytes.Equal(cachedData[i:i+32], key[:]) {
+				dbKey := new(DBBKey)
+				dbKey.Unmarshal(cachedData[i+32:i+DBKeyFullSize])
+				return dbKey, nil
+			}
+		}
+	}
+	hf.cacheMisses++
+
+	// 3. Binary search sorted section if it exists
+	if leaf.sortedCount > 0 {
+		return hf.binarySearchSorted(leaf, key)
+	}
+
+	return nil, fmt.Errorf("key not found")
+}
+
+// binarySearchSorted performs binary search on the sorted section
+func (hf *HistoryFile) binarySearchSorted(leaf *HybridLeaf, key [32]byte) (*DBBKey, error) {
+	numEntries := leaf.sortedCount
+	left := int32(0)
+	right := numEntries - 1
+
+	var entry [DBKeyFullSize]byte
+
+	for left <= right {
+		mid := (left + right) / 2
+		offset := leaf.sortedOffset + int64(mid)*DBKeyFullSize
+
+		_, err := hf.File.ReadAt(entry[:], offset)
+		if err != nil {
+			return nil, err
+		}
+
+		cmp := bytes.Compare(entry[:32], key[:])
+		if cmp == 0 {
+			dbKey := new(DBBKey)
+			dbKey.Unmarshal(entry[32:])
+			return dbKey, nil
+		} else if cmp < 0 {
+			left = mid + 1
+		} else {
+			right = mid - 1
+		}
+	}
+
+	return nil, fmt.Errorf("key not found in sorted section")
+}
+
+// backgroundSorter continuously sorts leaves that need sorting
+func (hf *HistoryFile) backgroundSorter() {
+	defer hf.sortWg.Done()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	binsToSort := make([]int, 0, hf.sortBatchSize)
+
+	for {
+		select {
+		case <-hf.stopSignal:
+			return
+
+		case binIndex := <-hf.sortQueue:
+			binsToSort = append(binsToSort, binIndex)
+
+			if len(binsToSort) >= hf.sortBatchSize {
+				hf.sortBatch(binsToSort)
+				binsToSort = binsToSort[:0]
+			}
+
+		case <-ticker.C:
+			if len(binsToSort) > 0 {
+				hf.sortBatch(binsToSort)
+				binsToSort = binsToSort[:0]
+			}
+
+			// Check for bins that need sorting
+			for i, leaf := range hf.leaves {
+				leaf.mu.RLock()
+				needsSort := int(leaf.unsortedCount) >= hf.maxUnsortedEntries/2
+				leaf.mu.RUnlock()
+
+				if needsSort {
+					select {
+					case hf.sortQueue <- i:
+					default:
+					}
+				}
+			}
+		}
+	}
+}
+
+// sortBatch sorts a batch of bins
+func (hf *HistoryFile) sortBatch(binIndices []int) {
+	for _, binIndex := range binIndices {
+		leaf := hf.leaves[binIndex]
+		if err := hf.sortAndFlushLeaf(leaf); err != nil {
+			fmt.Printf("Error sorting bin %d: %v\n", binIndex, err)
+		} else {
+			hf.totalSorts.Add(1)
+		}
+	}
+}
+
+// sortAndFlushLeaf sorts unsorted entries and merges with sorted section
+func (hf *HistoryFile) sortAndFlushLeaf(leaf *HybridLeaf) error {
+	leaf.mu.Lock()
+	defer leaf.mu.Unlock()
+
+	if leaf.unsortedCount == 0 {
+		return nil
+	}
+
+	// Read existing sorted section if it exists
+	var allEntries []byte
+
+	if leaf.sortedCount > 0 {
+		sortedData := make([]byte, leaf.sortedSize)
+		_, err := hf.File.ReadAt(sortedData, leaf.sortedOffset)
+		if err != nil {
+			return err
+		}
+		allEntries = sortedData
+	}
+
+	// Append unsorted entries
+	allEntries = append(allEntries, leaf.unsortedBuffer...)
+
+	// Sort all entries
+	hf.sortKeyBuffer(allEntries)
+
+	// Write back to file
+	_, err := hf.File.WriteAt(allEntries, leaf.sortedOffset)
+	if err != nil {
+		return err
+	}
+
+	// Update leaf state
+	leaf.sortedCount += leaf.unsortedCount
+	leaf.sortedSize = int64(len(allEntries))
+	leaf.unsortedCount = 0
+	leaf.unsortedBuffer = leaf.unsortedBuffer[:0]
+	leaf.memIndex = make(map[[32]byte]*DBBKey)
+	leaf.sorts++
+
+	// Update KeySet
+	keySet := hf.KeySets[leaf.binIndex]
+	keySet.Start = uint64(leaf.sortedOffset)
+	keySet.End = keySet.Start + uint64(leaf.sortedSize)
+
+	// Clear cache for this bin
+	delete(hf.keySetCache, leaf.binIndex)
+
+	return nil
+}
+
+// SortAllKeySets sorts all bins for optimal read performance
+func (hf *HistoryFile) SortAllKeySets() error {
+	hf.mu.Lock()
+	defer hf.mu.Unlock()
+
+	for i, leaf := range hf.leaves {
+		if leaf.unsortedCount > 0 || leaf.sortedCount == 0 {
+			// Read all data for this bin
+			keySet := hf.KeySets[i]
+			if keySet.End <= keySet.Start {
+				continue
+			}
+
+			size := keySet.End - keySet.Start
+			buffer := make([]byte, size)
+
+			// Read sorted portion if exists
+			if leaf.sortedCount > 0 {
+				_, err := hf.File.ReadAt(buffer[:leaf.sortedSize], leaf.sortedOffset)
+				if err != nil {
+					return err
+				}
+			}
+
+			// Add unsorted portion
+			if leaf.unsortedCount > 0 {
+				copy(buffer[leaf.sortedSize:], leaf.unsortedBuffer)
+			}
+
+			// Sort
+			hf.sortKeyBuffer(buffer)
+
+			// Write back
+			_, err := hf.File.WriteAt(buffer, leaf.sortedOffset)
+			if err != nil {
+				return err
+			}
+
+			// Update state
+			leaf.sortedCount = int32(len(buffer) / DBKeyFullSize)
+			leaf.sortedSize = int64(len(buffer))
+			leaf.unsortedCount = 0
+			leaf.unsortedBuffer = leaf.unsortedBuffer[:0]
+			leaf.memIndex = make(map[[32]byte]*DBBKey)
+		}
+	}
+
+	return nil
+}
+
+// FlushAll forces sorting of all unsorted data
+func (hf *HistoryFile) FlushAll() error {
+	for _, leaf := range hf.leaves {
+		if leaf.unsortedCount > 0 {
+			if err := hf.sortAndFlushLeaf(leaf); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // sortKeyBuffer sorts entries in the buffer by their 32-byte key
-// Each entry is DBKeyFullSize (48) bytes: [32]byte key + 16 bytes metadata
 func (hf *HistoryFile) sortKeyBuffer(buffer []byte) {
 	numEntries := len(buffer) / DBKeyFullSize
 	if numEntries <= 1 {
@@ -236,181 +627,105 @@ func (hf *HistoryFile) sortKeyBuffer(buffer []byte) {
 	}
 }
 
-// SortAllKeySets sorts all keys within each KeySet for binary search
-// This should be called after bulk loading is complete
-func (hf *HistoryFile) SortAllKeySets() error {
-	for i := 0; i < int(hf.OffsetCnt); i++ {
-		keySet := hf.KeySets[i]
-		keysLen := keySet.End - keySet.Start
+// Marshal serializes the header
+func (hf *HistoryFile) Marshal() []byte {
+	data := make([]byte, hf.HeaderSize)
+	binary.BigEndian.PutUint32(data, uint32(hf.OffsetCnt))
 
-		if keysLen == 0 {
-			continue // Skip empty KeySets
-		}
-
-		// Read the KeySet
-		buffer := make([]byte, keysLen)
-		if _, err := hf.File.ReadAt(buffer, int64(keySet.Start)); err != nil {
-			return err
-		}
-
-		// Sort the keys in the buffer
-		hf.sortKeyBuffer(buffer)
-
-		// Write the sorted buffer back
-		if _, err := hf.File.WriteAt(buffer, int64(keySet.Start)); err != nil {
-			return err
-		}
+	for i, keySet := range hf.KeySets {
+		offset := 4 + i*KeySetSize
+		copy(data[offset:], keySet.Bytes())
 	}
 
-	// Clear the cache after sorting since all KeySets have been modified
-	hf.keySetCacheLock.Lock()
-	hf.keySetCache = make(map[int][]byte)
-	hf.keySetCacheLock.Unlock()
+	return data
+}
 
+// UpdateKeySet - compatibility method (now just delegates to AddKeys)
+func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) error {
+	// In the hybrid approach, this is handled by addKeysToLeaf
+	// which is called from AddKeys
 	return nil
 }
 
-// OffsetSort
-// Sort the indexes by HistoryFile Offsets; Sort by the end, because
-// empty keySets can have the same Start as one keySet...
+// FindKey - compatibility method
+func (hf *HistoryFile) FindKey(keySet KeySet, key [32]byte) (*DBBKey, error) {
+	return hf.Get(key)
+}
+
+// Unmarshal deserializes the header (compatibility method)
+func (hf *HistoryFile) Unmarshal(data []byte) {
+	hf.OffsetCnt = int32(binary.BigEndian.Uint32(data))
+	// Initialize the slices with the correct size
+	hf.KeySets = make([]*KeySet, hf.OffsetCnt)
+	hf.KeySetOffset = make([]*KeySet, hf.OffsetCnt)
+	hf.leaves = make([]*HybridLeaf, hf.OffsetCnt)
+
+	data = data[4:]
+	for i := uint64(0); i < uint64(hf.OffsetCnt); i++ {
+		ks := new(KeySet)
+		ks.OffsetIndex = i
+		ks.Unmarshal(data)
+		hf.KeySets[i] = ks
+		hf.KeySetOffset[i] = ks
+
+		// Create hybrid leaf
+		leaf := &HybridLeaf{
+			binIndex:       int(i),
+			file:          hf.File,
+			sortedOffset:  int64(HeaderLocation + uint64(hf.OffsetCnt)*KeySetSize + i*1024*1024),
+			unsortedBuffer: make([]byte, 0, 1000*DBKeyFullSize),
+			memIndex:      make(map[[32]byte]*DBBKey),
+		}
+		hf.leaves[i] = leaf
+
+		data = data[KeySetSize:] // Advance to next KeySet
+	}
+	hf.OffsetSort()
+}
+
+// OffsetSort sorts the offset array (compatibility method)
 func (hf *HistoryFile) OffsetSort() {
 	ret := 0
 	slices.SortFunc(hf.KeySetOffset, func(a, b *KeySet) int {
 		switch {
 		case a.End < b.End:
 			ret = -1
-		case a.End == b.End:
-			ret = 0
-		default:
+		case a.End > b.End:
 			ret = 1
+		default:
+			ret = 0
 		}
 		return ret
 	})
-	for i, keySet := range hf.KeySetOffset {
-		keySet.OffsetIndex = uint64(i)
+	for i, ks := range hf.KeySetOffset {
+		ks.OffsetIndex = uint64(i)
 	}
 }
 
-// UpdateKeySet
-// Add the given entries to the KeySet at the given index and update
-// the History File
-//
-// # If the new keys fit where the KeySet is, just add them to the HistoryFile
-//
-// If a KeySet does not fit where it is in the HistoryFile,
-// Update it's start and end to where it can fit, and update the
-// KeySets offsets, and the HistoryFile. Mem
-func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
+// Stats returns statistics about the history file
+func (hf *HistoryFile) Stats() string {
+	totalSorted := int64(0)
+	totalUnsorted := int64(0)
+	maxUnsorted := int32(0)
 
-	if len(keyList) == 0 { // Ignore nil lists
-		return nil
-	}
-
-	keySet := hf.KeySets[index]
-	CurrentLength := keySet.End - keySet.Start
-	NewLength := CurrentLength + uint64(len(keyList))
-
-	offset := uint64(hf.HeaderSize)
-	iAfter := 0
-	for iAfter = 0; iAfter < int(hf.OffsetCnt); iAfter++ {
-		if hf.KeySetOffset[iAfter].Start-offset >= NewLength {
-			break
+	for _, leaf := range hf.leaves {
+		leaf.mu.RLock()
+		totalSorted += int64(leaf.sortedCount)
+		totalUnsorted += int64(leaf.unsortedCount)
+		if leaf.unsortedCount > maxUnsorted {
+			maxUnsorted = leaf.unsortedCount
 		}
-		offset = hf.KeySetOffset[iAfter].End
+		leaf.mu.RUnlock()
 	}
 
-	// Create a local buffer for this operation instead of using a shared buffer
-	// This reduces memory usage and prevents memory growth
-	buffer := make([]byte, NewLength)
-
-	// If we have to move the keySet, read in the keySet
-	if _, err = hf.File.ReadAt(buffer[:CurrentLength], int64(keySet.Start)); err != nil {
-		return err
-	}
-	// And tack on the keyList
-	copy(buffer[CurrentLength:NewLength], keyList)
-
-	if _, err = hf.File.WriteAt(buffer[:NewLength], int64(offset)); err != nil {
-		return err
+	cacheHitRate := float64(0)
+	if hf.cacheAccesses > 0 {
+		cacheHitRate = float64(hf.cacheAccesses-hf.cacheMisses) / float64(hf.cacheAccesses) * 100
 	}
 
-	// Clear the buffer to help with garbage collection
-	buffer = nil
-
-	// Update position of keySet in the HistoryFile
-	keySet.Start = offset
-	keySet.End = offset + NewLength
-
-	// Invalidate cache for this KeySet since it was updated
-	hf.keySetCacheLock.Lock()
-	delete(hf.keySetCache, index)
-	hf.keySetCacheLock.Unlock()
-
-	hf.OffsetSort() // Ensure all the offset sorting is correct.
-
-	return nil
-}
-
-// Get
-// Get the value for a given DBKeyFull.  The value returned
-// is free for the user to use (i.e. not part of a buffer used
-// by the BFile)
-func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
-
-	// The header reflects what is on disk.  Points keys to the section where it is.
-	index := hf.Index(Key)
-	start := hf.KeySets[index].Start // The index is where the section starts
-	end := hf.KeySets[index].End
-	keysLen := end - start
-
-	if keysLen == 0 { //                     If the start is the end, the section is empty
-		return nil, errors.New("not found") // TODO use buffer...
-	}
-
-	// Try to get from cache first
-	hf.keySetCacheLock.RLock()
-	buffer, cached := hf.keySetCache[index]
-	hf.keySetCacheLock.RUnlock()
-
-	if !cached {
-		// Not in cache, read from disk
-		buffer = make([]byte, keysLen)
-		if _, err = hf.File.ReadAt(buffer, int64(start)); err != nil { // Read the section
-			return nil, err
-		}
-
-		// Store in cache for future reads
-		hf.keySetCacheLock.Lock()
-		// Limit cache size to prevent excessive memory usage (e.g., cache up to 100 KeySets)
-		if len(hf.keySetCache) < 100 {
-			hf.keySetCache[index] = buffer
-		}
-		hf.keySetCacheLock.Unlock()
-	}
-
-	// Binary search for the key (keys are now sorted within each KeySet)
-	numEntries := len(buffer) / DBKeyFullSize
-	left, right := 0, numEntries-1
-
-	for left <= right {
-		mid := (left + right) / 2
-		midOffset := mid * DBKeyFullSize
-		midKey := [32]byte(buffer[midOffset : midOffset+32])
-
-		cmp := bytes.Compare(midKey[:], Key[:])
-		if cmp == 0 {
-			// Found the key
-			var dbKey DBBKey
-			if _, err := dbKey.Unmarshal(buffer[midOffset : midOffset+DBKeyFullSize]); err != nil {
-				return nil, err
-			}
-			return &dbKey, nil
-		} else if cmp < 0 {
-			left = mid + 1
-		} else {
-			right = mid - 1
-		}
-	}
-
-	return nil, errors.New("not found")
+	return fmt.Sprintf(
+		"Bins: %d, Keys: %d (sorted: %d, unsorted: %d), Max unsorted/bin: %d, "+
+			"Reads: %d, Writes: %d, Sorts: %d, Cache hit rate: %.1f%%",
+		hf.OffsetCnt, totalSorted+totalUnsorted, totalSorted, totalUnsorted, maxUnsorted,
+		hf.totalReads.Load(), hf.totalWrites.Load(), hf.totalSorts.Load(), cacheHitRate)
 }

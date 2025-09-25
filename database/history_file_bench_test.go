@@ -28,24 +28,9 @@ func BenchmarkHistoryFileRead(b *testing.B) {
 		allKeys[i] = fr.NextHash()
 	}
 
-	// Pre-sort keys by their KeySet index
-	type keyIndex struct {
-		key   [32]byte
-		index int
-		hfIdx int
-	}
-	keyIndices := make([]keyIndex, numKeys)
-	for i, key := range allKeys {
-		keyIndices[i] = keyIndex{
-			key:   key,
-			index: i,
-			hfIdx: hf.Index(key),
-		}
-	}
-
-	// Group sorted keys into one batch
+	// Simply use the keys in order
 	for i := 0; i < numKeys; i++ {
-		keyList[i].Key = keyIndices[i].key
+		keyList[i].Key = allKeys[i]
 		keyList[i].Length = uint64(0x1111 * (i + 1))
 		keyList[i].Offset = uint64(0x1010 * (i + 1))
 	}
