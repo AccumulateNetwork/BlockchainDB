@@ -15,8 +15,8 @@ func TestHistoryPerformance(t *testing.T) {
 	directory := "/tmp/HistoryPerf"
 	os.RemoveAll(directory)
 
-	const numBatches = 10  // Smaller test for quick verification
-	const batchSize = 1_000_000
+	const numBatches = 10 // Same as LevelDB test
+	const batchSize = 1_000_000 // 1M per batch, 10M total - same as LevelDB
 
 	fr := NewFastRandom([]byte{1, 2})
 	hf, err := NewHistoryFile(2000, directory)
@@ -109,33 +109,40 @@ func TestHistoryPerformance(t *testing.T) {
 	found := 0
 	notFound := 0
 
-	// Test reading first 100k keys
-	testKeys := 100000
-	for i := 0; i < testKeys; i++ {
-		k := fr.NextHash()
-		dbFull.Key = k
-		dbFull.Length = uint64(0x1111 * (cnt + 1))
-		dbFull.Offset = uint64(0x1010 * (cnt + 1))
-		cnt++
+	// Test reading in batches of 10k keys
+	testBatches := 10
+	readBatchSize := 10000
+	totalReads := testBatches * readBatchSize
 
-		_, err := hf.Get(dbFull.Key)
-		if err == nil {
-			found++
-		} else {
-			notFound++
+	for batch := 0; batch < testBatches; batch++ {
+		batchStart := time.Now()
+		batchFound := 0
+		batchNotFound := 0
+
+		for i := 0; i < readBatchSize; i++ {
+			k := fr.NextHash()
+			dbFull.Key = k
+			dbFull.Length = uint64(0x1111 * (cnt + 1))
+			dbFull.Offset = uint64(0x1010 * (cnt + 1))
+			cnt++
+
+			_, err := hf.Get(dbFull.Key)
+			if err == nil {
+				batchFound++
+				found++
+			} else {
+				batchNotFound++
+				notFound++
+			}
 		}
 
-		// Print progress every 10k keys
-		if (i+1)%10000 == 0 {
-			elapsed := time.Since(readStart)
-			readsPerSec := float64(i+1) / elapsed.Seconds()
-			fmt.Printf("  Read %d keys in %v @ %.0f reads/sec\n", i+1, elapsed, readsPerSec)
-		}
+		// Print stats in same format as writes
+		tps := float64(readBatchSize) / time.Since(batchStart).Seconds()
+		comma := humanize.Comma(int64((batch + 1) * readBatchSize))
+		fmt.Printf("%12s reads @ %12.2f tps %12s per read\n", comma, tps, ComputeTimePerOp(tps))
 	}
 
 	totalReadTime := time.Since(readStart)
-	avgReadRate := float64(testKeys) / totalReadTime.Seconds()
-	fmt.Printf("\nRead complete: %d keys in %v\n", testKeys, totalReadTime)
-	fmt.Printf("  Found: %d, Not Found: %d\n", found, notFound)
-	fmt.Printf("  Average: %.0f reads/sec, %.2fµs per read\n", avgReadRate, totalReadTime.Seconds()*1e6/float64(testKeys))
+	avgReadTPS := float64(totalReads) / totalReadTime.Seconds()
+	fmt.Printf("Read complete: %v total, %.0f avg TPS\n", totalReadTime, avgReadTPS)
 }
