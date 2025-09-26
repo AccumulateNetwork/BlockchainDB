@@ -4,17 +4,34 @@
 *.test
 .testdata
 __debug_bin*
-tmp
+tmp/
+
+# Debug and profiling files
+*.prof
+*.out
+*.pprof
+cpu.prof
+cpu_optimized.prof
+memprofile.out
+kv2_memprofile.out
 
 # Temp and log files
 *~
 *.kate-swp
 *.orig
 *.bak
-*.txt
 *.log
 *.swp
-*.out
+.tmp.*
+test_results.log
+benchmark_results.txt
+
+# Draft and temporary documentation
+*.draft
+
+# Build artifacts
+/database/__debug_bin*
+/tools/profiling/*
 
 # macOS
 .DS_Store
@@ -29,5 +46,5 @@ tmp
 .terraform.lock.hcl
 /.vscode/settings.json
 
-#jj
+# jj
 .newscripts
