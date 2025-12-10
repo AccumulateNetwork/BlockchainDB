@@ -1,0 +1,12 @@
+# Follower configuration - add BVN0 as known node
+known_nodes:
+  - name: BVN0
+    address: 23.22.212.106:8080
+
+# Bypass bootstrap server since it's not working
+bootstrap:
+  enabled: false
+
+# Direct connection to BVN0
+peers:
+  - BVN0: 23.22.212.106:8080

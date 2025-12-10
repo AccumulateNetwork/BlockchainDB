@@ -1,0 +1,14 @@
+{
+  "known_nodes": [
+    {
+      "name": "BVN0",
+      "address": "23.22.212.106:8080"
+    }
+  ],
+  "bootstrap": {
+    "enabled": false
+  },
+  "peers": {
+    "BVN0": "23.22.212.106:8080"
+  }
+}
