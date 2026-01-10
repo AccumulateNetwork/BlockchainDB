@@ -14,7 +14,7 @@ import (
 
 const (
 	NumShards        = 256
-	NumChannelGroups = 4                         // Number of channel groups (reduces contention)
+	NumChannelGroups = 2                         // Number of channel groups (reduces contention)
 	ShardsPerGroup   = NumShards / NumChannelGroups
 	WriteChannelSize = 20000                     // Per-group channel buffer size
 )
