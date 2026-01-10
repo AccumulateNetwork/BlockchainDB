@@ -24,6 +24,11 @@ func TestBDB_200M(t *testing.T) {
 	runBDBBenchmark(t, 200_000_000)
 }
 
+// TestBDB_500M runs 500 million entry benchmark (long-run degradation test)
+func TestBDB_500M(t *testing.T) {
+	runBDBBenchmark(t, 500_000_000)
+}
+
 func runBDBBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("BLOCKCHAINDB %s BENCHMARK\n", formatNum(targetEntries))
