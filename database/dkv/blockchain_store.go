@@ -40,7 +40,7 @@ var ErrKeyNotFound = errors.New("key not found")
 // NewBlockchainStore creates a new blockchain-optimized store
 func NewBlockchainStore(directory string) (*BlockchainStore, error) {
 	// Create KVShard with 64 bins per shard, expecting 200 million items
-	shards, err := kv.NewKVShard(directory, 64, 200_000_000)
+	shards, err := kv.NewKVShard(directory, 32, 200_000_000)
 	if err != nil {
 		return nil, err
 	}
