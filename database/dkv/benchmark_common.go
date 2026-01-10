@@ -4,11 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,26 +16,84 @@ import (
 
 // Deterministic data generation functions
 // These generate consistent key/value pairs from an index without storing in memory
+// Optimized to minimize allocations using strconv.Append* instead of fmt.Sprintf
+
+// Pool for 16-byte buffers used in hash generation
+var hashBufPool = sync.Pool{
+	New: func() any { return make([]byte, 16) },
+}
 
 func generateAccountKey(accountIdx uint64) []byte {
-	return []byte(fmt.Sprintf("account:%012d", accountIdx))
+	// "account:" = 8 bytes, max uint64 = 20 digits, padded to 12 = 20 bytes total
+	buf := make([]byte, 0, 20)
+	buf = append(buf, "account:"...)
+	// Pad with zeros to 12 digits
+	temp := strconv.AppendUint(buf[8:8], accountIdx, 10)
+	padLen := 12 - len(temp)
+	for i := 0; i < padLen; i++ {
+		buf = append(buf, '0')
+	}
+	buf = strconv.AppendUint(buf, accountIdx, 10)
+	return buf
 }
 
 func generateAccountValue(accountIdx uint64) []byte {
-	return []byte(fmt.Sprintf(`{"balance":%d,"nonce":%d,"delegate":"acc:%d","created":%d}`,
-		accountIdx*1000, accountIdx%100, accountIdx%1000, 1700000000+accountIdx))
+	// Pre-size buffer for typical JSON output
+	buf := make([]byte, 0, 96)
+	buf = append(buf, `{"balance":`...)
+	buf = strconv.AppendUint(buf, accountIdx*1000, 10)
+	buf = append(buf, `,"nonce":`...)
+	buf = strconv.AppendUint(buf, accountIdx%100, 10)
+	buf = append(buf, `,"delegate":"acc:`...)
+	buf = strconv.AppendUint(buf, accountIdx%1000, 10)
+	buf = append(buf, `","created":`...)
+	buf = strconv.AppendUint(buf, 1700000000+accountIdx, 10)
+	buf = append(buf, '}')
+	return buf
 }
 
 func generateTxHash(accountIdx, txIdx uint64) [32]byte {
-	data := make([]byte, 16)
+	// Get buffer from pool to avoid allocation
+	data := hashBufPool.Get().([]byte)
 	binary.BigEndian.PutUint64(data[0:8], accountIdx)
 	binary.BigEndian.PutUint64(data[8:16], txIdx)
-	return sha256.Sum256(data)
+	hash := sha256.Sum256(data)
+	hashBufPool.Put(data)
+	return hash
 }
 
 func generateTxValue(accountIdx, txIdx uint64) []byte {
-	return []byte(fmt.Sprintf(`{"from":"acc%d","to":"acc%d","amount":%d,"nonce":%d,"hash":"%x"}`,
-		accountIdx, (accountIdx+1)%10000, txIdx*100, txIdx, txIdx))
+	// Pre-size buffer for typical JSON output
+	buf := make([]byte, 0, 80)
+	buf = append(buf, `{"from":"acc`...)
+	buf = strconv.AppendUint(buf, accountIdx, 10)
+	buf = append(buf, `","to":"acc`...)
+	buf = strconv.AppendUint(buf, (accountIdx+1)%10000, 10)
+	buf = append(buf, `","amount":`...)
+	buf = strconv.AppendUint(buf, txIdx*100, 10)
+	buf = append(buf, `,"nonce":`...)
+	buf = strconv.AppendUint(buf, txIdx, 10)
+	buf = append(buf, `,"hash":"`...)
+	buf = appendHex(buf, txIdx)
+	buf = append(buf, `"}`...)
+	return buf
+}
+
+// appendHex appends the hex representation of n to buf
+func appendHex(buf []byte, n uint64) []byte {
+	const hexDigits = "0123456789abcdef"
+	if n == 0 {
+		return append(buf, '0')
+	}
+	// Find number of hex digits needed
+	var temp [16]byte
+	i := len(temp)
+	for n > 0 {
+		i--
+		temp[i] = hexDigits[n&0xf]
+		n >>= 4
+	}
+	return append(buf, temp[i:]...)
 }
 
 // BenchmarkStats holds performance metrics written to log files

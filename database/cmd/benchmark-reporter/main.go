@@ -66,9 +66,9 @@ const (
 
 // Metric defines how to extract and compare a metric
 type Metric struct {
-	Name       string
-	Extract    func(*BenchmarkStats) (float64, string) // returns numeric value and display string
-	LowerBetter bool                                   // true if lower values are better (like latency)
+	Name        string
+	Extract     func(*BenchmarkStats) (float64, string) // returns numeric value and display string
+	LowerBetter bool                                    // true if lower values are better (like latency)
 }
 
 func main() {
@@ -324,23 +324,23 @@ func printReport() {
 			return float64(s.NumGC), fmt.Sprintf("%d", s.NumGC)
 		}, true}, // Lower is better
 
-		// Operation counts
+		// Operation counts (per-database progress)
 		{"Total Entries", func(s *BenchmarkStats) (float64, string) {
 			if s == nil { return 0, "N/A" }
 			return float64(s.Entries), formatNum(s.Entries)
-		}, false}, // Higher is better
+		}, false},
 		{"Batches Committed", func(s *BenchmarkStats) (float64, string) {
 			if s == nil { return 0, "N/A" }
 			return float64(s.Batches), formatNum(s.Batches)
-		}, false}, // Info only
+		}, false},
 		{"Gets (by key)", func(s *BenchmarkStats) (float64, string) {
 			if s == nil { return 0, "N/A" }
 			return float64(s.Gets), formatNum(s.Gets)
-		}, false}, // Info only
+		}, false},
 		{"Gets (by hash)", func(s *BenchmarkStats) (float64, string) {
 			if s == nil { return 0, "N/A" }
 			return float64(s.GetsByHash), formatNum(s.GetsByHash)
-		}, false}, // Info only
+		}, false},
 	}
 
 	// Print metrics with rankings

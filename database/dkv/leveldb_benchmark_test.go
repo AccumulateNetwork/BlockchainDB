@@ -2,6 +2,7 @@ package dkv
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,6 +23,11 @@ func TestLevelDB_100M(t *testing.T) {
 	runLevelDBBenchmark(t, 100_000_000)
 }
 
+// TestLevelDB_200M runs 200 million entry benchmark
+func TestLevelDB_200M(t *testing.T) {
+	runLevelDBBenchmark(t, 200_000_000)
+}
+
 func runLevelDBBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("LEVELDB %s BENCHMARK\n", formatNum(targetEntries))
@@ -35,6 +41,9 @@ func runLevelDBBenchmark(t *testing.T, targetEntries uint64) {
 	baseDir := t.TempDir()
 	leveldbDir := filepath.Join(baseDir, "leveldb")
 	logPath := "/tmp/leveldb_benchmark.log"
+
+	// Delete old log file to start fresh
+	os.Remove(logPath)
 
 	tracker, err := NewPerfTracker("LevelDB", logPath, leveldbDir)
 	if err != nil {

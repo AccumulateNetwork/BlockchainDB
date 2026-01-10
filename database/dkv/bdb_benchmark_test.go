@@ -2,6 +2,7 @@ package dkv
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,11 @@ func TestBDB_100M(t *testing.T) {
 	runBDBBenchmark(t, 100_000_000)
 }
 
+// TestBDB_200M runs 200 million entry benchmark
+func TestBDB_200M(t *testing.T) {
+	runBDBBenchmark(t, 200_000_000)
+}
+
 func runBDBBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("BLOCKCHAINDB %s BENCHMARK\n", formatNum(targetEntries))
@@ -31,6 +37,9 @@ func runBDBBenchmark(t *testing.T, targetEntries uint64) {
 	baseDir := t.TempDir()
 	bdbDir := filepath.Join(baseDir, "bdb")
 	logPath := "/tmp/bdb_benchmark.log"
+
+	// Delete old log file to start fresh
+	os.Remove(logPath)
 
 	tracker, err := NewPerfTracker("BlockchainDB", logPath, bdbDir)
 	if err != nil {

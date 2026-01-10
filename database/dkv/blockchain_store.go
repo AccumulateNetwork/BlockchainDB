@@ -39,8 +39,8 @@ var ErrKeyNotFound = errors.New("key not found")
 
 // NewBlockchainStore creates a new blockchain-optimized store
 func NewBlockchainStore(directory string) (*BlockchainStore, error) {
-	// Create KVShard with 64 bins per shard, expecting 10M items
-	shards, err := kv.NewKVShard(directory, 64, 10_000_000)
+	// Create KVShard with 64 bins per shard, expecting 200 million items
+	shards, err := kv.NewKVShard(directory, 64, 200_000_000)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func (bs *BlockchainStore) Put(key, value []byte) error {
 
 // PutByHash stores a value by its hash directly (content-addressed storage).
 // Returns the hash. Used for transactions, blocks - data that won't change.
-// Writes are async for high throughput. Duplicate values are deduplicated.
+// Uses async writes with NumCPU workers for high throughput. Duplicate values are deduplicated.
 func (bs *BlockchainStore) PutByHash(value []byte) ([32]byte, error) {
 	bs.stats.PutsByHash.Add(1)
 

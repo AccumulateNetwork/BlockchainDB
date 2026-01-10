@@ -16,9 +16,11 @@ import (
 const (
 	KVKeyEntrySize   = 48   // 32 byte key + 8 byte offset + 8 byte length
 	KVHeaderSize     = 1024 // Space for header at start of file
+	BinMetaSize      = 20   // 8 byte offset + 8 byte size + 4 byte count per bin
 	valueFilename    = "values.dat"
 	valueTmpFilename = "values_tmp.dat"
 	kvFilename       = "kv_index.dat"
+	binMetaFilename  = "bin_meta.dat"
 )
 
 // KV implements a high-performance key-value store using the hybrid sorted/unsorted approach
@@ -111,7 +113,7 @@ func NewKV(directory string, binCount int32) (*KV, error) {
 		HeaderSizeKV:       KVHeaderSize,
 		keyCache:           make(map[[32]byte]*KeyLocation),
 		maxCacheSize:       10000,
-		maxUnsortedEntries: 1000,
+		maxUnsortedEntries: 100, // Lower threshold for memory efficiency
 		sortBatchSize:      10,
 		sortQueue:          make(chan int, binCount),
 		stopSignal:         make(chan struct{}),
@@ -137,7 +139,7 @@ func NewKV(directory string, binCount int32) (*KV, error) {
 			binIndex:       int(i),
 			file:           kv.IndexFile,
 			memIndex:       make(map[[32]byte]*KeyLocation),
-			unsortedBuffer: make([]byte, 0, 1000*KVKeyEntrySize),
+			unsortedBuffer: make([]byte, 0, 100*KVKeyEntrySize),
 		}
 	}
 
@@ -158,7 +160,7 @@ func OpenKV(directory string) (*KV, error) {
 		Directory:          directory,
 		keyCache:           make(map[[32]byte]*KeyLocation),
 		maxCacheSize:       10000,
-		maxUnsortedEntries: 1000,
+		maxUnsortedEntries: 100, // Lower threshold for memory efficiency
 		sortBatchSize:      10,
 		sortQueue:          make(chan int, 1024),
 		stopSignal:         make(chan struct{}),
@@ -189,10 +191,20 @@ func OpenKV(directory string) (*KV, error) {
 			binIndex:       int(i),
 			file:           kv.IndexFile,
 			memIndex:       make(map[[32]byte]*KeyLocation),
-			unsortedBuffer: make([]byte, 0, kv.maxUnsortedEntries*KVKeyEntrySize),
+			unsortedBuffer: make([]byte, 0, 100*KVKeyEntrySize),
 		}
-		// Load existing data
-		kv.loadBin(kv.bins[i])
+	}
+
+	// Load bin metadata first (sets sortedOffset, sortedSize, sortedCount)
+	if err := kv.loadBinMetadata(); err != nil {
+		return nil, err
+	}
+
+	// Now load bin data into memIndex
+	for i := int32(0); i < kv.BinCount; i++ {
+		if err := kv.loadBin(kv.bins[i]); err != nil {
+			return nil, err
+		}
 	}
 
 	// Start background sorter
@@ -281,7 +293,8 @@ func (bin *HybridBin) Put(key [32]byte, location *KeyLocation, sortQueue chan<- 
 	bin.unsortedCount++
 
 	// Check if we need to trigger background sort
-	if bin.unsortedCount >= int32(1000) { // maxUnsortedEntries
+	// Sort frequently to keep memIndex small and avoid memory bloat
+	if bin.unsortedCount >= int32(100) { // maxUnsortedEntries - lower threshold for memory efficiency
 		select {
 		case sortQueue <- bin.binIndex:
 			// Queued for sorting
@@ -412,6 +425,7 @@ func (kv *KV) startBackgroundSorter() {
 }
 
 // sortBin sorts the unsorted entries in a bin
+// Uses a per-bin sorted file that gets replaced to avoid write amplification
 func (kv *KV) sortBin(binIndex int) {
 	bin := kv.bins[binIndex]
 
@@ -428,18 +442,18 @@ func (kv *KV) sortBin(binIndex int) {
 	// Combine sorted and unsorted data
 	var allEntries [][]byte
 
-	// Load existing sorted entries
+	// Load existing sorted entries from per-bin file
 	if bin.sortedCount > 0 {
-		sortedData := make([]byte, bin.sortedSize)
-		if _, err := bin.file.ReadAt(sortedData, bin.sortedOffset); err != nil {
-			return
-		}
-
-		numSorted := int(bin.sortedSize / KVKeyEntrySize)
-		for i := 0; i < numSorted; i++ {
-			offset := i * KVKeyEntrySize
-			entry := sortedData[offset : offset+KVKeyEntrySize]
-			allEntries = append(allEntries, entry)
+		binSortedPath := filepath.Join(kv.Directory, fmt.Sprintf("bin_%04d.idx", binIndex))
+		sortedData, err := os.ReadFile(binSortedPath)
+		if err == nil {
+			numSorted := len(sortedData) / KVKeyEntrySize
+			for i := 0; i < numSorted; i++ {
+				offset := i * KVKeyEntrySize
+				entry := make([]byte, KVKeyEntrySize)
+				copy(entry, sortedData[offset:offset+KVKeyEntrySize])
+				allEntries = append(allEntries, entry)
+			}
 		}
 	}
 
@@ -447,7 +461,8 @@ func (kv *KV) sortBin(binIndex int) {
 	numUnsorted := int(bin.unsortedCount)
 	for i := 0; i < numUnsorted; i++ {
 		offset := i * KVKeyEntrySize
-		entry := bin.unsortedBuffer[offset : offset+KVKeyEntrySize]
+		entry := make([]byte, KVKeyEntrySize)
+		copy(entry, bin.unsortedBuffer[offset:offset+KVKeyEntrySize])
 		allEntries = append(allEntries, entry)
 	}
 
@@ -456,28 +471,26 @@ func (kv *KV) sortBin(binIndex int) {
 		return bytes.Compare(allEntries[i][:32], allEntries[j][:32]) < 0
 	})
 
-	// Write sorted data to disk
+	// Write sorted data to per-bin file (replaces old file - no write amplification)
 	sortedData := make([]byte, 0, len(allEntries)*KVKeyEntrySize)
 	for _, entry := range allEntries {
 		sortedData = append(sortedData, entry...)
 	}
 
-	// Get new offset for sorted data
-	newOffset, _ := bin.file.Seek(0, 2) // Seek to end
-
-	// Write sorted data
-	if _, err := bin.file.Write(sortedData); err != nil {
+	binSortedPath := filepath.Join(kv.Directory, fmt.Sprintf("bin_%04d.idx", binIndex))
+	if err := os.WriteFile(binSortedPath, sortedData, 0644); err != nil {
 		return
 	}
 
-	// Update bin metadata
-	bin.sortedOffset = newOffset
+	// Update bin metadata (no longer using shared file offsets)
 	bin.sortedSize = int64(len(sortedData))
 	bin.sortedCount = int32(len(allEntries))
 
-	// Clear unsorted buffer
+	// Clear unsorted buffer AND memIndex
+	// memIndex only holds unsorted entries - once sorted to disk, we use binary search
 	bin.unsortedBuffer = bin.unsortedBuffer[:0]
 	bin.unsortedCount = 0
+	bin.memIndex = make(map[[32]byte]*KeyLocation) // Clear to free memory
 }
 
 // writeHeader writes the KV header to the index file
@@ -525,9 +538,57 @@ func (kv *KV) readHeader() error {
 
 // loadBin loads existing data for a bin from disk
 func (kv *KV) loadBin(bin *HybridBin) error {
-	// This would load bin metadata from disk
-	// For now, bins start empty
+	// Bin metadata is loaded separately via loadBinMetadata
+	// memIndex only holds unsorted entries (recent writes), not all entries
+	// For sorted data, we use binary search on disk to avoid massive memory usage
+	// With 100M entries, loading all keys would consume ~10GB of heap
 	return nil
+}
+
+// loadBinMetadata loads bin metadata from the metadata file
+func (kv *KV) loadBinMetadata() error {
+	metaPath := filepath.Join(kv.Directory, binMetaFilename)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // No metadata file yet, bins start empty
+		}
+		return err
+	}
+
+	// Validate size
+	expectedSize := int(kv.BinCount) * BinMetaSize
+	if len(data) < expectedSize {
+		return nil // Metadata file too small, treat as empty
+	}
+
+	// Load each bin's metadata
+	for i := int32(0); i < kv.BinCount; i++ {
+		offset := int(i) * BinMetaSize
+		bin := kv.bins[i]
+		bin.sortedOffset = int64(binary.BigEndian.Uint64(data[offset : offset+8]))
+		bin.sortedSize = int64(binary.BigEndian.Uint64(data[offset+8 : offset+16]))
+		bin.sortedCount = int32(binary.BigEndian.Uint32(data[offset+16 : offset+20]))
+	}
+
+	return nil
+}
+
+// saveBinMetadata saves bin metadata to the metadata file
+func (kv *KV) saveBinMetadata() error {
+	data := make([]byte, int(kv.BinCount)*BinMetaSize)
+
+	for i, bin := range kv.bins {
+		offset := i * BinMetaSize
+		bin.mu.RLock()
+		binary.BigEndian.PutUint64(data[offset:offset+8], uint64(bin.sortedOffset))
+		binary.BigEndian.PutUint64(data[offset+8:offset+16], uint64(bin.sortedSize))
+		binary.BigEndian.PutUint32(data[offset+16:offset+20], uint32(bin.sortedCount))
+		bin.mu.RUnlock()
+	}
+
+	metaPath := filepath.Join(kv.Directory, binMetaFilename)
+	return os.WriteFile(metaPath, data, 0644)
 }
 
 // Close closes the KV store
@@ -539,6 +600,11 @@ func (kv *KV) Close() error {
 	// Flush all unsorted data
 	for i := range kv.bins {
 		kv.sortBin(i)
+	}
+
+	// Save bin metadata for persistence
+	if err := kv.saveBinMetadata(); err != nil {
+		return err
 	}
 
 	// Close files

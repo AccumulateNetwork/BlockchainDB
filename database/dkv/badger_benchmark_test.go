@@ -2,6 +2,7 @@ package dkv
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +21,11 @@ func TestBadger_100M(t *testing.T) {
 	runBadgerBenchmark(t, 100_000_000)
 }
 
+// TestBadger_200M runs 200 million entry benchmark
+func TestBadger_200M(t *testing.T) {
+	runBadgerBenchmark(t, 200_000_000)
+}
+
 func runBadgerBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("BADGER %s BENCHMARK\n", formatNum(targetEntries))
@@ -33,6 +39,9 @@ func runBadgerBenchmark(t *testing.T, targetEntries uint64) {
 	baseDir := t.TempDir()
 	badgerDir := filepath.Join(baseDir, "badger")
 	logPath := "/tmp/badger_benchmark.log"
+
+	// Delete old log file to start fresh
+	os.Remove(logPath)
 
 	tracker, err := NewPerfTracker("BadgerDB", logPath, badgerDir)
 	if err != nil {
