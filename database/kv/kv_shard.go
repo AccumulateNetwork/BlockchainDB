@@ -14,9 +14,9 @@ import (
 
 const (
 	NumShards        = 256
-	NumChannelGroups = 4                         // Number of channel groups (reduces contention)
+	NumChannelGroups = 8                         // Number of channel groups (reduces contention)
 	ShardsPerGroup   = NumShards / NumChannelGroups
-	WriteChannelSize = 20000                     // Per-group channel buffer size
+	WriteChannelSize = 50000                     // Per-group channel buffer size
 )
 
 // writeRequest represents an async write operation
