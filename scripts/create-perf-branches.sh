@@ -45,8 +45,16 @@ create_branch() {
         return 1
     fi
 
+    # Only stage the specific files we changed
+    git add "$KV_SHARD" "$BLOCKCHAIN_STORE"
+
+    # Check if there are actual changes
+    if git diff --cached --quiet; then
+        echo "  No changes from baseline - skipping commit"
+        return 0
+    fi
+
     # Commit
-    git add -A
     git commit -m "perf: $description
 
 Config: channels=$channels, buffer=$buffer, bins=$bins
