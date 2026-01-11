@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/AccumulateNetwork/BlockchainDB/database/kv"
 )
 
 // TestBDB_10M runs 10 million entry benchmark
@@ -27,6 +30,45 @@ func TestBDB_200M(t *testing.T) {
 // TestBDB_500M runs 500 million entry benchmark (long-run degradation test)
 func TestBDB_500M(t *testing.T) {
 	runBDBBenchmark(t, 500_000_000)
+}
+
+// getConfigFromEnv reads benchmark configuration from environment variables.
+// Supported variables:
+//   - BDB_SHARDS: Number of shards (default 1024)
+//   - BDB_BINS: Number of bins per shard (default 256)
+//   - BDB_CHANNELS: Number of channel groups (default 8)
+//   - BDB_BUFFER: Write channel buffer size (default 20000)
+//   - BDB_BLOOM: Expected items for bloom filter sizing (default: target entries)
+func getConfigFromEnv(expectedItems int) kv.KVShardConfig {
+	config := kv.DefaultConfig(expectedItems)
+
+	// Bloom filter sizing - allow override for testing
+	if v := os.Getenv("BDB_BLOOM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			config.ExpectedItems = n
+		}
+	}
+	if v := os.Getenv("BDB_SHARDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			config.NumShards = n
+		}
+	}
+	if v := os.Getenv("BDB_BINS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			config.BinCount = n
+		}
+	}
+	if v := os.Getenv("BDB_CHANNELS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			config.NumChannelGroups = n
+		}
+	}
+	if v := os.Getenv("BDB_BUFFER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			config.WriteChannelSize = n
+		}
+	}
+	return config
 }
 
 func runBDBBenchmark(t *testing.T, targetEntries uint64) {
@@ -52,13 +94,18 @@ func runBDBBenchmark(t *testing.T, targetEntries uint64) {
 	}
 	defer tracker.Close()
 
-	db, err := NewBlockchainStore(bdbDir)
+	// Get config from environment variables (or use defaults)
+	config := getConfigFromEnv(int(targetEntries))
+	db, err := NewBlockchainStoreWithConfig(bdbDir, config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
 	fmt.Printf("Target: %s entries\n", formatNum(targetEntries))
+	fmt.Printf("Config: shards=%d, bins=%d, channels=%d, buffer=%d, bloom=%s\n",
+		config.NumShards, config.BinCount, config.NumChannelGroups, config.WriteChannelSize,
+		formatNum(uint64(config.ExpectedItems)))
 	fmt.Printf("Stats log: %s\n", logPath)
 	fmt.Printf("Data dir: %s\n\n", bdbDir)
 

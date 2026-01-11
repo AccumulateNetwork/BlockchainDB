@@ -149,7 +149,7 @@ func (d *DynaKV) rebuildSortedKeys() {
 }
 
 // Put stores a key-value pair.
-func (d *DynaKV) Put(key [32]byte, value []byte) error {
+func (d *DynaKV) Put(key InternalKey, value []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -222,7 +222,7 @@ func (d *DynaKV) writeWALEntry(op byte, key string, value []byte) error {
 }
 
 // Get retrieves a value by key.
-func (d *DynaKV) Get(key [32]byte) ([]byte, error) {
+func (d *DynaKV) Get(key InternalKey) ([]byte, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -258,7 +258,7 @@ func (d *DynaKV) GetBytes(key []byte) ([]byte, error) {
 }
 
 // Has checks if a key exists.
-func (d *DynaKV) Has(key [32]byte) bool {
+func (d *DynaKV) Has(key InternalKey) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -267,7 +267,7 @@ func (d *DynaKV) Has(key [32]byte) bool {
 }
 
 // Delete removes a key.
-func (d *DynaKV) Delete(key [32]byte) error {
+func (d *DynaKV) Delete(key InternalKey) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

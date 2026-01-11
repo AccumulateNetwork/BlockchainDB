@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	KVKeyEntrySize   = 48   // 32 byte key + 8 byte offset + 8 byte length
+	KVKeyEntrySize   = 36   // 20 byte key + 8 byte offset + 8 byte length
 	KVHeaderSize     = 1024 // Space for header at start of file
 	BinMetaSize      = 20   // 8 byte offset + 8 byte size + 4 byte count per bin
 	valueFilename    = "values.dat"
@@ -42,7 +42,7 @@ type KV struct {
 	bins []*HybridBin // Hybrid bins for key management
 
 	// Caching
-	keyCache     map[[32]byte]*KeyLocation
+	keyCache     map[InternalKey]*KeyLocation
 	maxCacheSize int
 	cacheHits    atomic.Int64
 	cacheMisses  atomic.Int64
@@ -86,7 +86,7 @@ type HybridBin struct {
 	unsortedCount  int32  // Number of unsorted entries
 
 	// Memory index for fast lookups
-	memIndex map[[32]byte]*KeyLocation // key -> location for O(1) lookup
+	memIndex map[InternalKey]*KeyLocation // key -> location for O(1) lookup
 
 	// Statistics
 	reads  atomic.Int64
@@ -111,7 +111,7 @@ func NewKV(directory string, binCount int32) (*KV, error) {
 		Directory:          directory,
 		BinCount:           binCount,
 		HeaderSizeKV:       KVHeaderSize,
-		keyCache:           make(map[[32]byte]*KeyLocation),
+		keyCache:           make(map[InternalKey]*KeyLocation),
 		maxCacheSize:       10000,
 		maxUnsortedEntries: 100, // Lower threshold for memory efficiency
 		sortBatchSize:      10,
@@ -138,7 +138,7 @@ func NewKV(directory string, binCount int32) (*KV, error) {
 		kv.bins[i] = &HybridBin{
 			binIndex:       int(i),
 			file:           kv.IndexFile,
-			memIndex:       make(map[[32]byte]*KeyLocation),
+			memIndex:       make(map[InternalKey]*KeyLocation),
 			unsortedBuffer: make([]byte, 0, 100*KVKeyEntrySize),
 		}
 	}
@@ -158,7 +158,7 @@ func NewKV(directory string, binCount int32) (*KV, error) {
 func OpenKV(directory string) (*KV, error) {
 	kv := &KV{
 		Directory:          directory,
-		keyCache:           make(map[[32]byte]*KeyLocation),
+		keyCache:           make(map[InternalKey]*KeyLocation),
 		maxCacheSize:       10000,
 		maxUnsortedEntries: 100, // Lower threshold for memory efficiency
 		sortBatchSize:      10,
@@ -190,7 +190,7 @@ func OpenKV(directory string) (*KV, error) {
 		kv.bins[i] = &HybridBin{
 			binIndex:       int(i),
 			file:           kv.IndexFile,
-			memIndex:       make(map[[32]byte]*KeyLocation),
+			memIndex:       make(map[InternalKey]*KeyLocation),
 			unsortedBuffer: make([]byte, 0, 100*KVKeyEntrySize),
 		}
 	}
@@ -214,7 +214,7 @@ func OpenKV(directory string) (*KV, error) {
 }
 
 // Put stores a key-value pair
-func (kv *KV) Put(key [32]byte, value []byte) error {
+func (kv *KV) Put(key InternalKey, value []byte) error {
 	kv.totalWrites.Add(1)
 
 	// Get offset for value
@@ -243,7 +243,7 @@ func (kv *KV) Put(key [32]byte, value []byte) error {
 }
 
 // Get retrieves a value by key
-func (kv *KV) Get(key [32]byte) ([]byte, error) {
+func (kv *KV) Get(key InternalKey) ([]byte, error) {
 	kv.totalReads.Add(1)
 
 	// Check cache first
@@ -274,7 +274,7 @@ func (kv *KV) Get(key [32]byte) ([]byte, error) {
 }
 
 // Put adds a key to the bin
-func (bin *HybridBin) Put(key [32]byte, location *KeyLocation, sortQueue chan<- int) error {
+func (bin *HybridBin) Put(key InternalKey, location *KeyLocation, sortQueue chan<- int) error {
 	bin.mu.Lock()
 	defer bin.mu.Unlock()
 
@@ -285,9 +285,9 @@ func (bin *HybridBin) Put(key [32]byte, location *KeyLocation, sortQueue chan<- 
 
 	// Add to unsorted buffer
 	keyEntry := make([]byte, KVKeyEntrySize)
-	copy(keyEntry[:32], key[:])
-	binary.BigEndian.PutUint64(keyEntry[32:40], location.Offset)
-	binary.BigEndian.PutUint64(keyEntry[40:48], location.Length)
+	copy(keyEntry[:InternalKeySize], key[:])
+	binary.BigEndian.PutUint64(keyEntry[InternalKeySize:InternalKeySize+8], location.Offset)
+	binary.BigEndian.PutUint64(keyEntry[InternalKeySize+8:InternalKeySize+16], location.Length)
 
 	bin.unsortedBuffer = append(bin.unsortedBuffer, keyEntry...)
 	bin.unsortedCount++
@@ -307,7 +307,7 @@ func (bin *HybridBin) Put(key [32]byte, location *KeyLocation, sortQueue chan<- 
 }
 
 // Get retrieves a key from the bin
-func (bin *HybridBin) Get(key [32]byte) (*KeyLocation, error) {
+func (bin *HybridBin) Get(key InternalKey) (*KeyLocation, error) {
 	bin.mu.RLock()
 	bin.reads.Add(1)
 
@@ -329,7 +329,7 @@ func (bin *HybridBin) Get(key [32]byte) (*KeyLocation, error) {
 }
 
 // binarySearch performs binary search in the sorted section
-func (bin *HybridBin) binarySearch(key [32]byte) (*KeyLocation, error) {
+func (bin *HybridBin) binarySearch(key InternalKey) (*KeyLocation, error) {
 	bin.mu.RLock()
 	defer bin.mu.RUnlock()
 
@@ -351,15 +351,15 @@ func (bin *HybridBin) binarySearch(key [32]byte) (*KeyLocation, error) {
 		mid := (left + right) / 2
 		offset := mid * KVKeyEntrySize
 
-		var midKey [32]byte
-		copy(midKey[:], sortedData[offset:offset+32])
+		var midKey InternalKey
+		copy(midKey[:], sortedData[offset:offset+InternalKeySize])
 
 		cmp := bytes.Compare(midKey[:], key[:])
 		if cmp == 0 {
 			// Found it
 			loc := &KeyLocation{
-				Offset: binary.BigEndian.Uint64(sortedData[offset+32 : offset+40]),
-				Length: binary.BigEndian.Uint64(sortedData[offset+40 : offset+48]),
+				Offset: binary.BigEndian.Uint64(sortedData[offset+InternalKeySize : offset+InternalKeySize+8]),
+				Length: binary.BigEndian.Uint64(sortedData[offset+InternalKeySize+8 : offset+InternalKeySize+16]),
 			}
 			return loc, nil
 		} else if cmp < 0 {
@@ -373,7 +373,7 @@ func (bin *HybridBin) binarySearch(key [32]byte) (*KeyLocation, error) {
 }
 
 // getBinIndex determines which bin a key belongs to
-func (kv *KV) getBinIndex(key [32]byte) int {
+func (kv *KV) getBinIndex(key InternalKey) int {
 	// Use first bytes of key to determine bin
 	hash := binary.BigEndian.Uint32(key[:4])
 	return int(hash % uint32(kv.BinCount))
@@ -389,7 +389,7 @@ func (kv *KV) readValue(loc *KeyLocation) ([]byte, error) {
 }
 
 // updateCache updates the key cache
-func (kv *KV) updateCache(key [32]byte, location *KeyLocation) {
+func (kv *KV) updateCache(key InternalKey, location *KeyLocation) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -468,7 +468,7 @@ func (kv *KV) sortBin(binIndex int) {
 
 	// Sort all entries
 	sort.Slice(allEntries, func(i, j int) bool {
-		return bytes.Compare(allEntries[i][:32], allEntries[j][:32]) < 0
+		return bytes.Compare(allEntries[i][:InternalKeySize], allEntries[j][:InternalKeySize]) < 0
 	})
 
 	// Write sorted data to per-bin file (replaces old file - no write amplification)
@@ -490,7 +490,7 @@ func (kv *KV) sortBin(binIndex int) {
 	// memIndex only holds unsorted entries - once sorted to disk, we use binary search
 	bin.unsortedBuffer = bin.unsortedBuffer[:0]
 	bin.unsortedCount = 0
-	bin.memIndex = make(map[[32]byte]*KeyLocation) // Clear to free memory
+	bin.memIndex = make(map[InternalKey]*KeyLocation) // Clear to free memory
 }
 
 // writeHeader writes the KV header to the index file

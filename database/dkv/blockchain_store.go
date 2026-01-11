@@ -12,9 +12,11 @@ import (
 // It wraps KVShard to provide:
 //   - Dynamic data (accounts, state) via PutDyna/GetDyna - in-memory with WAL
 //   - Permanent data (transactions, blocks) via PutByHash/GetByHash - async disk writes
-//   - 256 shards for parallel I/O
+//   - Configurable shards for parallel I/O (default 1024)
 //   - Write-through cache for async writes (no flush needed for reads)
 //   - Bloom filter for fast negative lookups
+//
+// Configuration is stored in the database directory as config.json.
 type BlockchainStore struct {
 	shards *kv.KVShard
 	stats  StoreStats
@@ -37,10 +39,16 @@ var ErrEmptyKey = errors.New("key cannot be empty")
 // ErrKeyNotFound is returned when a key is not found
 var ErrKeyNotFound = errors.New("key not found")
 
-// NewBlockchainStore creates a new blockchain-optimized store
+// NewBlockchainStore creates a new blockchain-optimized store with default configuration.
+// Uses 1024 shards, 8 channel groups, 256 bins per shard, expecting 200 million items.
 func NewBlockchainStore(directory string) (*BlockchainStore, error) {
-	// Create KVShard with 64 bins per shard, expecting 200 million items
-	shards, err := kv.NewKVShard(directory, 64, 200_000_000)
+	return NewBlockchainStoreWithConfig(directory, kv.DefaultConfig(200_000_000))
+}
+
+// NewBlockchainStoreWithConfig creates a new blockchain-optimized store with custom configuration.
+// Configuration is saved to the database directory and loaded automatically on Open.
+func NewBlockchainStoreWithConfig(directory string, config kv.KVShardConfig) (*BlockchainStore, error) {
+	shards, err := kv.NewKVShard(directory, config)
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +168,11 @@ func (bs *BlockchainStore) Flush() {
 // Stats returns store statistics
 func (bs *BlockchainStore) Stats() StoreStats {
 	return bs.stats
+}
+
+// Config returns the store configuration
+func (bs *BlockchainStore) Config() kv.KVShardConfig {
+	return bs.shards.Config
 }
 
 // Batch provides atomic batch operations

@@ -51,7 +51,7 @@ const (
 	bucketVersion     = 1
 	bucketHeaderSize  = 4096
 	bucketMetaSize    = 24 // 8 + 4 + 4 + 4 + padding
-	bucketEntrySize   = 48 // 32 key + 8 offset + 8 length
+	bucketEntrySize   = 36 // 20 key + 8 offset + 8 length
 	defaultBucketSize = 64 * 1024 // 64KB per bucket initially
 	defaultBucketCount = 1024     // 1024 buckets
 )
@@ -242,14 +242,14 @@ func (bs *BucketStore) updateHeader() error {
 }
 
 // bucketIndex returns which bucket a key belongs to
-func (bs *BucketStore) bucketIndex(key [32]byte) uint32 {
+func (bs *BucketStore) bucketIndex(key InternalKey) uint32 {
 	// Use first 4 bytes of key as hash
 	h := binary.BigEndian.Uint32(key[0:4])
 	return h % bs.bucketCount
 }
 
 // Put stores a key-value pair
-func (bs *BucketStore) Put(key [32]byte, value []byte) error {
+func (bs *BucketStore) Put(key InternalKey, value []byte) error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
@@ -262,9 +262,9 @@ func (bs *BucketStore) Put(key [32]byte, value []byte) error {
 
 	// Create entry
 	entry := make([]byte, bucketEntrySize)
-	copy(entry[0:32], key[:])
-	binary.BigEndian.PutUint64(entry[32:40], uint64(valueOffset))
-	binary.BigEndian.PutUint64(entry[40:48], uint64(len(value)))
+	copy(entry[0:InternalKeySize], key[:])
+	binary.BigEndian.PutUint64(entry[InternalKeySize:InternalKeySize+8], uint64(valueOffset))
+	binary.BigEndian.PutUint64(entry[InternalKeySize+8:InternalKeySize+16], uint64(len(value)))
 
 	// Find bucket
 	idx := bs.bucketIndex(key)
@@ -359,7 +359,7 @@ func (bs *BucketStore) writeBucketMeta(idx uint32) error {
 }
 
 // Get retrieves a value by key
-func (bs *BucketStore) Get(key [32]byte) ([]byte, error) {
+func (bs *BucketStore) Get(key InternalKey) ([]byte, error) {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 
@@ -379,12 +379,12 @@ func (bs *BucketStore) Get(key [32]byte) ([]byte, error) {
 	// Scan for key
 	for i := uint32(0); i < bucket.Count; i++ {
 		offset := i * bucketEntrySize
-		var entryKey [32]byte
-		copy(entryKey[:], bucketData[offset:offset+32])
+		var entryKey InternalKey
+		copy(entryKey[:], bucketData[offset:offset+InternalKeySize])
 
 		if entryKey == key {
-			valueOffset := binary.BigEndian.Uint64(bucketData[offset+32 : offset+40])
-			valueLength := binary.BigEndian.Uint64(bucketData[offset+40 : offset+48])
+			valueOffset := binary.BigEndian.Uint64(bucketData[offset+InternalKeySize : offset+InternalKeySize+8])
+			valueLength := binary.BigEndian.Uint64(bucketData[offset+InternalKeySize+8 : offset+InternalKeySize+16])
 
 			// Read value
 			value := make([]byte, valueLength)
@@ -399,7 +399,7 @@ func (bs *BucketStore) Get(key [32]byte) ([]byte, error) {
 }
 
 // Has checks if a key exists
-func (bs *BucketStore) Has(key [32]byte) bool {
+func (bs *BucketStore) Has(key InternalKey) bool {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 
@@ -419,8 +419,8 @@ func (bs *BucketStore) Has(key [32]byte) bool {
 	// Scan for key
 	for i := uint32(0); i < bucket.Count; i++ {
 		offset := i * bucketEntrySize
-		var entryKey [32]byte
-		copy(entryKey[:], bucketData[offset:offset+32])
+		var entryKey InternalKey
+		copy(entryKey[:], bucketData[offset:offset+InternalKeySize])
 
 		if entryKey == key {
 			return true

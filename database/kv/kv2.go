@@ -90,19 +90,19 @@ func OpenKV2(directory string) (*KV2, error) {
 
 // GetDyna retrieves a value from DynaKV only.
 // Use when you know the key is dynamic data.
-func (k *KV2) GetDyna(key [32]byte) ([]byte, error) {
+func (k *KV2) GetDyna(key InternalKey) ([]byte, error) {
 	return k.DynaKV.Get(key)
 }
 
 // GetPerm retrieves a value from PermKV only.
 // Use when you know the key is permanent data.
-func (k *KV2) GetPerm(key [32]byte) ([]byte, error) {
+func (k *KV2) GetPerm(key InternalKey) ([]byte, error) {
 	return k.PermKV.Get(key)
 }
 
 // Get retrieves a value, checking DynaKV first then PermKV.
 // This is the general-purpose get that handles both data types.
-func (k *KV2) Get(key [32]byte) ([]byte, error) {
+func (k *KV2) Get(key InternalKey) ([]byte, error) {
 	// Check DynaKV first (fast, in-memory)
 	if value, err := k.DynaKV.Get(key); err == nil {
 		return value, nil
@@ -114,7 +114,7 @@ func (k *KV2) Get(key [32]byte) ([]byte, error) {
 
 // PutDyna stores a value in DynaKV.
 // Use for data that may change (accounts, state).
-func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
+func (k *KV2) PutDyna(key InternalKey, value []byte) (writes int, err error) {
 	k.DWrites++
 	err = k.DynaKV.Put(key, value)
 	return k.DWrites, err
@@ -122,7 +122,7 @@ func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
 
 // PutPerm stores a value in PermKV.
 // Use for data that won't change (transactions, blocks).
-func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
+func (k *KV2) PutPerm(key InternalKey, value []byte) (writes int, err error) {
 	k.PWrites++
 	err = k.PermKV.Put(key, value)
 	return k.DWrites, err
@@ -136,7 +136,7 @@ func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
 //  3. If key exists in PermKV with same value → no-op
 //  4. If key exists in PermKV with different value → store in DynaKV (key "migrates")
 //  5. If key doesn't exist → store in PermKV (default for new keys)
-func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
+func (k *KV2) Put(key InternalKey, value []byte) (writes int, err error) {
 	// Check if key exists in DynaKV
 	if existingValue, err := k.DynaKV.Get(key); err == nil {
 		if bytes.Equal(value, existingValue) {
@@ -166,7 +166,7 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 }
 
 // Has checks if a key exists in either tier.
-func (k *KV2) Has(key [32]byte) bool {
+func (k *KV2) Has(key InternalKey) bool {
 	if k.DynaKV.Has(key) {
 		return true
 	}
@@ -175,7 +175,7 @@ func (k *KV2) Has(key [32]byte) bool {
 }
 
 // HasDyna checks if a key exists in DynaKV.
-func (k *KV2) HasDyna(key [32]byte) bool {
+func (k *KV2) HasDyna(key InternalKey) bool {
 	return k.DynaKV.Has(key)
 }
 

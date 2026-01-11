@@ -34,7 +34,7 @@ const (
 	mmapMagic       = "MMIX"
 	mmapVersion     = 1
 	mmapHeaderSize  = 16
-	mmapEntrySize   = 48 // 32 byte key + 8 byte offset + 8 byte length
+	mmapEntrySize   = 36 // 20 byte key + 8 byte offset + 8 byte length
 )
 
 // NewMmapIndex creates a new memory-mapped index file.
@@ -122,7 +122,7 @@ func OpenMmapIndex(path string) (*MmapIndex, error) {
 
 // Get performs a binary search for a key in the mmap'd index.
 // Returns the KeyLocation or an error if not found.
-func (m *MmapIndex) Get(key [32]byte) (*KeyLocation, error) {
+func (m *MmapIndex) Get(key InternalKey) (*KeyLocation, error) {
 	if m.data == nil || m.entryCount == 0 {
 		return nil, errors.New("key not found")
 	}
@@ -133,15 +133,15 @@ func (m *MmapIndex) Get(key [32]byte) (*KeyLocation, error) {
 		mid := (left + right) / 2
 		entryOffset := m.dataOffset + mid*mmapEntrySize
 
-		var midKey [32]byte
-		copy(midKey[:], m.data[entryOffset:entryOffset+32])
+		var midKey InternalKey
+		copy(midKey[:], m.data[entryOffset:entryOffset+InternalKeySize])
 
 		cmp := bytes.Compare(midKey[:], key[:])
 		if cmp == 0 {
 			// Found it
 			return &KeyLocation{
-				Offset: binary.BigEndian.Uint64(m.data[entryOffset+32 : entryOffset+40]),
-				Length: binary.BigEndian.Uint64(m.data[entryOffset+40 : entryOffset+48]),
+				Offset: binary.BigEndian.Uint64(m.data[entryOffset+InternalKeySize : entryOffset+InternalKeySize+8]),
+				Length: binary.BigEndian.Uint64(m.data[entryOffset+InternalKeySize+8 : entryOffset+InternalKeySize+16]),
 			}, nil
 		} else if cmp < 0 {
 			left = mid + 1
@@ -154,7 +154,7 @@ func (m *MmapIndex) Get(key [32]byte) (*KeyLocation, error) {
 }
 
 // Has checks if a key exists in the index.
-func (m *MmapIndex) Has(key [32]byte) bool {
+func (m *MmapIndex) Has(key InternalKey) bool {
 	_, err := m.Get(key)
 	return err == nil
 }
@@ -206,9 +206,9 @@ func (m *MmapIndex) Build(entries []IndexEntry) error {
 	// Write entries
 	for _, entry := range entries {
 		entryData := make([]byte, mmapEntrySize)
-		copy(entryData[0:32], entry.Key[:])
-		binary.BigEndian.PutUint64(entryData[32:40], entry.Offset)
-		binary.BigEndian.PutUint64(entryData[40:48], entry.Length)
+		copy(entryData[0:InternalKeySize], entry.Key[:])
+		binary.BigEndian.PutUint64(entryData[InternalKeySize:InternalKeySize+8], entry.Offset)
+		binary.BigEndian.PutUint64(entryData[InternalKeySize+8:InternalKeySize+16], entry.Length)
 
 		if _, err := m.file.Write(entryData); err != nil {
 			return err
@@ -230,7 +230,7 @@ func (m *MmapIndex) Build(entries []IndexEntry) error {
 
 // Append adds a new entry to the index.
 // Note: This invalidates sorted order - call Rebuild() after batch appends.
-func (m *MmapIndex) Append(key [32]byte, offset, length uint64) error {
+func (m *MmapIndex) Append(key InternalKey, offset, length uint64) error {
 	// Calculate new entry position
 	entryOffset := mmapHeaderSize + m.entryCount*mmapEntrySize
 	newSize := entryOffset + mmapEntrySize
@@ -250,9 +250,9 @@ func (m *MmapIndex) Append(key [32]byte, offset, length uint64) error {
 
 	// Write entry
 	entryData := make([]byte, mmapEntrySize)
-	copy(entryData[0:32], key[:])
-	binary.BigEndian.PutUint64(entryData[32:40], offset)
-	binary.BigEndian.PutUint64(entryData[40:48], length)
+	copy(entryData[0:InternalKeySize], key[:])
+	binary.BigEndian.PutUint64(entryData[InternalKeySize:InternalKeySize+8], offset)
+	binary.BigEndian.PutUint64(entryData[InternalKeySize+8:InternalKeySize+16], length)
 
 	if _, err := m.file.WriteAt(entryData, entryOffset); err != nil {
 		return err
@@ -290,13 +290,13 @@ func (m *MmapIndex) Close() error {
 
 // IndexEntry represents a single entry in the index.
 type IndexEntry struct {
-	Key    [32]byte
+	Key    InternalKey
 	Offset uint64
 	Length uint64
 }
 
 // ForEach iterates over all entries in the index in sorted order.
-func (m *MmapIndex) ForEach(fn func(key [32]byte, offset, length uint64) error) error {
+func (m *MmapIndex) ForEach(fn func(key InternalKey, offset, length uint64) error) error {
 	if m.data == nil {
 		return nil
 	}
@@ -304,10 +304,10 @@ func (m *MmapIndex) ForEach(fn func(key [32]byte, offset, length uint64) error) 
 	for i := int64(0); i < m.entryCount; i++ {
 		entryOffset := m.dataOffset + i*mmapEntrySize
 
-		var key [32]byte
-		copy(key[:], m.data[entryOffset:entryOffset+32])
-		offset := binary.BigEndian.Uint64(m.data[entryOffset+32 : entryOffset+40])
-		length := binary.BigEndian.Uint64(m.data[entryOffset+40 : entryOffset+48])
+		var key InternalKey
+		copy(key[:], m.data[entryOffset:entryOffset+InternalKeySize])
+		offset := binary.BigEndian.Uint64(m.data[entryOffset+InternalKeySize : entryOffset+InternalKeySize+8])
+		length := binary.BigEndian.Uint64(m.data[entryOffset+InternalKeySize+8 : entryOffset+InternalKeySize+16])
 
 		if err := fn(key, offset, length); err != nil {
 			return err

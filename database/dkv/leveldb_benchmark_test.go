@@ -28,6 +28,11 @@ func TestLevelDB_200M(t *testing.T) {
 	runLevelDBBenchmark(t, 200_000_000)
 }
 
+// TestLevelDB_500M runs 500 million entry benchmark
+func TestLevelDB_500M(t *testing.T) {
+	runLevelDBBenchmark(t, 500_000_000)
+}
+
 func runLevelDBBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("LEVELDB %s BENCHMARK\n", formatNum(targetEntries))

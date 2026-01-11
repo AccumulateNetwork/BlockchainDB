@@ -26,6 +26,11 @@ func TestBadger_200M(t *testing.T) {
 	runBadgerBenchmark(t, 200_000_000)
 }
 
+// TestBadger_500M runs 500 million entry benchmark
+func TestBadger_500M(t *testing.T) {
+	runBadgerBenchmark(t, 500_000_000)
+}
+
 func runBadgerBenchmark(t *testing.T, targetEntries uint64) {
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("BADGER %s BENCHMARK\n", formatNum(targetEntries))
