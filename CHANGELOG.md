@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-01-11 - Performance Optimizations & 20-Byte Internal Keys
+
+**Branch**: `2-performance`
+**Commit**: `6156ffc`
+
+### Added
+- **20-byte internal keys**: External API accepts [32]byte, internally truncated to [20]byte
+  - 25% reduction in entry size (48→36 bytes)
+  - 7.9% disk savings (~6GB at 500M entries)
+  - 2^80 birthday bound collision resistance
+- **Lock-free bloom filter**: Atomic bit-OR operations, no mutex on hot path
+- **Deferred bloom add**: Moved from PutPermAsync to background workers
+- **Comprehensive benchmark documentation**: `docs/performance/benchmark-results-2026-01.md`
+
+### Changed
+- **NumChannelGroups**: 4 → 8 (better parallelism with 1024 shards)
+- **NumShards**: 256 → 1024 (17% faster with 256 bins)
+- **selectgo overhead**: 28% → 3% CPU time
+
+### Performance Results (100M Deterministic Benchmark)
+| Metric | BadgerDB | BlockchainDB | Ratio |
+|--------|----------|--------------|-------|
+| Entries @ 3min | 1.3M | 99.9M | **77x** |
+| Entries/second | 7,141 | 554,944 | **78x** |
+| Batch Write Time | 14.1ms | 121µs | **117x** |
+
+### Technical Details
+- `InternalKey`: New [20]byte type for internal storage
+- `truncateKey()`: Converts [32]byte external key to InternalKey
+- Entry format: 20-byte key + 8-byte offset + 8-byte length = 36 bytes
+- Bloom filter: Lock-free with pendingCache check before bloom on reads
+
+---
+
 ## 2024-01-26 - DKV Implementation & Documentation Cleanup
 
 ### Added

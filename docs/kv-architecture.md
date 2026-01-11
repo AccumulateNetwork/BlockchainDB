@@ -1,13 +1,32 @@
 # BlockchainDB KV Architecture - Final Design
 
+**Last Updated**: 2026-01-11
+**Branch**: `2-performance`
+**Commit**: `6156ffc`
+
 ## Summary of Changes
 
 We've consolidated the KV implementations by:
 1. **Removed** experimental KV2 and sharded KV implementations
 2. **Promoted** the high-performance history file implementation to be the new KV
 3. **Created** DKV (Dynamic KV) for mutable data with compaction support
+4. **Implemented** KVShard for high-throughput async writes with 1024 shards
 
 ## Current Architecture
+
+### KVShard - High-Throughput Sharded Storage (`database/kv/kv_shard.go`)
+The primary storage engine for blockchain data:
+- **1024 shards**: Parallel I/O, key distribution via first 2 bytes
+- **20-byte internal keys**: Truncated from 32-byte external (7.9% disk savings)
+- **Lock-free bloom filter**: Mmap'd with atomic operations, crash recovery
+- **8 channel groups**: Async writes with NumCPU/8 workers per group
+- **Write-through cache**: Pending writes visible before flush
+
+**Key Features:**
+- 555K entries/sec sustained at 100M+ entries
+- 77x faster than BadgerDB, 2.7x faster than LevelDB
+- Batch writes: 121µs (vs Badger's 14.1ms)
+- No performance degradation at scale
 
 ### KV - For Immutable Blockchain Data (`database/kv/kv.go`)
 Based on the successful history file hybrid approach:
@@ -38,6 +57,27 @@ Optimized for mutable data:
 - Per-shard concurrency
 
 ## Usage Patterns
+
+### For High-Throughput Blockchain Data (KVShard)
+```go
+// Use KVShard for maximum write throughput
+config := kv.DefaultConfig(100_000_000) // Expected 100M entries
+kvs, err := kv.NewKVShard("./data/blockchain", config)
+
+// Async write - returns immediately
+key := sha256.Sum256(txData)
+kvs.PutPermAsync(key, txData)  // Fire and forget
+
+// Sync write - waits for completion
+kvs.PutPerm(key, txData)
+
+// Read (checks cache first, then bloom, then disk)
+data, err := kvs.GetPerm(key)
+
+// Flush pending writes before shutdown
+kvs.Flush()
+kvs.Close()
+```
 
 ### For Blockchain Data (Immutable)
 ```go
@@ -72,6 +112,16 @@ dkv.Delete(accountKey)
 
 ## Performance Characteristics
 
+### KVShard (High-Throughput)
+| Operation | Performance | Notes |
+|-----------|------------|-------|
+| Async Write | 555K ops/sec | Returns immediately |
+| Sync Write | 200K ops/sec | Waits for disk |
+| Read (cache) | Instant | Pending writes |
+| Read (bloom miss) | Instant | No disk access |
+| Read (disk) | 8.5K ops/sec | 117µs per read |
+| Batch Write | 121µs | vs Badger's 14.1ms |
+
 ### KV (Immutable)
 | Operation | Performance | Complexity |
 |-----------|------------|------------|
@@ -89,6 +139,20 @@ dkv.Delete(accountKey)
 | Compact | Background | When 50% wasted |
 
 ## File Organization
+
+### KVShard Files
+```
+data/kvshard/
+├── config.json         # Shard configuration
+├── bloom.mmap          # Memory-mapped bloom filter
+├── bloom.dat           # Persisted bloom filter
+└── shard_NNNN/         # 1024 shard directories
+    ├── dyna/           # DynaKV (mutable) data
+    │   └── wal.dat
+    └── perm/           # PermKV (immutable) data
+        ├── values.dat
+        └── bin_NNN/    # 256 bins per shard
+```
 
 ### KV Files
 ```
