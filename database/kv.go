@@ -110,18 +110,24 @@ func (k *KV) Open() (err error) {
 }
 
 // Compress
-// Re-write the values file to remove trash values
+// Re-write the values file to remove trash values (values that have been
+// overwritten and are no longer referenced by any key).
+//
+// Only meaningful for a mutable (history-disabled) KV: with history
+// enabled values are immutable, so the values file holds no trash.
+//
+// TODO(#5): the swap of the values file and the kfile rewrite are two
+// separate steps; a crash between them leaves the keys and values
+// inconsistent.  Making compaction crash-atomic needs the recovery
+// design tracked in issue #5.
 func (k *KV) Compress() (err error) {
-	k.Open()
-	k.Close()
-	k.Open()
-
-	if true {
-		return nil
+	if k.UseHistory {
+		return nil // Immutable values are never trash; nothing to reclaim
 	}
-
-	tvFile, err := NewBFile(filepath.Join(k.Directory, valueTmpFilename))
-	if err != nil {
+	if err = k.Open(); err != nil {
+		return err
+	}
+	if err = k.vFile.Flush(); err != nil { // All values must be on disk to copy them
 		return err
 	}
 
@@ -129,33 +135,61 @@ func (k *KV) Compress() (err error) {
 	if err != nil {
 		return err
 	}
+	if len(ks) == 0 {
+		return nil // Nothing to compress
+	}
 
-	var buffer [10000]byte
+	tvFile, err := NewBFile(filepath.Join(k.Directory, valueTmpFilename))
+	if err != nil {
+		return err
+	}
+
+	// Copy the live values into the tmp file, assigning new offsets
+	var buffer []byte
+	var newOffset uint64
 	for _, key := range ks {
 		dbbKey := kvs[key]
+		if uint64(cap(buffer)) < dbbKey.Length {
+			buffer = make([]byte, dbbKey.Length)
+		}
+		buffer = buffer[:dbbKey.Length]
 		// Read the current key value
-		if err := k.vFile.ReadAt(dbbKey.Offset, buffer[:dbbKey.Length]); err != nil {
+		if err := k.vFile.ReadAt(dbbKey.Offset, buffer); err != nil {
 			return err
 		}
-		// Put the new offset in the tvFile into the dbbKey (length does not change)
-		dbbKey.Offset, err = tvFile.Offset()
-		if err != nil {
+		// Write the value into the tvFile and point the key at it
+		if _, err = tvFile.Write(buffer); err != nil {
 			return err
 		}
-		// Update the key in the kFile
-		if err = k.kFile.Put(key, dbbKey); err != nil {
+		dbbKey.Offset = newOffset
+		newOffset += dbbKey.Length
+	}
+	if err = tvFile.Close(); err != nil { // Flush + sync the compacted values
+		return err
+	}
+
+	// Swap the compacted values file into place
+	if k.vFile.File != nil {
+		if err = k.vFile.File.Close(); err != nil {
 			return err
 		}
-		// Write the value into the tvFile
-		if _, err = tvFile.Write(buffer[:dbbKey.Length]); err != nil {
+		k.vFile.File = nil
+	}
+	if err = os.Rename(tvFile.Filename, k.vFile.Filename); err != nil {
+		return err
+	}
+	k.vFile.EOB = 0
+	k.vFile.EOD = newOffset
+
+	// Update the keys with their new offsets
+	for _, key := range ks {
+		if err = k.kFile.Put(key, kvs[key]); err != nil {
 			return err
 		}
 	}
+	if err = k.kFile.Close(); err != nil { // Persist the updated keys
+		return err
+	}
 
-	k.vFile.Close()
-	tvFile.Close()
-	k.kFile.Close()
-	os.Remove(k.vFile.Filename)
-	os.Rename(tvFile.Filename, k.vFile.Filename)
-	return nil
+	return k.Open()
 }

@@ -182,8 +182,9 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 // bogus DynaKV key will exist in PermKV.
 //
 // TODO: Cleanse PermKV of keys in DynaKV
-func (k *KV2) Compress() {
-	k.DynaKV.Compress()
+func (k *KV2) Compress() error {
+	err := k.DynaKV.Compress()
 	k.DWrites = 0 // Clear write counts
 	k.PWrites = 0
+	return err
 }
