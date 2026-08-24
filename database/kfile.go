@@ -15,6 +15,12 @@ import (
 const (
 	kFileName    string = "kfile.dat"     // Name of Key File
 	kTmpFileName string = "kfile_tmp.dat" // Name of the tmp file
+
+	// DefaultBloomCapacity is the key capacity a fresh KFile's Bloom
+	// filter is sized for (~150KB at 12 bits/key).  The filter rebuilds
+	// at double capacity whenever the key count outgrows it, so this is
+	// a starting point, not a limit.
+	DefaultBloomCapacity uint64 = 100_000
 )
 
 // Block File
@@ -51,7 +57,7 @@ type KFile struct {
 	TotalCnt       uint64               // Total number of keys processed
 	OffsetCnt      uint64               // Number of key sets in the kFile
 	HistoryOffsets int                  // History offset cnt
-	BloomFilter    *Bloom               // Bloom filter for quick key existence checks
+	BloomFilter    *BloomSet            // Layered Bloom filter for quick key existence checks
 }
 
 // Open
@@ -61,10 +67,11 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 
 	kFile.Directory = directory
 
-	// Remove any tmp file left behind by a crash mid-rewrite; the real
-	// kfile is only ever replaced by an atomic rename, so a lingering tmp
-	// file is always incomplete.
+	// Remove any tmp files left behind by a crash mid-rewrite; the real
+	// files are only ever replaced by an atomic rename, so a lingering
+	// tmp file is always incomplete.
 	os.Remove(filepath.Join(directory, kTmpFileName))
+	os.Remove(filepath.Join(directory, bloomTmpFilename))
 
 	filename := filepath.Join(directory, kFileName)
 	if kFile.File, err = OpenBFile(filename); err != nil {
@@ -133,9 +140,11 @@ func NewKFile(
 	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
 
-	// Initialize the Bloom filter with a reasonable size
-	// Using 10MB as a size, which is a good balance between memory usage and false positive rate
-	kFile.BloomFilter = NewBloomFilter(10.0, 3) // 10MB Bloom filter with 3 hash functions
+	// The Bloom filter is layered: the first layer is sized here, and
+	// new layers grow automatically as keys outrun the capacity -- no
+	// key is ever re-read to grow the filter
+	capacity := max(DefaultBloomCapacity, 2*keyLimit)
+	kFile.BloomFilter = NewBloomSet(capacity, 3)
 
 	return kFile, err
 }
@@ -196,6 +205,17 @@ func (k *KFile) PushHistory() (err error) {
 		}
 
 		k.HistoryMutex.Unlock()
+
+		// Persist the Bloom filter now that history holds the keys.
+		// Ordering matters: if we crash before this write, the stale
+		// bloom.dat misses the pushed keys, but they are still in the
+		// kfile (not yet reset) and the open path scans the kfile -- so
+		// every crash window leaves the filter complete.
+		if k.BloomFilter != nil {
+			if err = k.BloomFilter.Save(k.Directory); err != nil {
+				return err
+			}
+		}
 	}
 
 	// The keys are durable in history; now reset the kfile
@@ -229,26 +249,59 @@ func (k *KFile) Open() error {
 	// database); once in memory it tracks every key added by Put, so
 	// repopulating on every Open would be wasted work.
 	if k.BloomFilter == nil {
-		// Using 10MB as a size, which is a good balance between memory usage and false positive rate
-		k.BloomFilter = NewBloomFilter(10.0, 3) // 10MB Bloom filter with 3 hash functions
-
-		// If history is enabled, populate the Bloom filter with keys from history
-		if k.History != nil {
-			if err := k.PopulateBloomFilterFromHistory(); err != nil {
-				return err
-			}
-		}
-
-		// Populate the Bloom filter with the keys still in the current
-		// kfile.  Without this, keys that have not yet been pushed to
-		// history are invisible after a reopen (Get fails the Bloom test
-		// before ever reading the disk).
-		if err := k.PopulateBloomFilterFromKFile(); err != nil {
+		if err := k.buildBloomFilter(); err != nil {
 			return err
 		}
 	}
 
 	return k.File.Open()
+}
+
+// expectedKeys
+// The number of key records currently stored on disk (kfile plus
+// history), derived from the file sizes -- no scanning required.
+func (k *KFile) expectedKeys() uint64 {
+	var n uint64
+	kfileBytes := k.File.EOD + k.File.EOB
+	if kfileBytes > uint64(k.HeaderSize) {
+		n += (kfileBytes - uint64(k.HeaderSize)) / DBKeyFullSize
+	}
+	if k.History != nil {
+		for _, ks := range k.History.KeySets {
+			n += (ks.End - ks.Start) / DBKeyFullSize
+		}
+	}
+	return n
+}
+
+// buildBloomFilter
+// Reconstruct the Bloom filter on reopen.  The persisted bloom.dat is
+// loaded when present (a read, not a rebuild); it covers everything in
+// history as of the last push, and the keys added since then are still
+// in the kfile, so a scan of the (small) kfile completes the filter.
+// Without bloom.dat the filter is built by scanning history and the
+// kfile once.
+func (k *KFile) buildBloomFilter() (err error) {
+	if bs, err := LoadBloomSet(k.Directory); err == nil {
+		k.BloomFilter = bs
+		return k.PopulateBloomFilterFromKFile()
+	}
+
+	capacity := max(2*k.expectedKeys(), DefaultBloomCapacity, 2*k.KeyLimit)
+	k.BloomFilter = NewBloomSet(capacity, 3)
+
+	// If history is enabled, populate the Bloom filter with keys from history
+	if k.History != nil {
+		if err := k.PopulateBloomFilterFromHistory(); err != nil {
+			return err
+		}
+	}
+
+	// Populate the Bloom filter with the keys still in the current
+	// kfile.  Without this, keys that have not yet been pushed to
+	// history are invisible after a reopen (Get fails the Bloom test
+	// before ever reading the disk).
+	return k.PopulateBloomFilterFromKFile()
 }
 
 // PopulateBloomFilterFromKFile
@@ -264,7 +317,7 @@ func (k *KFile) PopulateBloomFilterFromKFile() error {
 	}
 
 	start := uint64(k.HeaderSize)
-	end := k.File.EOD
+	end := k.File.EOD + k.File.EOB // Include keys still in the write buffer
 	if end <= start {
 		return nil
 	}
