@@ -64,7 +64,7 @@ func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
 	if writes, err := k.Shards[index].PutDyna(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
-		k.Shards[index].Compress()
+		return k.Shards[index].Compress()
 	}
 	return nil
 }
@@ -77,7 +77,7 @@ func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
 	if writes, err := k.Shards[index].PutPerm(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
-		k.Shards[index].Compress()
+		return k.Shards[index].Compress()
 	}
 	return nil
 }
@@ -90,7 +90,7 @@ func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 	if writes, err := k.Shards[index].Put(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
-		k.Shards[index].Compress()
+		return k.Shards[index].Compress()
 	}
 	return nil
 }
@@ -132,7 +132,7 @@ func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {
 	for _, kvs := range k.Shards {
-		if err = kvs.Close(); err != nil {
+		if err = kvs.Compress(); err != nil {
 			return err
 		}
 	}
