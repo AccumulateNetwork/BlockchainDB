@@ -87,10 +87,13 @@ func (k *KV) Get(key [32]byte) (value []byte, err error) {
 }
 
 func (k *KV) Close() (err error) {
-	if err = k.kFile.Close(); err != nil {
+	// Close (and sync) the values first: keys reference offsets in the
+	// value file, so values must be durable before the keys that point
+	// at them.
+	if err = k.vFile.Close(); err != nil {
 		return err
 	}
-	if err = k.vFile.Close(); err != nil {
+	if err = k.kFile.Close(); err != nil {
 		return err
 	}
 	return nil

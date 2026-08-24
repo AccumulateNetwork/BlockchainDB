@@ -227,8 +227,12 @@ func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 		fmt.Printf("Update End %d to %d\n", startOff, endOff)
 		return err
 	}
-	_, err = hf.File.WriteAt(hf.Marshal(), 0)
-	return err
+	if _, err = hf.File.WriteAt(hf.Marshal(), 0); err != nil {
+		return err
+	}
+	// Sync so the caller can safely discard its copy of these keys
+	// (PushHistory resets the kfile once AddKeys returns)
+	return hf.File.Sync()
 }
 
 // OffsetSort

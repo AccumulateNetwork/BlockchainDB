@@ -60,6 +60,12 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 	kFile = new(KFile)
 
 	kFile.Directory = directory
+
+	// Remove any tmp file left behind by a crash mid-rewrite; the real
+	// kfile is only ever replaced by an atomic rename, so a lingering tmp
+	// file is always incomplete.
+	os.Remove(filepath.Join(directory, kTmpFileName))
+
 	filename := filepath.Join(directory, kFileName)
 	if kFile.File, err = OpenBFile(filename); err != nil {
 		return nil, err
@@ -159,19 +165,9 @@ func (k *KFile) PushHistory() (err error) {
 		return err
 	}
 
-	if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
-		return err
-	}
-
-	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
-		return err
-	}
-
-	k.Header.Init(uint64(k.OffsetsCnt))
-	k.Close()
-	k.Open()
-
-	// Only attempt to push to history if we have keys to push
+	// Push the keys into history BEFORE resetting the kfile.  A crash
+	// between the two steps then leaves the keys in both places (a benign
+	// duplicate resolved by the next push) instead of in neither.
 	if len(keyList) > 0 {
 		// Process history synchronously to prevent memory buildup
 
@@ -188,10 +184,6 @@ func (k *KFile) PushHistory() (err error) {
 			buffPtr = buffPtr[DBKeyFullSize:]
 		}
 
-		// Clear references to help with garbage collection
-		keyValues = nil
-		keyList = nil
-
 		k.HistoryMutex.Lock()
 
 		// Double-check that History is still valid before using it
@@ -204,10 +196,26 @@ func (k *KFile) PushHistory() (err error) {
 		}
 
 		k.HistoryMutex.Unlock()
-
-		// Clear the buffer to help with garbage collection
-		buff = nil
 	}
+
+	// The keys are durable in history; now reset the kfile
+	if k.File.File != nil { // GetKeyList leaves the file open
+		if err = k.File.File.Close(); err != nil {
+			return err
+		}
+		k.File.File = nil
+	}
+	if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
+		return err
+	}
+
+	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
+		return err
+	}
+
+	k.Header.Init(uint64(k.OffsetsCnt))
+	k.Close()
+	k.Open()
 
 	return nil
 }
@@ -601,31 +609,46 @@ func (k *KFile) Close() (err error) {
 	}
 	k.Header.EndOfList = currentOffset // End of List is where the currentOffset was left
 
-	err = k.File.File.Close()
+	if err = k.File.File.Close(); err != nil {
+		return err
+	}
+	k.File.File = nil
+
+	// Rewrite the kfile through a tmp file and an atomic rename so a crash
+	// mid-rewrite cannot lose the keys (the old kfile stays intact until
+	// the new one is durable).
+	tmpPath := filepath.Join(k.Directory, kTmpFileName)
+	tmp, err := NewBFile(tmpPath)
 	if err != nil {
 		return err
 	}
-	err = os.Remove(k.File.Filename)
-	if err != nil {
-		return err
-	}
-	if k.File.File, err = os.Create(k.File.Filename); err != nil {
-		return err
-	}
-	err = k.WriteHeader()
-	if err != nil {
+	if _, err = tmp.Write(k.Header.Marshal()); err != nil {
 		return err
 	}
 	// Write all the keys following the Header
 	for _, key := range keyList {
 		keyB := keyValues[key].Bytes(key)
-		_, err = k.File.Write(keyB)
-		if err != nil {
+		if _, err = tmp.Write(keyB); err != nil {
 			return err
 		}
 	}
+	if err = tmp.Flush(); err != nil {
+		return err
+	}
+	if err = tmp.File.Sync(); err != nil { // Make the new kfile durable
+		return err
+	}
+	if err = tmp.File.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, k.File.Filename); err != nil {
+		return err
+	}
 
-	return k.File.Close()
+	// Update the BFile state to match the file just written
+	k.File.EOB = 0
+	k.File.EOD = uint64(k.HeaderSize) + uint64(len(keyList)*DBKeyFullSize)
+	return nil
 }
 
 // GetKeyList
