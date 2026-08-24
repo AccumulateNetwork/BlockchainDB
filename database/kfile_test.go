@@ -160,50 +160,50 @@ func TestImmutabilityWithHistory(t *testing.T) {
 	// Create a test key and value
 	var key [32]byte
 	copy(key[:], []byte("test-key"))
-	
+
 	// Create original value
 	originalValue := &DBBKey{
 		Length: 100,
 		Offset: 200,
 	}
-	
+
 	// Put the original value
 	err = kf.Put(key, originalValue)
 	assert.NoError(t, err, "Should be able to write the key initially")
-	
+
 	// Verify we can get the value
 	retrievedValue, err := kf.Get(key)
 	assert.NoError(t, err, "Should be able to get the key")
 	assert.Equal(t, originalValue.Bytes(key), retrievedValue.Bytes(key), "Retrieved value should match original")
-	
+
 	// Try to overwrite with a different value
 	newValue := &DBBKey{
 		Length: 300, // Different from original
 		Offset: 400, // Different from original
 	}
-	
+
 	// Verify the values are different
 	assert.NotEqual(t, originalValue.Bytes(key), newValue.Bytes(key), "New value should be different from original")
-	
+
 	// Try to put the different value - should fail
 	err = kf.Put(key, newValue)
 	assert.Error(t, err, "Should not allow overwriting with different value when history is enabled")
 	assert.Contains(t, err.Error(), "cannot overwrite immutable value when history is enabled")
-	
+
 	// Verify the original value is still there
 	retrievedValue, err = kf.Get(key)
 	assert.NoError(t, err, "Should still be able to get the key")
 	assert.Equal(t, originalValue.Bytes(key), retrievedValue.Bytes(key), "Retrieved value should still match original")
-	
+
 	// Try to put the same value - should succeed
 	sameValue := &DBBKey{
 		Length: originalValue.Length,
 		Offset: originalValue.Offset,
 	}
-	
+
 	// Verify the values are the same
 	assert.Equal(t, originalValue.Bytes(key), sameValue.Bytes(key), "Same value should match original")
-	
+
 	// Try to put the same value - should succeed
 	err = kf.Put(key, sameValue)
 	assert.NoError(t, err, "Should allow overwriting with the same value when history is enabled")
@@ -220,35 +220,35 @@ func TestMutabilityWithoutHistory(t *testing.T) {
 	// Create a test key and value
 	var key [32]byte
 	copy(key[:], []byte("test-key"))
-	
+
 	// Create original value
 	originalValue := &DBBKey{
 		Length: 100,
 		Offset: 200,
 	}
-	
+
 	// Put the original value
 	err = kf.Put(key, originalValue)
 	assert.NoError(t, err, "Should be able to write the key initially")
-	
+
 	// Verify we can get the value
 	retrievedValue, err := kf.Get(key)
 	assert.NoError(t, err, "Should be able to get the key")
 	assert.Equal(t, originalValue.Bytes(key), retrievedValue.Bytes(key), "Retrieved value should match original")
-	
+
 	// Try to overwrite with a different value
 	newValue := &DBBKey{
 		Length: 300, // Different from original
 		Offset: 400, // Different from original
 	}
-	
+
 	// Verify the values are different
 	assert.NotEqual(t, originalValue.Bytes(key), newValue.Bytes(key), "New value should be different from original")
-	
+
 	// Try to put the different value - should succeed with history disabled
 	err = kf.Put(key, newValue)
 	assert.NoError(t, err, "Should allow overwriting with different value when history is disabled")
-	
+
 	// Verify the value has been updated
 	retrievedValue, err = kf.Get(key)
 	assert.NoError(t, err, "Should still be able to get the key")

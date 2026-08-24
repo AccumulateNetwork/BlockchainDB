@@ -44,6 +44,7 @@ type KVView struct {
 	Timeout     time.Duration // How long before views timeout; every access resets timeout
 	OffsetCnt   uint64        // KeyOffset number for the key files
 	KeyLimit    uint64        // KeyLimit sets when to move keys to History
+	FlushErr    error         // First error hit while flushing buffered writes to the DB
 }
 
 func NewShardDBViews(
@@ -78,10 +79,32 @@ func OpenShardDBViews(
 	return nil, err
 }
 
-func (s *KVView) Close() {
+// flushViewCache
+// Writes the key/value pairs buffered in the view cache (ActiveViews[0])
+// into the underlying DB.  While views are active, Put only buffers
+// writes; they land in the DB here, when the last view goes away.
+// The first flush error is retained in s.FlushErr and returned by Close.
+func (s *KVView) flushViewCache() {
+	if len(s.ActiveViews) == 0 {
+		return
+	}
+	for key, value := range s.ActiveViews[0].KeyValues {
+		if err := s.DB.Put(key, value); err != nil && s.FlushErr == nil {
+			s.FlushErr = err
+		}
+	}
+	s.ActiveViews[0].KeyValues = nil
+}
+
+func (s *KVView) Close() error {
+	s.flushViewCache()
 	s.ActiveViews = nil
 	s.Map = nil
-	s.DB.Close()
+	err := s.DB.Close()
+	if s.FlushErr != nil {
+		return s.FlushErr
+	}
+	return err
 }
 
 // Active Views
@@ -105,8 +128,9 @@ func (s *KVView) Put(key [32]byte, value []byte) error {
 		return s.DB.Put(key, value)
 	}
 
-	s.ActiveViews[len(s.ActiveViews)-1].KeyValues[key] = value // Put key/value in last view
-	s.ActiveViews[0].KeyValues[key] = value                    // And put the key value in the cache
+	s.ActiveViews[len(s.ActiveViews)-1].KeyValues[key] = value  // Put key/value in last view
+	s.ActiveViews[len(s.ActiveViews)-1].LastAccess = time.Now() // Writing counts as activity
+	s.ActiveViews[0].KeyValues[key] = value                     // And put the key value in the cache
 	return nil
 }
 
@@ -150,36 +174,41 @@ func (s *KVView) NewView() *View {
 
 // GetViewIndex
 // Returns the view index for a view.  Returns 0 if view is closed.
+// Also expires views that have not been accessed within the timeout,
+// prunes closed views from the old end of the stack, and flushes the
+// buffered writes to the DB when the last view goes away.
 func (s *KVView) GetViewIndex(view *View) int {
-	if view.Closed || len(s.ActiveViews) == 0 {
+	if len(s.ActiveViews) == 0 {
 		return 0
 	}
 
-	// Look for and mark all the views that have timed out
+	// Mark all the views that have timed out.  Note this checks each
+	// view's own LastAccess (checking the queried view's LastAccess here
+	// would close every other view as soon as one view went stale).
 	for _, v := range s.ActiveViews[1:] {
-		if v.Closed {
-			return 0
-		}
-		if dt := time.Since(view.LastAccess); dt > s.Timeout {
+		if time.Since(v.LastAccess) > s.Timeout {
 			v.Closed = true
 		}
 	}
 
-	// First clear ActiveViews if no active view exists
-	if len(s.ActiveViews) == 2 && s.ActiveViews[1].Closed { // Clear ActiveViews if none exist
-		s.ActiveViews = s.ActiveViews[:0]
-		return 0
-	}
-	for s.ActiveViews[1].Closed { // While the oldest ActiveView is closed, delete it
+	// Remove closed views from the old end of the stack.  Closed views in
+	// the middle must be retained: newer views still look up buffered
+	// writes through them.
+	for len(s.ActiveViews) >= 2 && s.ActiveViews[1].Closed {
 		n := len(s.ActiveViews)
-		if n <= 2 { // If Removing the last view, clear ActiveViews
-			s.ActiveViews = s.ActiveViews[:0] // No index exists for the View
-			return 0
+		if n <= 2 { // Removing the last view: flush buffered writes, clear all
+			s.flushViewCache()
+			s.ActiveViews = s.ActiveViews[:0]
+			break
 		}
 		copy(s.ActiveViews[1:], s.ActiveViews[2:]) // Remove the closed View
+		s.ActiveViews[n-1] = nil
 		s.ActiveViews = s.ActiveViews[:n-1]
 	}
 
+	if view.Closed {
+		return 0
+	}
 	for i, v := range s.ActiveViews[1:] { // Look for the view in the Views that remain
 		if v.ID == view.ID {
 			return i + 1
@@ -194,14 +223,14 @@ func (s *KVView) GetViewIndex(view *View) int {
 // active views that were created before this view are searched in turn.  If no
 // key value pair is found in the view or older views, then return what the DB has
 func (s *KVView) ViewGet(view *View, key [32]byte) (value []byte, err error) {
-	//
-	view.LastAccess = time.Now()
-	// Check if the view provided is active.  If not, return an error that the
-	// view has expired
+	// Check if the view provided is active.  If not, return an error that
+	// the view has expired.  Only refresh LastAccess for a still-valid
+	// view; refreshing first would resurrect views that already expired.
 	viewIdx := s.GetViewIndex(view)
 	if viewIdx == 0 {
 		return nil, fmt.Errorf("view invalid")
 	}
+	view.LastAccess = time.Now()
 
 	// Check the view and all the older views for a key value pair.  Note that even
 	// if an older view has expired, we still need its key value pair rather than

@@ -6,7 +6,7 @@ type Bloom struct {
 	SizeOfMap float64
 	NumBytes  uint64
 	Map       []byte
-	K         int     // Number of hash functions
+	K         int // Number of hash functions
 }
 
 // NewBloom
@@ -37,20 +37,20 @@ func (b *Bloom) ByteMask(key [32]byte, hashNum int) (Index uint64, BitMask byte)
 	// Since the key is a SHA-256 hash, we can simply use different byte ranges
 	// Each 8-byte segment provides enough entropy for a good hash function
 	offset := (hashNum * 8) % 24 // Use different 8-byte chunks, wrapping if needed
-	
+
 	// Extract an 8-byte value from the key
 	v := binary.BigEndian.Uint64(key[offset:])
-	
+
 	// Modulo to fit in our bitmap
 	v = v % (b.NumBytes << 8)
-	
+
 	// Split into byte index and bit index
 	Index = v >> 8
 	BitIndex := v & 0xFF
-	
+
 	// Convert bit index to a bitmask
 	BitMask = 1 << (BitIndex % 8)
-	
+
 	return Index, BitMask
 }
 

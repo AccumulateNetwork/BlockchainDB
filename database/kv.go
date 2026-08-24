@@ -9,11 +9,10 @@ const valueFilename = "values.dat"
 const valueTmpFilename = "values_tmp.dat"
 
 type KV struct {
-	Directory   string
-	vFile       *BFile
-	kFile       *KFile
-	HistoryFile *HistoryFile
-	UseHistory  bool
+	Directory  string
+	vFile      *BFile
+	kFile      *KFile
+	UseHistory bool
 }
 
 // NewKV
@@ -31,11 +30,10 @@ func NewKV(history bool, directory string, offsetsCnt, KeyLimit uint64, MaxCache
 	if kv.vFile, err = NewBFile(filepath.Join(directory, valueFilename)); err != nil {
 		return nil, err
 	}
-	if history {
-		if kv.HistoryFile, err = NewHistoryFile(1024, directory); err != nil {
-			return nil, err
-		}
-	}
+	// Note: the history file (when enabled) is owned by the kFile, which
+	// created it above.  Creating a second HistoryFile here would truncate
+	// the one the kFile is using.
+	kv.UseHistory = history
 	return kv, nil
 }
 
@@ -51,6 +49,7 @@ func OpenKV(directory string) (kv *KV, err error) {
 	if kv.kFile, err = OpenKFile(directory); err != nil {
 		return nil, err
 	}
+	kv.UseHistory = kv.kFile.History != nil
 	return kv, err
 }
 
@@ -88,10 +87,13 @@ func (k *KV) Get(key [32]byte) (value []byte, err error) {
 }
 
 func (k *KV) Close() (err error) {
-	if err = k.kFile.Close(); err != nil {
+	// Close (and sync) the values first: keys reference offsets in the
+	// value file, so values must be durable before the keys that point
+	// at them.
+	if err = k.vFile.Close(); err != nil {
 		return err
 	}
-	if err = k.vFile.Close(); err != nil {
+	if err = k.kFile.Close(); err != nil {
 		return err
 	}
 	return nil

@@ -90,9 +90,15 @@ func (b *BFile) Flush() (err error) {
 }
 
 // Close
-// Close the underlying file
+// Close the underlying file.  The file is synced first so the data is
+// durable once Close returns.
 func (b *BFile) Close() (err error) {
 	if err = b.Flush(); err != nil {
+		return err
+	}
+	if err = b.File.Sync(); err != nil {
+		b.File.Close()
+		b.File = nil
 		return err
 	}
 	err = b.File.Close()

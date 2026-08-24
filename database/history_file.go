@@ -103,6 +103,33 @@ func NewHistoryFile(OffsetCnt uint64, Directory string) (historyFile *HistoryFil
 	return hf, nil
 }
 
+// OpenHistoryFile
+// Opens an existing HistoryFile and loads its header (the KeySet offsets).
+func OpenHistoryFile(Directory string) (historyFile *HistoryFile, err error) {
+	hf := new(HistoryFile)
+	hf.Directory = Directory
+	hf.Filename = filepath.Join(Directory, historyFilename)
+	if hf.File, err = os.OpenFile(hf.Filename, os.O_RDWR, 0644); err != nil {
+		return nil, err
+	}
+
+	// The first 4 bytes hold the OffsetCnt, which sizes the header
+	var cntBuff [4]byte
+	if _, err = hf.File.ReadAt(cntBuff[:], 0); err != nil {
+		return nil, err
+	}
+	offsetCnt := binary.BigEndian.Uint32(cntBuff[:])
+	hf.OffsetCnt = int32(offsetCnt)
+	hf.HeaderSize = 4 + KeySetSize*uint64(offsetCnt)
+
+	header := make([]byte, hf.HeaderSize)
+	if _, err = hf.File.ReadAt(header, 0); err != nil {
+		return nil, err
+	}
+	hf.Unmarshal(header)
+	return hf, nil
+}
+
 // EOF
 // Return the last offset in the HistoryFile
 func (hf *HistoryFile) EOF() uint64 {
@@ -138,10 +165,18 @@ func min(a, b int) int {
 func (hf *HistoryFile) Unmarshal(data []byte) {
 	hf.OffsetCnt = int32(binary.BigEndian.Uint32(data))
 	data = data[4:]
+	// Allocate the KeySet slices if needed (e.g. when opening an existing
+	// HistoryFile rather than creating a new one)
+	if len(hf.KeySets) != int(hf.OffsetCnt) {
+		hf.KeySets = make([]*KeySet, hf.OffsetCnt)
+		hf.KeySetOffset = make([]*KeySet, hf.OffsetCnt)
+	}
 	for i := uint64(0); i < uint64(hf.OffsetCnt); i++ {
 		ks := new(KeySet)
 		ks.OffsetIndex = i
+		ks.KeySetIndex = i
 		ks.Unmarshal(data)
+		data = data[KeySetSize:] // Advance to the next KeySet entry
 		hf.KeySets[i] = ks
 		hf.KeySetOffset[i] = ks
 	}
@@ -192,8 +227,12 @@ func (hf *HistoryFile) AddKeys(keyList []byte) (err error) {
 		fmt.Printf("Update End %d to %d\n", startOff, endOff)
 		return err
 	}
-	_, err = hf.File.WriteAt(hf.Marshal(), 0)
-	return err
+	if _, err = hf.File.WriteAt(hf.Marshal(), 0); err != nil {
+		return err
+	}
+	// Sync so the caller can safely discard its copy of these keys
+	// (PushHistory resets the kfile once AddKeys returns)
+	return hf.File.Sync()
 }
 
 // OffsetSort
@@ -258,7 +297,7 @@ func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
 	if _, err = hf.File.WriteAt(buffer[:NewLength], int64(offset)); err != nil {
 		return err
 	}
-	
+
 	// Clear the buffer to help with garbage collection
 	buffer = nil
 
@@ -295,7 +334,7 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, err
 	}
 
-	var dbKey DBBKey                    //          Search the keys by unmarshaling each key as we search
+	var dbKey DBBKey                   //          Search the keys by unmarshaling each key as we search
 	for len(buffer) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
 		if [32]byte(buffer) == Key {
 			if _, err := dbKey.Unmarshal(buffer[:DBKeyFullSize]); err != nil {
