@@ -1,12 +1,14 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 )
 
@@ -256,25 +258,77 @@ func (hf *HistoryFile) OffsetSort() {
 	}
 }
 
+// recordSort
+// Sorts a buffer of 48-byte key records in place by their 32-byte key
+type recordSort []byte
+
+func (r recordSort) Len() int { return len(r) / DBKeyFullSize }
+func (r recordSort) Less(i, j int) bool {
+	return bytes.Compare(r[i*DBKeyFullSize:i*DBKeyFullSize+32], r[j*DBKeyFullSize:j*DBKeyFullSize+32]) < 0
+}
+func (r recordSort) Swap(i, j int) {
+	var tmp [DBKeyFullSize]byte
+	copy(tmp[:], r[i*DBKeyFullSize:])
+	copy(r[i*DBKeyFullSize:(i+1)*DBKeyFullSize], r[j*DBKeyFullSize:])
+	copy(r[j*DBKeyFullSize:(j+1)*DBKeyFullSize], tmp[:])
+}
+
+// mergeRecords
+// Merges two key-sorted record buffers into one sorted buffer.  Records
+// with equal keys are deduplicated; the record from incoming wins.
+// (Duplicates arise when a crash between a history push and the kfile
+// reset leaves keys in both places; the next push re-sends them.)
+func mergeRecords(existing, incoming []byte) []byte {
+	merged := make([]byte, 0, len(existing)+len(incoming))
+	for len(existing) > 0 && len(incoming) > 0 {
+		switch bytes.Compare(existing[:32], incoming[:32]) {
+		case -1:
+			merged = append(merged, existing[:DBKeyFullSize]...)
+			existing = existing[DBKeyFullSize:]
+		case 1:
+			merged = append(merged, incoming[:DBKeyFullSize]...)
+			incoming = incoming[DBKeyFullSize:]
+		default: // Same key: the incoming record wins
+			merged = append(merged, incoming[:DBKeyFullSize]...)
+			existing = existing[DBKeyFullSize:]
+			incoming = incoming[DBKeyFullSize:]
+		}
+	}
+	merged = append(merged, existing...)
+	merged = append(merged, incoming...)
+	return merged
+}
+
 // UpdateKeySet
 // Add the given entries to the KeySet at the given index and update
-// the History File
+// the History File.
 //
-// # If the new keys fit where the KeySet is, just add them to the HistoryFile
-//
-// If a KeySet does not fit where it is in the HistoryFile,
-// Update it's start and end to where it can fit, and update the
-// KeySets offsets, and the HistoryFile. Mem
+// The records in a KeySet are kept sorted by key (Get relies on this to
+// binary search).  The incoming records are sorted, then merged with the
+// KeySet's existing records; the merged KeySet is written wherever it
+// first fits (which may mean relocating it).
 func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
 
 	if len(keyList) == 0 { // Ignore nil lists
 		return nil
 	}
 
+	// Sort the incoming records by key.  Sorting is in place; callers do
+	// not reuse the buffer.
+	sort.Sort(recordSort(keyList))
+
 	keySet := hf.KeySets[index]
 	CurrentLength := keySet.End - keySet.Start
-	NewLength := CurrentLength + uint64(len(keyList))
 
+	// Read the existing (sorted) records and merge the new ones in
+	existing := make([]byte, CurrentLength)
+	if _, err = hf.File.ReadAt(existing, int64(keySet.Start)); err != nil {
+		return err
+	}
+	merged := mergeRecords(existing, keyList)
+	NewLength := uint64(len(merged))
+
+	// First fit: find the first gap the merged KeySet fits in
 	offset := uint64(hf.HeaderSize)
 	iAfter := 0
 	for iAfter = 0; iAfter < int(hf.OffsetCnt); iAfter++ {
@@ -284,22 +338,9 @@ func (hf *HistoryFile) UpdateKeySet(index int, keyList []byte) (err error) {
 		offset = hf.KeySetOffset[iAfter].End
 	}
 
-	// Create a local buffer for this operation instead of using a shared buffer
-	// This reduces memory usage and prevents memory growth
-	buffer := make([]byte, NewLength)
-
-	// If we have to move the keySet, read in the keySet
-	if _, err = hf.File.ReadAt(buffer[:CurrentLength], int64(keySet.Start)); err != nil {
+	if _, err = hf.File.WriteAt(merged, int64(offset)); err != nil {
 		return err
 	}
-	// And tack on the keyList
-	copy(buffer[CurrentLength:NewLength], keyList)
-	if _, err = hf.File.WriteAt(buffer[:NewLength], int64(offset)); err != nil {
-		return err
-	}
-
-	// Clear the buffer to help with garbage collection
-	buffer = nil
 
 	// Update position of keySet in the HistoryFile
 	keySet.Start = offset
@@ -320,29 +361,62 @@ func (hf *HistoryFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	index := hf.Index(Key)
 	start := hf.KeySets[index].Start // The index is where the section starts
 	end := hf.KeySets[index].End
-	keysLen := end - start
+	numRecords := int64(end-start) / DBKeyFullSize
 
-	if keysLen == 0 { //                     If the start is the end, the section is empty
-		return nil, errors.New("not found") // TODO use buffer...
+	if numRecords == 0 { //                  If the start is the end, the section is empty
+		return nil, errors.New("not found")
 	}
 
-	// Use a local buffer instead of growing the shared buffer
-	// This prevents memory growth over time
-	buffer := make([]byte, keysLen)
+	// The records in a KeySet are sorted by key (see UpdateKeySet), so
+	// binary search, reading one 48-byte record per probe rather than the
+	// entire KeySet.  Once the remaining range is small, read it in one
+	// gulp and finish the search in memory to save syscalls.
+	const inMemRecords = 64 // 3KB; the range read in one gulp
 
-	if _, err = hf.File.ReadAt(buffer, int64(start)); err != nil { // Read the section
-		return nil, err
-	}
-
-	var dbKey DBBKey                   //          Search the keys by unmarshaling each key as we search
-	for len(buffer) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
-		if [32]byte(buffer) == Key {
-			if _, err := dbKey.Unmarshal(buffer[:DBKeyFullSize]); err != nil {
+	var record [DBKeyFullSize]byte
+	lo, hi := int64(0), numRecords-1
+	for hi-lo+1 > inMemRecords {
+		mid := (lo + hi) / 2
+		if _, err = hf.File.ReadAt(record[:], int64(start)+mid*DBKeyFullSize); err != nil {
+			return nil, err
+		}
+		switch bytes.Compare(Key[:], record[:32]) {
+		case 0:
+			var dbKey DBBKey
+			if _, err := dbKey.Unmarshal(record[:]); err != nil {
 				return nil, err
 			}
 			return &dbKey, nil
+		case -1:
+			hi = mid - 1
+		default:
+			lo = mid + 1
 		}
-		buffer = buffer[DBKeyFullSize:] //       Move to the next DBBKey
+	}
+
+	// Read the remaining range and binary search it in memory
+	var gulp [inMemRecords * DBKeyFullSize]byte
+	n := hi - lo + 1
+	buff := gulp[:n*DBKeyFullSize]
+	if _, err = hf.File.ReadAt(buff, int64(start)+lo*DBKeyFullSize); err != nil {
+		return nil, err
+	}
+	i, j := int64(0), n-1
+	for i <= j {
+		mid := (i + j) / 2
+		rec := buff[mid*DBKeyFullSize:]
+		switch bytes.Compare(Key[:], rec[:32]) {
+		case 0:
+			var dbKey DBBKey
+			if _, err := dbKey.Unmarshal(rec[:DBKeyFullSize]); err != nil {
+				return nil, err
+			}
+			return &dbKey, nil
+		case -1:
+			j = mid - 1
+		default:
+			i = mid + 1
+		}
 	}
 	return nil, errors.New("not found")
 }

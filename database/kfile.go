@@ -491,6 +491,22 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 				// If there was an error other than "not found", return it
 				return err
 			}
+
+			// Not in the current kfile; the key may have been pushed to
+			// history.  Immutability must hold for pushed keys too.
+			// (KeySets are sorted, so this check is a cheap binary search.)
+			k.HistoryMutex.Lock()
+			existingKey, err = k.History.Get(Key)
+			k.HistoryMutex.Unlock()
+			if err == nil {
+				if !bytes.Equal(existingKey.Bytes(Key), dbBKey.Bytes(Key)) {
+					return errors.New("cannot overwrite immutable value when history is enabled")
+				}
+				k.Cache[Key] = dbBKey // Update cache with the existing value
+				return nil
+			} else if err.Error() != "not found" {
+				return err
+			}
 		}
 		// If key doesn't exist, proceed with the write
 	}
@@ -696,14 +712,17 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 		offset++
 	}
 
-	// Sort the keys into their offset bins.
-	// They won't be sorted inside the bins.
-	// The order will not be the same over multiple machines.
-	// Note: Keys must be sorted in ascending order by bin for HistoryFile.AddKeys to work correctly
+	// Sort the keys by their offset bins, and by key within each bin.
+	// Bin order is required by HistoryFile.AddKeys; key order within bins
+	// keeps KeySets sorted so lookups can binary search, and makes the
+	// order deterministic across machines.
 	sort.Slice(KeyList, func(i, j int) bool {
 		a := k.OffsetIndex(KeyList[i][:]) // Bin for a
 		b := k.OffsetIndex(KeyList[j][:]) // Bin for b
-		return a < b                      // Sort in ascending order
+		if a != b {
+			return a < b // Sort by bin in ascending order
+		}
+		return bytes.Compare(KeyList[i][:], KeyList[j][:]) < 0
 	})
 
 	return keyValues, KeyList, nil
