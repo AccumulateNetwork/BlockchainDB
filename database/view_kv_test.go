@@ -114,70 +114,63 @@ func TestView(t *testing.T) {
 	Vr := NewFastRandom([]byte{1, 2, 3, 4})
 
 	// Make sure we can read and write keys
+	keys := make([][32]byte, NumKeys)
+	original := make([][]byte, NumKeys)
 	for i := 0; i < NumKeys; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		sdbv.Put(key, value)
-		v, err := sdbv.Get(key)
+		keys[i] = Kr.NextHash()
+		original[i] = Vr.RandBuff(10, 10)
+		sdbv.Put(keys[i], original[i])
+		v, err := sdbv.Get(keys[i])
 		assert.NoError(t, err, "get failed")
-		assert.Equal(t, value, v, "failed to get data")
+		assert.Equal(t, original[i], v, "failed to get data")
 	}
 
-	// Make sure we can read the keys
-	Kr.Reset()
-	Vr.Reset()
-	for i := 0; i < NumKeys; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		v, err := sdbv.Get(key)
-		assert.NoError(t, err, "get failed")
-		assert.Equal(t, value, v, "failed to get data")
-	}
-
-	// Create a view and modify half the keys (Don't reset the value sequence)
-	Kr.Reset()
+	// Create a view and modify half the keys
 	view := sdbv.NewView()
+	changed := make([][]byte, NumKeys/2)
 	for i := 0; i < NumKeys/2; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		err := sdbv.Put(key, value)
+		changed[i] = Vr.RandBuff(10, 10)
+		err := sdbv.Put(keys[i], changed[i])
 		assert.NoError(t, err, "put failed")
 	}
 
-	// No values changed above should change in the view
-	Kr.Reset()
-	Vr.Reset()
+	// The view must still see the original values for every key
 	for i := 0; i < NumKeys; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		v, err := view.Get(key)
+		v, err := view.Get(keys[i])
 		assert.NoError(t, err, "get failed")
-		assert.Equal(t, value, v, "failed to get data")
+		assert.Equal(t, original[i], v, "view saw a write made after its creation")
 	}
-	assert.Equal(t, 1, len(sdbv.ActiveViews), "Should have one active view")
-	sdbv.Close()
 
-	// Check the DB; first half should have changed values, last half not changed
-	Kr.Reset()
-	Vr.Reset()
-	for i := 0; i < NumKeys; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		v, err := view.Get(key)
+	// The view stack holds the write cache (index 0) plus the one view
+	assert.Equal(t, 2, len(sdbv.ActiveViews), "should have the cache and one active view")
+
+	// While the view is active, non-view reads see the new values (from
+	// the write cache)
+	for i := 0; i < NumKeys/2; i++ {
+		v, err := sdbv.Get(keys[i])
 		assert.NoError(t, err, "get failed")
-		if i >= NumKeys/2 {
-			assert.Equal(t, value, v, "failed to get data")
+		assert.Equal(t, changed[i], v, "read of a buffered write failed")
+	}
+
+	// Let the view time out.  The buffered writes must flush to the DB
+	time.Sleep(Timeout + 100*time.Millisecond)
+	assert.False(t, sdbv.IsViewActive(), "view should have expired")
+	assert.NoError(t, sdbv.FlushErr, "flushing buffered writes failed")
+
+	// An expired view is no longer usable
+	_, err = view.Get(keys[0])
+	assert.Error(t, err, "expired view should return an error")
+
+	// The DB must have the changed values for the first half and the
+	// original values for the second half
+	for i := 0; i < NumKeys; i++ {
+		v, err := sdbv.Get(keys[i])
+		assert.NoError(t, err, "get failed")
+		if i < NumKeys/2 {
+			assert.Equal(t, changed[i], v, "buffered write was not flushed to the DB")
 		} else {
-			assert.NotEqual(t, value, v, "failed to update value")
+			assert.Equal(t, original[i], v, "unmodified key changed")
 		}
 	}
-	// Check the first half to be equal to the changed values
-	Kr.Reset()
-	for i := 0; i < NumKeys/2; i++ {
-		key := Kr.NextHash()
-		value := Vr.RandBuff(10, 10)
-		v, err := sdbv.Get(key)
-		assert.NoError(t, err, "put failed")
-		assert.Equal(t, value, v, "failed to get data")
-	}
+	assert.NoError(t, sdbv.Close(), "close failed")
 }
