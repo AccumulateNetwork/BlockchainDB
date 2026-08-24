@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,7 @@ func (v *View) Get(key [32]byte) (value []byte, err error) {
 // More recent views lookup values in their cache, and then in the views that come
 // before.  Later views are ignored.
 type KVView struct {
+	Mutex       sync.Mutex    // Serializes access; KVView methods are safe for concurrent use
 	DB          *KVShard      // The underlying DB
 	ViewID      int           // The next ViewID
 	ActiveViews []*View       // List of all active Views, newest first
@@ -97,6 +99,8 @@ func (s *KVView) flushViewCache() {
 }
 
 func (s *KVView) Close() error {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
 	s.flushViewCache()
 	s.ActiveViews = nil
 	s.Map = nil
@@ -111,20 +115,30 @@ func (s *KVView) Close() error {
 // Returns true if a valid active view exists.  If old views
 // exist, but none are active, the active views are tossed.
 func (s *KVView) IsViewActive() bool {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.isViewActive()
+}
+
+// isViewActive
+// Internal version of IsViewActive; the caller must hold the Mutex.
+func (s *KVView) isViewActive() bool {
 	// The first entry in the ActiveViews is the View Cache
 	// ActiveViews with a length less than two means no active views
 	if len(s.ActiveViews) < 2 {
 		return false
 	}
 
-	s.GetViewIndex(s.ActiveViews[1]) // This will clear ActiveViews if none are valid
+	s.getViewIndex(s.ActiveViews[1]) // This will clear ActiveViews if none are valid
 	return len(s.ActiveViews) > 0    // If any remain, then a View is Active
 }
 
 func (s *KVView) Put(key [32]byte, value []byte) error {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
 
 	// If not view is active, then write to the DB
-	if !s.IsViewActive() {
+	if !s.isViewActive() {
 		return s.DB.Put(key, value)
 	}
 
@@ -135,9 +149,11 @@ func (s *KVView) Put(key [32]byte, value []byte) error {
 }
 
 func (s *KVView) Get(key [32]byte) (value []byte, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
 
 	// If no view is active, just get the DB value
-	if !s.IsViewActive() {
+	if !s.isViewActive() {
 		return s.DB.Get(key)
 	}
 
@@ -151,9 +167,12 @@ func (s *KVView) Get(key [32]byte) (value []byte, err error) {
 }
 
 func (s *KVView) NewView() *View {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+
 	// If no view is active, we have to cache DB updates so
 	// create a "DB Update View" at s.ActiveViews[0]
-	if !s.IsViewActive() {
+	if !s.isViewActive() {
 		view := new(View)
 		view.ID = 0
 		view.KeyValues = make(map[[32]byte][]byte)
@@ -178,6 +197,14 @@ func (s *KVView) NewView() *View {
 // prunes closed views from the old end of the stack, and flushes the
 // buffered writes to the DB when the last view goes away.
 func (s *KVView) GetViewIndex(view *View) int {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.getViewIndex(view)
+}
+
+// getViewIndex
+// Internal version of GetViewIndex; the caller must hold the Mutex.
+func (s *KVView) getViewIndex(view *View) int {
 	if len(s.ActiveViews) == 0 {
 		return 0
 	}
@@ -223,10 +250,13 @@ func (s *KVView) GetViewIndex(view *View) int {
 // active views that were created before this view are searched in turn.  If no
 // key value pair is found in the view or older views, then return what the DB has
 func (s *KVView) ViewGet(view *View, key [32]byte) (value []byte, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+
 	// Check if the view provided is active.  If not, return an error that
 	// the view has expired.  Only refresh LastAccess for a still-valid
 	// view; refreshing first would resurrect views that already expired.
-	viewIdx := s.GetViewIndex(view)
+	viewIdx := s.getViewIndex(view)
 	if viewIdx == 0 {
 		return nil, fmt.Errorf("view invalid")
 	}

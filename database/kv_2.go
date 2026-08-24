@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const PermDirName = "perm"
@@ -37,11 +38,12 @@ const DynaDirName = "dyna"
 // could then be used to rapidly sync partially synced nodes
 
 type KV2 struct {
-	Directory string // Directory where the PermKV and DynaKV directories are
-	PermKV    *KV    // The Perm KV
-	DynaKV    *KV    // the Dyna KV
-	DWrites   int    // Number of writes to the DynaKV since the last compress
-	PWrites   int    // Number of writes to the PermKV since the last compress
+	Mutex     sync.Mutex // Serializes access; KV2 methods are safe for concurrent use
+	Directory string     // Directory where the PermKV and DynaKV directories are
+	PermKV    *KV        // The Perm KV
+	DynaKV    *KV        // the Dyna KV
+	DWrites   int        // Number of writes to the DynaKV since the last compress
+	PWrites   int        // Number of writes to the PermKV since the last compress
 }
 
 // NewKV2
@@ -90,6 +92,8 @@ func OpenKV2(directory string) (kv2 *KV2, err error) {
 }
 
 func (k *KV2) Open() error {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 	if err := k.PermKV.Open(); err != nil {
 		return err
 	}
@@ -97,6 +101,8 @@ func (k *KV2) Open() error {
 }
 
 func (k *KV2) Close() error {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 	if err := k.PermKV.Close(); err != nil {
 		return err
 	}
@@ -106,6 +112,8 @@ func (k *KV2) Close() error {
 // GetDyna
 // Get a k/v from the DynaKV db.  Doesn't check the PermKV.
 func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 
 	if value, err = k.DynaKV.Get(key); err != nil { // Not in DynaKV, then return whatever
 		return nil, err
@@ -116,6 +124,8 @@ func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
 // GetPerm
 // Get a k/v from the PermKV db.  Doesn't check the DynaKV.
 func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 
 	if value, err = k.PermKV.Get(key); err != nil { // Not in PermKV, then return whatever
 		return nil, err
@@ -126,6 +136,8 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 // Get
 // Get a value from the KV2.  Checks the DynaKV first, then the PermKV
 func (k *KV2) Get(key [32]byte) (value []byte, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 
 	// Check and see if this is a key that has been changed
 	if value, err = k.DynaKV.Get(key); err == nil { // Not in DynaKV, then return whatever
@@ -138,6 +150,8 @@ func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 // PutDyna
 // Use when the k/v is known to be a dynamic k/v
 func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 	k.DWrites++
 	err = k.DynaKV.Put(key, value)
 	return k.DWrites, err
@@ -146,6 +160,8 @@ func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
 // PutPerm
 // Use when the k/v is known to be a dynamic k/v
 func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 	k.PWrites++
 	err = k.PermKV.Put(key, value)
 	return k.DWrites, err
@@ -154,6 +170,8 @@ func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
 // Put
 // Returns the number of writes since the last compress, and an err if the put failed
 func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 
 	if value2, err2 := k.DynaKV.Get(key); err2 == nil { // Check.  Is this a DynaKV key?
 		if bytes.Equal(value, value2) { // If the key is in DynaKV, it stays there.
@@ -183,6 +201,8 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 //
 // TODO: Cleanse PermKV of keys in DynaKV
 func (k *KV2) Compress() error {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
 	err := k.DynaKV.Compress()
 	k.DWrites = 0 // Clear write counts
 	k.PWrites = 0

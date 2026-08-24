@@ -8,6 +8,16 @@ import (
 
 const NumShards = 512
 
+// KVShard
+// A sharded KV database.  Keys route to one of NumShards KV2 instances
+// by ShardIndex.
+//
+// Concurrency: KVShard methods are safe for concurrent use.  The Shards
+// array is fixed after creation, and each KV2 serializes access with its
+// own mutex - so operations on different shards run in parallel, while
+// operations on the same shard are serialized.  (KV, KFile, and BFile
+// are NOT safe for concurrent use on their own; they rely on the KV2
+// lock when accessed through this layer.)
 type KVShard struct {
 	Directory string
 	Shards    [NumShards]*KV2
