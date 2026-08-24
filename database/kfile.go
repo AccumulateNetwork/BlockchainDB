@@ -23,16 +23,16 @@ const (
 // KFile can operate in two modes based on whether history is enabled or disabled:
 //
 // 1. With History Enabled (used in PermKV):
-//    - Values are immutable - once a key is associated with a value, it cannot be changed
-//    - Attempting to overwrite a key with a different value will result in an error
-//    - Overwriting a key with the same value is allowed (no-op)
-//    - Suitable for content-addressed storage where keys are derived from values (e.g., hash of value)
-//    - Uses a Bloom filter to optimize key lookups and avoid unnecessary disk I/O
+//   - Values are immutable - once a key is associated with a value, it cannot be changed
+//   - Attempting to overwrite a key with a different value will result in an error
+//   - Overwriting a key with the same value is allowed (no-op)
+//   - Suitable for content-addressed storage where keys are derived from values (e.g., hash of value)
+//   - Uses a Bloom filter to optimize key lookups and avoid unnecessary disk I/O
 //
 // 2. With History Disabled (used in DynaKV):
-//    - Values are mutable - keys can be freely associated with different values over time
-//    - Overwriting a key with a different value is allowed
-//    - Suitable for state storage where keys have an arbitrary relationship to values
+//   - Values are mutable - keys can be freely associated with different values over time
+//   - Overwriting a key with a different value is allowed
+//   - Suitable for state storage where keys have an arbitrary relationship to values
 //
 // Performance Optimizations:
 // - Uses a Bloom filter to quickly determine if a key definitely doesn't exist
@@ -40,20 +40,18 @@ const (
 // - In Put operations, uses the Bloom filter to avoid unnecessary disk lookups
 // - Memory usage is optimized by having a single Bloom filter per KFile
 type KFile struct {
-	Header                               // kFile header (what is pushed to disk)
-	Directory       string               // Directory of the BFile
-	File            *BFile               // Key File
-	History         *HistoryFile         // The History Database (nil if history is disabled)
-	Cache           map[[32]byte]*DBBKey // Cache of DBBKey Offsets
-	BlocksCached    int                  // Track blocks cached before rewritten
-	HistoryMutex    sync.Mutex           // Allow the History to be merged in background
-	KeyCnt          uint64               // Number of keys in the current KFile
-	TotalCnt        uint64               // Total number of keys processed
-	OffsetCnt       uint64               // Number of key sets in the kFile
-	KeyLimit        uint64               // How many keys triggers to send keys to History
-	MaxCachedBlocks int                  // Maximum number of keys cached before flushing to kfile
-	HistoryOffsets  int                  // History offset cnt
-	BloomFilter     *Bloom               // Bloom filter for quick key existence checks
+	Header                              // kFile header (what is pushed to disk)
+	Directory      string               // Directory of the BFile
+	File           *BFile               // Key File
+	History        *HistoryFile         // The History Database (nil if history is disabled)
+	Cache          map[[32]byte]*DBBKey // Cache of DBBKey Offsets
+	BlocksCached   int                  // Track blocks cached before rewritten
+	HistoryMutex   sync.Mutex           // Allow the History to be merged in background
+	KeyCnt         uint64               // Number of keys in the current KFile
+	TotalCnt       uint64               // Total number of keys processed
+	OffsetCnt      uint64               // Number of key sets in the kFile
+	HistoryOffsets int                  // History offset cnt
+	BloomFilter    *Bloom               // Bloom filter for quick key existence checks
 }
 
 // Open
@@ -66,38 +64,24 @@ func OpenKFile(directory string) (kFile *KFile, err error) {
 	if kFile.File, err = OpenBFile(filename); err != nil {
 		return nil, err
 	}
+
+	// Load the header so the offset table, KeyLimit, and MaxCachedBlocks
+	// reflect what is on disk.  Without this, every key lookup misses and
+	// KeyLimit=0 triggers a history push on every Put.
+	if err = kFile.LoadHeader(); err != nil {
+		return nil, err
+	}
+
 	kFile.Cache = make(map[[32]byte]*DBBKey)
-	kFile.BlocksCached = 0
+	kFile.BlocksCached = kFile.MaxCachedBlocks
 
 	// Check if there's a history file and open it
-	historyFilename := filepath.Join(directory, historyFilename)
-	if _, err := os.Stat(historyFilename); err == nil {
-		// History file exists, open it
-		hf := new(HistoryFile)
-		hf.Directory = directory
-		hf.Filename = historyFilename
-		if hf.File, err = os.OpenFile(historyFilename, os.O_RDWR, 0644); err != nil {
+	historyPath := filepath.Join(directory, historyFilename)
+	if _, err := os.Stat(historyPath); err == nil {
+		if kFile.History, err = OpenHistoryFile(directory); err != nil {
 			return nil, err
 		}
-		
-		// Read the header
-		header := make([]byte, 4)
-		if _, err = hf.File.ReadAt(header, 0); err != nil {
-			return nil, err
-		}
-		hf.OffsetCnt = int32(binary.BigEndian.Uint32(header))
-		hf.HeaderSize = 4 + KeySetSize*uint64(hf.OffsetCnt)
-		
-		// Read the KeySets
-		keySetsData := make([]byte, hf.HeaderSize-4)
-		if _, err = hf.File.ReadAt(keySetsData, 4); err != nil {
-			return nil, err
-		}
-		hf.Unmarshal(append(header, keySetsData...))
-		
 		// The Bloom filter will be initialized and populated when Open is called
-		
-		kFile.History = hf
 	}
 
 	return kFile, nil
@@ -129,20 +113,20 @@ func NewKFile(
 	if kFile.File, err = NewBFile(filepath.Join(directory, filename)); err != nil {
 		return nil, err
 	}
-	
+
 	// Only create a history file if history is enabled
 	if history {
 		if kFile.History, err = NewHistoryFile(offsetCnt, directory); err != nil {
 			return nil, err
 		}
 	}
-	
+
 	kFile.KeyLimit = keyLimit
 	kFile.MaxCachedBlocks = maxCachedBlocks
 	kFile.Header.Init(offsetCnt)
 	kFile.WriteHeader()
 	kFile.Cache = make(map[[32]byte]*DBBKey)
-	
+
 	// Initialize the Bloom filter with a reasonable size
 	// Using 10MB as a size, which is a good balance between memory usage and false positive rate
 	kFile.BloomFilter = NewBloomFilter(10.0, 3) // 10MB Bloom filter with 3 hash functions
@@ -154,57 +138,43 @@ func NewKFile(
 // Creates a new kFile height.  Merges the keys of the current kFile into the History.
 // Resets the KFile to accept more keys.
 func (k *KFile) PushHistory() (err error) {
-	// If history is disabled, just reset the KFile without pushing to history
+	// If history is disabled, the keys have nowhere to go -- they must stay
+	// in the kfile.  Close compacts the kfile (GetKeyList deduplicates
+	// overwritten keys), so a Close/Open cycle reclaims space without
+	// losing any keys.
 	if k.History == nil {
-		// Close the current file
 		if err = k.Close(); err != nil {
 			return err
 		}
-		
-		// Remove the old file
-		if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
-			return err
-		}
-		
-		// Create a new file
-		if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
-			return err
-		}
-		
-		// Initialize the header
-		k.Header.Init(uint64(k.OffsetsCnt))
-		k.Close()
-		k.Open()
-		
-		return nil
+		return k.File.Open()
 	}
-	
+
 	// Normal history-enabled flow
 	if err = k.Close(); err != nil {
 		return err
 	}
-	
+
 	keyValues, keyList, err := k.GetKeyList()
 	if err != nil {
 		return err
 	}
-	
+
 	if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
 		return err
 	}
-	
+
 	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
 		return err
 	}
-	
+
 	k.Header.Init(uint64(k.OffsetsCnt))
 	k.Close()
 	k.Open()
-	
+
 	// Only attempt to push to history if we have keys to push
 	if len(keyList) > 0 {
 		// Process history synchronously to prevent memory buildup
-		
+
 		// Create a buffer for the keys
 		buff := make([]byte, len(keyList)*DBKeyFullSize)
 		buffPtr := buff
@@ -213,17 +183,17 @@ func (k *KFile) PushHistory() (err error) {
 			if k.BloomFilter != nil {
 				k.BloomFilter.Set(key)
 			}
-			
+
 			copy(buffPtr, (*keyValues[key]).Bytes(key))
 			buffPtr = buffPtr[DBKeyFullSize:]
 		}
-		
+
 		// Clear references to help with garbage collection
 		keyValues = nil
 		keyList = nil
-		
+
 		k.HistoryMutex.Lock()
-		
+
 		// Double-check that History is still valid before using it
 		if k.History != nil {
 			// Add keys to history
@@ -232,13 +202,13 @@ func (k *KFile) PushHistory() (err error) {
 				return fmt.Errorf("Error sending data to history: %v", err)
 			}
 		}
-		
+
 		k.HistoryMutex.Unlock()
-		
+
 		// Clear the buffer to help with garbage collection
 		buff = nil
 	}
-	
+
 	return nil
 }
 
@@ -246,20 +216,69 @@ func (k *KFile) PushHistory() (err error) {
 // Make sure the underlying File is open for adding keys.  Sets the
 // location in the file for writing to the end of the file.
 func (k *KFile) Open() error {
-	// Initialize the Bloom filter if it doesn't exist
+	// Initialize the Bloom filter if it doesn't exist.  Population is only
+	// needed when the filter is created (i.e. on reopen of an existing
+	// database); once in memory it tracks every key added by Put, so
+	// repopulating on every Open would be wasted work.
 	if k.BloomFilter == nil {
 		// Using 10MB as a size, which is a good balance between memory usage and false positive rate
 		k.BloomFilter = NewBloomFilter(10.0, 3) // 10MB Bloom filter with 3 hash functions
-	}
-	
-	// If history is enabled, populate the Bloom filter with keys from history
-	if k.History != nil {
-		if err := k.PopulateBloomFilterFromHistory(); err != nil {
+
+		// If history is enabled, populate the Bloom filter with keys from history
+		if k.History != nil {
+			if err := k.PopulateBloomFilterFromHistory(); err != nil {
+				return err
+			}
+		}
+
+		// Populate the Bloom filter with the keys still in the current
+		// kfile.  Without this, keys that have not yet been pushed to
+		// history are invisible after a reopen (Get fails the Bloom test
+		// before ever reading the disk).
+		if err := k.PopulateBloomFilterFromKFile(); err != nil {
 			return err
 		}
 	}
-	
+
 	return k.File.Open()
+}
+
+// PopulateBloomFilterFromKFile
+// Populates the Bloom filter with the keys currently stored in the kfile
+// itself (keys that have not been pushed to history).  Called when a KFile
+// is reopened.
+func (k *KFile) PopulateBloomFilterFromKFile() error {
+	if k.BloomFilter == nil {
+		return nil
+	}
+	if err := k.File.Open(); err != nil {
+		return err
+	}
+
+	start := uint64(k.HeaderSize)
+	end := k.File.EOD
+	if end <= start {
+		return nil
+	}
+
+	// Read the keys in ~1MB chunks.  The chunk size must be a multiple of
+	// the record size so records never straddle a chunk boundary.
+	const chunkSize = DBKeyFullSize * 21845
+	buffer := make([]byte, min(chunkSize, int(end-start)))
+	for offset := start; offset < end; offset += uint64(len(buffer)) {
+		if offset+uint64(len(buffer)) > end {
+			buffer = buffer[:end-offset]
+		}
+		if err := k.File.ReadAt(offset, buffer); err != nil {
+			return err
+		}
+		for keyPos := 0; keyPos+DBKeyFullSize <= len(buffer); keyPos += DBKeyFullSize {
+			var key [32]byte
+			copy(key[:], buffer[keyPos:keyPos+32])
+			k.BloomFilter.Set(key)
+		}
+	}
+	return nil
 }
 
 // Use the min function from history_file.go
@@ -271,9 +290,9 @@ func (k *KFile) PopulateBloomFilterFromHistory() error {
 	if k.History == nil || k.BloomFilter == nil {
 		return nil
 	}
-	
+
 	hf := k.History
-	
+
 	// Iterate through all KeySets in the history file
 	for i := 0; i < int(hf.OffsetCnt); i++ {
 		start := hf.KeySets[i].Start
@@ -286,8 +305,10 @@ func (k *KFile) PopulateBloomFilterFromHistory() error {
 		}
 
 		// Use a smaller buffer size to reduce memory usage
-		// Process in chunks instead of loading the entire KeySet at once
-		const chunkSize = 1024 * 1024 // 1MB chunks
+		// Process in chunks instead of loading the entire KeySet at once.
+		// The chunk size must be a multiple of the record size so records
+		// never straddle a chunk boundary.
+		const chunkSize = DBKeyFullSize * 21845 // ~1MB chunks
 		buffer := make([]byte, min(chunkSize, int(keysLen)))
 
 		// Process the KeySet in chunks
@@ -315,9 +336,16 @@ func (k *KFile) PopulateBloomFilterFromHistory() error {
 }
 
 // LoadHeader
-// Load the Header out of the Key File
+// Load the Header out of the Key File.  The header is self-describing:
+// the first 8 bytes hold OffsetsCnt and HeaderSize, which size the read
+// of the full header.
 func (k *KFile) LoadHeader() (err error) {
-	h := make([]byte, k.HeaderSize)
+	first := make([]byte, 8)
+	if err = k.File.ReadAt(0, first); err != nil {
+		return err
+	}
+	headerSize := binary.BigEndian.Uint32(first[4:])
+	h := make([]byte, headerSize)
 	if err = k.File.ReadAt(0, h); err != nil {
 		return err
 	}
@@ -342,26 +370,26 @@ func (k *KFile) Get(Key [32]byte) (dbBKey *DBBKey, err error) {
 	if value, ok := k.Cache[Key]; ok {
 		return value, nil
 	}
-	
+
 	// If we have a Bloom filter, check it before doing any disk I/O
 	// If the Bloom filter says the key doesn't exist, it's definitely not in the file or history
 	if k.BloomFilter != nil && !k.BloomFilter.Test(Key) {
 		return nil, errors.New("not found")
 	}
-	
+
 	// Try to get the key from the current file
 	dbBKey, err = k.kGet(Key)
 	if err == nil {
 		return dbBKey, nil
 	}
-	
+
 	// If not found and history is enabled, try to get from history
 	if k.History != nil {
 		k.HistoryMutex.Lock()
 		defer k.HistoryMutex.Unlock()
 		return k.History.Get(Key)
 	}
-	
+
 	// If no history or not found in history, return the original error
 	return nil, err
 }
@@ -413,16 +441,16 @@ func (k *KFile) kGet(Key [32]byte) (dbBKey *DBBKey, err error) {
 // Put a key value pair into the BFile, return the *DBBKeyFull
 //
 // Behavior depends on whether history is enabled:
-// - With history enabled (k.History != nil): Values are immutable. If the key already exists
-//   with a different value, an error is returned. Overwriting with the same value is a no-op.
-// - With history disabled (k.History == nil): Values are mutable. Keys can be freely overwritten
-//   with different values.
+//   - With history enabled (k.History != nil): Values are immutable. If the key already exists
+//     with a different value, an error is returned. Overwriting with the same value is a no-op.
+//   - With history disabled (k.History == nil): Values are mutable. Keys can be freely overwritten
+//     with different values.
 //
 // This design supports two use cases:
-// 1. Content-addressed storage (history enabled): Where keys are derived from values (e.g., hash)
-//    and immutability is required.
-// 2. State storage (history disabled): Where keys have an arbitrary relationship to values and
-//    need to be updated over time.
+//  1. Content-addressed storage (history enabled): Where keys are derived from values (e.g., hash)
+//     and immutability is required.
+//  2. State storage (history disabled): Where keys have an arbitrary relationship to values and
+//     need to be updated over time.
 func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 	// If history is enabled, check if this key already exists with a different value
 	if k.History != nil {
@@ -435,7 +463,7 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 			// If values are the same, this is a no-op
 			return nil
 		}
-		
+
 		// Use the Bloom filter to avoid disk lookup if possible
 		// If the Bloom filter says the key doesn't exist, we can skip the expensive disk lookup
 		if k.BloomFilter != nil && !k.BloomFilter.Test(Key) {
@@ -458,15 +486,15 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 		}
 		// If key doesn't exist, proceed with the write
 	}
-	
+
 	// Add to the cache
 	k.Cache[Key] = dbBKey
-	
+
 	// Add to the Bloom filter if it exists
 	if k.BloomFilter != nil {
 		k.BloomFilter.Set(Key)
 	}
-	
+
 	k.KeyCnt++
 	k.TotalCnt++
 	update, err := k.File.Write(dbBKey.Bytes(Key)) // Write the key to the file
@@ -475,50 +503,50 @@ func (k *KFile) Put(Key [32]byte, dbBKey *DBBKey) (err error) {
 		delete(k.Cache, Key)
 		return err
 	}
-	
-	if update {                                    // If the file was updated && time to clear cache
+
+	if update { // If the file was updated && time to clear cache
 		if k.BlocksCached <= 0 {
 			if err = k.Close(); err != nil { //           In order to allow access to keys written to disk
 				return err //                               the file has to be closed and opened to update
 			} //                                            the key offsets
-			
+
 			// Save our cache
 			tempCache := make(map[[32]byte]*DBBKey)
 			for key, val := range k.Cache {
 				tempCache[key] = val
 			}
-			
+
 			// Clear the cache as required by the original implementation
 			clear(k.Cache)
-			
+
 			if err = k.File.Open(); err != nil { //       Reopen the file
 				return err
 			}
-			
+
 			// Restore our cache
 			for key, val := range tempCache {
 				k.Cache[key] = val
 			}
-			
+
 			k.BlocksCached = k.MaxCachedBlocks
 		} else {
 			k.BlocksCached--
 		}
 	}
-	
+
 	if k.KeyCnt > k.KeyLimit {
 		k.KeyCnt = 0
-		
+
 		// Push to history - we've modified PushHistory to be synchronous
 		if err = k.PushHistory(); err != nil {
 			return err
 		}
-		
+
 		// Clear the cache to reduce memory footprint
 		// We don't need to preserve the cache since all keys are now in history
 		clear(k.Cache)
 	}
-	
+
 	return nil
 }
 
@@ -652,7 +680,7 @@ func (k *KFile) GetKeyList() (keyValues map[[32]byte]*DBBKey, KeyList [][32]byte
 	sort.Slice(KeyList, func(i, j int) bool {
 		a := k.OffsetIndex(KeyList[i][:]) // Bin for a
 		b := k.OffsetIndex(KeyList[j][:]) // Bin for b
-		return a < b // Sort in ascending order
+		return a < b                      // Sort in ascending order
 	})
 
 	return keyValues, KeyList, nil

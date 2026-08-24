@@ -38,31 +38,31 @@ func TestBuildBigFor3Minutes(t *testing.T) {
 		// Create a key and value
 		keyStr := fmt.Sprintf("key%d", count)
 		value := fmt.Sprintf("value%d", count)
-		
+
 		// Create a 32-byte key
 		var key [32]byte
 		// Copy the string bytes into the fixed-size array
 		copy(key[:], []byte(keyStr))
-		
+
 		// Put the key-value pair
 		err = kvShard.Put(key, []byte(value))
 		if err != nil {
 			t.Fatal(err)
 		}
-		
+
 		count++
-		
+
 		// Print progress every 10,000 entries
 		if count%10000 == 0 {
 			elapsed := time.Since(startTime)
-			fmt.Printf("Added %d entries in %v (%.2f entries/sec)\n", 
+			fmt.Printf("Added %d entries in %v (%.2f entries/sec)\n",
 				count, elapsed, float64(count)/elapsed.Seconds())
 		}
 	}
 
 	// Final stats
 	elapsed := time.Since(startTime)
-	fmt.Printf("\nFinal: Added %d entries in %v (%.2f entries/sec)\n", 
+	fmt.Printf("\nFinal: Added %d entries in %v (%.2f entries/sec)\n",
 		count, elapsed, float64(count)/elapsed.Seconds())
 
 	// Write memory profile

@@ -11,10 +11,12 @@ const IndexShards = 4  // byte index to a 16 bit int used to define a shard for 
 // the key list we need to ignore.  This way, we have an offset to
 // the end of valid keys.
 type Header struct {
-	OffsetsCnt uint32   // Number of bins in the Offset Table
-	HeaderSize uint32   // Length of the header
-	Offsets    []uint64 // List of offsets
-	EndOfList  uint64   // Offset marking end of the last Key section
+	OffsetsCnt      uint32   // Number of bins in the Offset Table
+	HeaderSize      uint32   // Length of the header
+	Offsets         []uint64 // List of offsets
+	EndOfList       uint64   // Offset marking end of the last Key section
+	KeyLimit        uint64   // How many keys triggers to send keys to History
+	MaxCachedBlocks int      // Maximum number of blocks cached before flushing to kfile
 }
 
 // OffsetIndex
@@ -43,6 +45,10 @@ func (h *Header) Marshal() []byte {
 		offset += 8
 	}
 	binary.BigEndian.PutUint64(buffer[offset:], h.EndOfList) // EndOfList
+	offset += 8
+	binary.BigEndian.PutUint64(buffer[offset:], h.KeyLimit) // KeyLimit
+	offset += 8
+	binary.BigEndian.PutUint64(buffer[offset:], uint64(h.MaxCachedBlocks)) // MaxCachedBlocks
 	return buffer[:]
 }
 
@@ -53,27 +59,32 @@ func (h *Header) Unmarshal(data []byte) {
 	data = data[4:]
 	h.HeaderSize = binary.BigEndian.Uint32(data)
 	data = data[4:]
-	
+
 	// Initialize the Offsets slice if it's nil or has the wrong length
 	if h.Offsets == nil || len(h.Offsets) != int(h.OffsetsCnt) {
 		h.Offsets = make([]uint64, h.OffsetsCnt)
 	}
-	
+
 	// Read the offsets
 	for i := range h.Offsets {
 		h.Offsets[i] = binary.BigEndian.Uint64(data[i*8:])
 	}
-	
-	// Read the EndOfList value
-	h.EndOfList = binary.BigEndian.Uint64(data[len(h.Offsets)*8:])
+
+	// Read the EndOfList value, then the persisted KFile settings
+	data = data[len(h.Offsets)*8:]
+	h.EndOfList = binary.BigEndian.Uint64(data)
+	h.KeyLimit = binary.BigEndian.Uint64(data[8:])
+	h.MaxCachedBlocks = int(binary.BigEndian.Uint64(data[16:]))
 }
 
 // Init
 // Initiate a header to its default value
-// for an empty BFile
+// for an empty BFile.
+// Note: KeyLimit and MaxCachedBlocks are preserved; they are set once
+// by NewKFile and must survive the Header resets done by PushHistory.
 func (h *Header) Init(OffsetsCnt uint64) *Header {
 	h.OffsetsCnt = uint32(OffsetsCnt)
-	h.HeaderSize = uint32(OffsetsCnt)*8 + 4 + 4 + 8
+	h.HeaderSize = uint32(OffsetsCnt)*8 + 4 + 4 + 8 + 16
 	h.Offsets = make([]uint64, OffsetsCnt)
 	for i := range h.Offsets {
 		h.Offsets[i] = uint64(h.HeaderSize)

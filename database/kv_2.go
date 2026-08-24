@@ -48,13 +48,13 @@ type KV2 struct {
 // Create a two level KV file with different immutability characteristics:
 //
 // 1. PermKV: Uses KFile with history enabled (immutable values)
-//    - Created with history=true
-//    - Once a key is associated with a value, it cannot be changed
-//    - If a key in PermKV needs to be updated, it's moved to DynaKV
+//   - Created with history=true
+//   - Once a key is associated with a value, it cannot be changed
+//   - If a key in PermKV needs to be updated, it's moved to DynaKV
 //
 // 2. DynaKV: Uses KFile with history disabled (mutable values)
-//    - Created with history=false
-//    - Keys can be freely associated with different values over time
+//   - Created with history=false
+//   - Keys can be freely associated with different values over time
 //
 // This design efficiently separates immutable data (content-addressed storage)
 // from mutable data (state storage) in a blockchain-style database.
