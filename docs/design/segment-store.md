@@ -130,7 +130,7 @@ record from a crash mid-write is dropped.
    count flat while the tail — replayed in full on every open — grew
    without bound.
 
-   Measured on the layer's own workload (`TestDynaCostComparison`:
+   Measured on the layer's own workload (`TestDynaCost`:
    400,000 writes over 50,000 keys, compacting every 100,000):
 
    | | puts/s | on disk |
@@ -150,8 +150,12 @@ record from a crash mid-write is dropped.
    anything: `NewKV2(directory, sealLimit)` and
    `NewKVShard(directory, sealLimit)` are the constructors now.
 
-   `ShardIndex`, `recordSort`, and `DefaultBloomCapacity` moved to the
-   files that still use them. The measurement tests that compared the
+   `ShardIndex` and `recordSort` moved to the files that still use
+   them.  `DefaultBloomCapacity` moved to `bloomset.go` for lack of a
+   better home: despite the name its only consumer is `KV2.Open`,
+   which uses it as a seal limit for a store reopened without one.
+   Renaming it, and giving `SealLimit` a persisted home, is follow-up
+   work. The measurement tests that compared the
    two layers kept their v2 halves (`TestSyncCost`, `TestDynaCost`);
    the numbers in this document are the last measured comparison, and
    reproducing them means checking out a commit before the removal.

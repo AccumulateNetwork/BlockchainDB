@@ -14,10 +14,13 @@ const (
 	bloomMagic       = 0x424C4D31      // "BLM1"
 )
 
-// DefaultBloomCapacity is the key capacity a fresh Bloom filter is
-// sized for (~150KB at 12 bits/key).  The filter grows a new layer
-// whenever the key count outgrows it, so this is a starting point,
-// not a limit.
+// DefaultBloomCapacity was the key capacity a fresh v1 Bloom filter
+// was sized for.  Nothing sizes a filter with it now -- segments size
+// theirs from their own key count via NewBloomSizedForKeys -- and its
+// only remaining consumer is KV2.Open, which uses it as the seal limit
+// for a store reopened without one.  It lives here for lack of a
+// better home; the name is wrong for the job and both it and the
+// missing SealLimit persistence want fixing together.
 const DefaultBloomCapacity uint64 = 100_000
 
 // BloomSet

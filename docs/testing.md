@@ -14,6 +14,9 @@ The repository contains the following test files:
 - `bloom_test.go`, `bloomset_test.go` - Bloom filter and the layered,
   persisted filter built on it
 - `concurrency_test.go` - Concurrent access to `KVShard` and `KVView`
+- `crash_test.go` - SIGKILL injection: the durability contract in
+  [durability.md](design/durability.md), enforced by killing a child
+  process mid-write and verifying every checkpointed key
 - `dyna_test.go` - The mutable (Dyna) layer: compaction, live-tail
   bounds, and crash-midway recovery
 - `fastrandom_test.go` - The deterministic generator used to build test data

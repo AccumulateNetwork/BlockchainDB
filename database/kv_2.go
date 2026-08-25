@@ -62,7 +62,12 @@ type KV2 struct {
 // This design efficiently separates immutable data (content-addressed storage)
 // from mutable data (state storage) in a blockchain-style database.
 //
-// sealLimit sets SealLimit, the point at which a layer seals its live tail.
+// sealLimit sets SealLimit, the point at which a layer seals its live
+// tail.  It is not persisted: a store reopened with OpenKV2 falls back
+// to DefaultBloomCapacity unless the caller sets SealLimit again.
+//
+// This DESTROYS any existing database in directory.  Use OpenKV2 to
+// reopen one.
 func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {

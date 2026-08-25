@@ -35,16 +35,34 @@ import (
 // (buffered writes, a seal, a compaction, a manifest commit).
 //
 // The environment variables below are a parent/child handshake for the
-// re-executed test binary, not configuration: the child skips itself
-// when they are absent, so a typo cannot silently turn the test into a
-// pass of something that never ran.
+// re-executed test binary, not configuration.  Both are checked
+// strictly: crashChildEnv decides whether this process is the child at
+// all, and a missing or malformed crashChildStartEnv is a hard failure
+// rather than a default -- restarting the workload from 0 would make
+// the parent's checkpoint count regress and the suite would report a
+// pass of far fewer keys than it verified.
 const crashChildEnv = "BDB_CRASH_CHILD_DIR"
 const crashChildStartEnv = "BDB_CRASH_CHILD_START"
 
-// crashSealLimit is deliberately small so a 100-key run seals many
-// times: seals and the compactions they enable are the crash windows
-// this test exists to land kills in.
+// crashSealLimit is deliberately small so that the few hundred keys a
+// round gets through before the kill still seal many times.  Seals,
+// and the compactions they enable, are the crash windows this test
+// exists to land kills in.
 const crashSealLimit = 50
+
+// crashCompressEvery compacts the Dyna layer every N writes.  Nothing
+// in KV2 compacts on its own -- sealPermIfFull and sealDynaIfFull seal
+// and stop there -- so without this the compaction path (issue #19,
+// the one multi-step commit in the write path) is never under the
+// kill.
+//
+// N must exceed 2*crashSealLimit, because only odd i reach Dyna and
+// Compress empties the tail before returning: at N=50 the tail peaks
+// at 25 records, sealDynaIfFull never fires, and adding compaction
+// would silently cost the Dyna auto-seal window it was meant to
+// complement.  Measured over 1200 puts: N=50 gives 0 Dyna auto-seals,
+// N=137 gives 9.
+const crashCompressEvery = 137
 
 // crashKV generates the deterministic key/value sequence, skipping the
 // first `skip` pairs
@@ -76,7 +94,9 @@ func TestCrashChildProcess(t *testing.T) {
 	if dir == "" {
 		t.Skip("helper process for TestCrashRecovery")
 	}
-	start, _ := strconv.Atoi(os.Getenv(crashChildStartEnv))
+	startEnv := os.Getenv(crashChildStartEnv)
+	start, err := strconv.Atoi(startEnv)
+	require.NoErrorf(t, err, "child: %s must be an integer, got %q", crashChildStartEnv, startEnv)
 
 	kv, err := OpenKV2(dir)
 	require.NoError(t, err, "child: open")
@@ -87,6 +107,9 @@ func TestCrashChildProcess(t *testing.T) {
 	const batch = 20
 	for i := start; i < start+100_000; i++ {
 		require.NoError(t, crashPut(kv, i, kr.NextHash(), vr.RandBuff(10, 50)), "child: put")
+		if (i+1)%crashCompressEvery == 0 {
+			require.NoError(t, kv.Compress(), "child: compress")
+		}
 		if (i+1)%batch == 0 {
 			require.NoError(t, kv.Close(), "child: close")
 			fmt.Printf("CHECKPOINT %d\n", i+1) // Durability point reached
@@ -160,16 +183,18 @@ func TestCrashRecovery(t *testing.T) {
 		case <-progressed:
 		case <-time.After(10 * time.Second):
 			cmd.Process.Kill()
+			<-done // StdoutPipe: all reads must finish before Wait closes it
 			cmd.Wait()
-			<-done
 			outMu.Lock()
+			out := strings.Join(childOut, "\n")
+			outMu.Unlock()
 			t.Fatalf("child made no progress (durable=%d)\nchild stdout:\n%s\nchild stderr:\n%s",
-				durable, strings.Join(childOut, "\n"), childErr.String())
+				durable, out, childErr.String())
 		}
 		time.Sleep(time.Duration(rng.UintN(120)) * time.Millisecond)
 		require.NoError(t, cmd.Process.Kill())
-		cmd.Wait()
-		<-done
+		<-done     // StdoutPipe: draining must finish before Wait closes it,
+		cmd.Wait() // or buffered CHECKPOINT lines are lost and durable undercounts
 		durable = int(lastCheckpoint.Load())
 
 		// The contract: the DB opens, and every checkpointed key reads

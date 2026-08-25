@@ -25,19 +25,21 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	blockchainDB "github.com/AccumulateNetwork/BlockchainDB/database"
 )
 
 func main() {
-	// Create a directory for the database
 	dbDir := "./mydb"
-	os.MkdirAll(dbDir, os.ModePerm)
 
-	// Create a new sharded store.  sealLimit is the point at which a
-	// layer seals its live tail into an immutable segment: bigger
-	// means fewer, larger segments and a longer replay on open.
+	// NewKVShard CREATES a database, destroying anything already in
+	// dbDir -- run this twice and the first database is gone.  To
+	// reopen an existing one, use OpenKVShard (next section).
+	//
+	// sealLimit is the point at which a layer seals its live tail into
+	// an immutable segment: bigger means fewer, larger segments and a
+	// longer replay on open.  It is not persisted, so a reopened
+	// database falls back to a default of 100,000.
 	kvs, err := blockchainDB.NewKVShard(dbDir, 100_000)
 	if err != nil {
 		fmt.Printf("Error creating database: %v\n", err)
@@ -167,14 +169,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 
 	blockchainDB "github.com/AccumulateNetwork/BlockchainDB/database"
 )
 
 func main() {
-	dbDir := "./bindb"
-	os.MkdirAll(dbDir, os.ModePerm)
+	dbDir := "./bindb" // NewKVShard destroys anything already here
 
 	kvs, err := blockchainDB.NewKVShard(dbDir, 100_000)
 	if err != nil {
@@ -216,14 +216,12 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	blockchainDB "github.com/AccumulateNetwork/BlockchainDB/database"
 )
 
 func main() {
-	dbDir := "./errdb"
-	os.MkdirAll(dbDir, os.ModePerm)
+	dbDir := "./errdb" // NewKVShard destroys anything already here
 
 	kvs, err := blockchainDB.NewKVShard(dbDir, 100_000)
 	if err != nil {
