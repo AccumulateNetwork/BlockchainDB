@@ -10,6 +10,7 @@ import (
 
 // TestBuildBigFor3Minutes runs a modified version of TestBuildBig that only runs for 3 minutes
 func TestBuildBigFor3Minutes(t *testing.T) {
+	skipUnlessLoad(t)
 	// Create memory profile file
 	f, err := os.Create("memprofile.out")
 	if err != nil {
