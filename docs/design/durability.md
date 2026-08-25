@@ -54,9 +54,12 @@ committed block. Two mechanics make that safe:
 
 - **`KV.Compress` is not crash-atomic**: the values-file swap and the
   kfile offset rewrite are two steps; a crash between them leaves keys
-  pointing into the wrong values layout. Compress the Dyna layer at
-  quiet moments, or wait for block segmentation, which removes the
-  in-place swap entirely. Tracked separately.
+  pointing into the wrong values layout. **No longer on the database's
+  path** — the Dyna layer is a mutable `SegmentStore` and compacts by
+  writing a new sealed generation and committing it with one manifest
+  rename (issue #19). `KV.Compress` remains only for the legacy `KV`
+  and as the baseline the segment benchmarks measure against; the gap
+  is theirs, not the database's.
 - **Initial creation** (`NewKV`) is not crash-atomic — a crash during
   first-time setup can leave a partial directory. Create once, verify,
   then rely on the contract. Recovery: delete and recreate.
