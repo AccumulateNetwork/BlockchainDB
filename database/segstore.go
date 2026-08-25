@@ -1,12 +1,14 @@
 package blockchainDB
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -55,6 +57,8 @@ const (
 	segTmpSuffix    = ".tmp"
 	segCompactName  = "compact"
 
+	segWriteBuffer = 1 << 20 // Buffer for writing a segment's records
+
 	segIndexMagic   = 0x53494458 // "SIDX"
 	segIndexVersion = 1
 	segIndexHdrSize = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
@@ -82,11 +86,12 @@ type StoreManifest struct {
 // segment
 // An open sealed segment
 type segment struct {
-	meta  SegmentMeta
-	data  *os.File
-	index *os.File
-	count int64  // Indexed keys
-	bloom *Bloom // Membership filter over this segment's keys
+	meta    SegmentMeta
+	data    *os.File
+	index   *os.File
+	count   int64  // Indexed keys
+	records int64  // Physical records in the data file; > count if any key repeats
+	bloom   *Bloom // Membership filter over this segment's keys
 }
 
 // close releases a segment's file handles
@@ -250,6 +255,12 @@ func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 	if seg.data, err = os.Open(dataPath); err != nil {
 		return nil, err
 	}
+	var dataHdr [segDataHdrSize]byte
+	if _, err = seg.data.ReadAt(dataHdr[:], 0); err != nil {
+		seg.close()
+		return nil, err
+	}
+	seg.records = int64(binary.BigEndian.Uint64(dataHdr[16:]))
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if _, err = os.Stat(indexPath); err != nil { // Rebuild a missing index
 		if err = buildIndexFor(dataPath, indexPath); err != nil {
@@ -366,7 +377,7 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 			os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
 			continue
 		}
-		hash, count, err := hashAndCount(path)
+		hash, count, err := s.identify(path)
 		if err != nil {
 			return err
 		}
@@ -524,18 +535,35 @@ func (s *SegmentStore) LiveCount() int {
 	return len(s.live)
 }
 
+// LiveRecords
+// The number of physical records in the live tail.  A mutable store
+// leaves one record per write, so a key rewritten n times leaves n
+// records: this, not LiveCount, is what bounds the tail's size on disk
+// and its replay cost on open.
+func (s *SegmentStore) LiveRecords() uint64 {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.liveRecords
+}
+
+// nextHeight
+// The height at which a seal or compaction lands above every existing
+// segment.  The caller must hold the Mutex.
+func (s *SegmentStore) nextHeight() uint64 {
+	if newest, ok := s.newestHeight(); ok {
+		return newest + 1
+	}
+	return 0
+}
+
 // SealNext
 // Seal the live tail at the next available height.  Used to bound the
 // live tail when no block boundary has arrived; block boundaries call
 // Seal with the block height instead.
 func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
-	next := uint64(0)
-	if newest, ok := s.newestHeight(); ok {
-		next = newest + 1
-	}
-	s.Mutex.Unlock()
-	return s.Seal(next)
+	defer s.Mutex.Unlock()
+	return s.seal(s.nextHeight())
 }
 
 // Seal
@@ -548,7 +576,11 @@ func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
 func (s *SegmentStore) Seal(height uint64) (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+	return s.seal(height)
+}
 
+// seal is Seal; the caller must hold the Mutex
+func (s *SegmentStore) seal(height uint64) (meta SegmentMeta, err error) {
 	if len(s.live) == 0 {
 		return meta, nil // Nothing to seal
 	}
@@ -559,26 +591,25 @@ func (s *SegmentStore) Seal(height uint64) (meta SegmentMeta, err error) {
 	dataName := segmentFileName(height)
 	dataPath := filepath.Join(s.Directory, dataName)
 
-	var count uint64
-	var hash string
+	var sl sealed
 	if uint64(len(s.live)) == s.liveRecords {
 		// No shadowed records: promote the live file as it stands
-		if hash, count, err = s.promoteLiveFile(dataPath); err != nil {
+		if sl, err = s.promoteLiveFile(dataPath); err != nil {
 			return meta, err
 		}
 	} else {
 		// Shadowed records present (overwrites): write a compacted copy
-		if hash, count, err = s.rewriteLiveFile(dataPath); err != nil {
+		if sl, err = s.rewriteLiveFile(dataPath); err != nil {
 			return meta, err
 		}
 	}
 
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = buildIndexFor(dataPath, indexPath); err != nil {
+	if err = writeIndexFile(indexPath, sl.order, sl.entries); err != nil {
 		return meta, err
 	}
 
-	meta = SegmentMeta{Height: height, File: dataName, Count: count, Hash: hash}
+	meta = SegmentMeta{Height: height, File: dataName, Count: uint64(len(sl.order)), Hash: sl.hash}
 	seg, err := s.openSegment(meta)
 	if err != nil {
 		return meta, err
@@ -610,45 +641,67 @@ func (s *SegmentStore) newestHeight() (newest uint64, ok bool) {
 	return newest, ok
 }
 
+// sealed
+// What sealing produced: the segment's hash (empty in a mutable store,
+// which never transports a segment) and the index records for it.
+// Whoever writes the segment already knows where every value landed,
+// so the index is built from these rather than by reading the segment
+// back off disk.
+type sealed struct {
+	hash    string
+	order   [][32]byte
+	entries map[[32]byte]*DBBKey
+}
+
 // promoteLiveFile
 // Finish the live file's header, make it durable, and rename it into
 // place as a sealed segment.  No record is copied.
-func (s *SegmentStore) promoteLiveFile(dataPath string) (hash string, count uint64, err error) {
-	count = s.liveRecords
+func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
+	count := s.liveRecords
 	if err = s.liveFile.Flush(); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	binary.BigEndian.PutUint64(header[16:], count)
 	if err = s.liveFile.WriteAt(0, header[:]); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	if err = s.liveFile.File.Sync(); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	livePath := s.liveFile.Filename
 	if err = s.liveFile.File.Close(); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	s.liveFile.File = nil
 	if err = os.Rename(livePath, dataPath); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	if err = syncDir(s.Directory); err != nil {
-		return "", 0, err
+		return sl, err
 	}
-	if hash, _, err = hashAndCount(dataPath); err != nil {
-		return "", 0, err
+
+	// The rename moved no bytes, so the live tail's offsets are the
+	// sealed segment's offsets
+	sl.entries = s.live
+	sl.order = make([][32]byte, 0, len(s.live))
+	for key := range s.live {
+		sl.order = append(sl.order, key)
 	}
-	return hash, count, nil
+	if !s.Mutable { // Immutable segments are transported; a peer verifies this
+		if sl.hash, _, err = hashAndCount(dataPath); err != nil {
+			return sl, err
+		}
+	}
+	return sl, nil
 }
 
 // rewriteLiveFile
 // Write the live tail's newest record per key to a new sealed segment,
 // dropping records shadowed by later writes
-func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint64, err error) {
+func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
 	keys := make([][32]byte, 0, len(s.live))
 	for key := range s.live {
 		keys = append(keys, key)
@@ -658,7 +711,7 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint
 	tmpPath := dataPath + segTmpSuffix
 	f, err := os.Create(tmpPath)
 	if err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	defer func() {
 		if f != nil {
@@ -667,15 +720,24 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint
 		}
 	}()
 
-	h := sha256.New()
-	out := io.MultiWriter(f, h)
+	bw := bufio.NewWriterSize(f, segWriteBuffer)
+	var h hash.Hash
+	var out io.Writer = bw
+	if !s.Mutable { // Immutable segments are transported; a peer verifies this
+		h = sha256.New()
+		out = io.MultiWriter(bw, h)
+	}
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
 	if _, err = out.Write(header[:]); err != nil {
-		return "", 0, err
+		return sl, err
 	}
+
+	// Record where each value lands, so the index needs no read-back
+	sl.order, sl.entries = keys, make(map[[32]byte]*DBBKey, len(keys))
+	offset := uint64(segDataHdrSize)
 
 	var recHdr [segRecHdrSize]byte
 	value := make([]byte, 0, 1024)
@@ -686,30 +748,35 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint
 		}
 		value = value[:dbb.Length]
 		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return "", 0, err
+			return sl, err
 		}
 		copy(recHdr[:32], key[:])
 		binary.BigEndian.PutUint64(recHdr[32:], dbb.Length)
 		if _, err = out.Write(recHdr[:]); err != nil {
-			return "", 0, err
+			return sl, err
 		}
 		if _, err = out.Write(value); err != nil {
-			return "", 0, err
+			return sl, err
 		}
+		sl.entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: dbb.Length}
+		offset += segRecHdrSize + dbb.Length
+	}
+	if err = bw.Flush(); err != nil {
+		return sl, err
 	}
 	if err = f.Sync(); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	if err = f.Close(); err != nil {
 		f = nil
-		return "", 0, err
+		return sl, err
 	}
 	f = nil
 	if err = os.Rename(tmpPath, dataPath); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 	if err = syncDir(s.Directory); err != nil {
-		return "", 0, err
+		return sl, err
 	}
 
 	// The old live file is superseded by the sealed segment
@@ -718,7 +785,10 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint
 		s.liveFile.File = nil
 	}
 	os.Remove(s.liveFile.Filename)
-	return fmt.Sprintf("%x", h.Sum(nil)), uint64(len(keys)), nil
+	if h != nil {
+		sl.hash = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	return sl, nil
 }
 
 // Compact
@@ -731,7 +801,21 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (hash string, count uint
 func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+	return s.compact(height)
+}
 
+// CompactNext
+// Compact at the next available height.  The Dyna layer numbers its
+// segments by generation rather than by block height, so it compacts
+// by generation too.
+func (s *SegmentStore) CompactNext() (meta SegmentMeta, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.compact(s.nextHeight())
+}
+
+// compact is Compact; the caller must hold the Mutex
+func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	if len(s.segments) == 0 {
 		return meta, nil
 	}
@@ -763,6 +847,16 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 		}
 	}
 
+	// A single generation holding one record per key has nothing to
+	// reclaim: rewriting it would copy every value to produce the same
+	// file.  The Dyna layer compacts on a write count, so it lands here
+	// whenever a compaction has already run since the last seal.  The
+	// meta returned is the standing generation's, at its own height --
+	// not the height asked for, since no segment was written.
+	if len(s.segments) == 1 && int64(len(winners)) == s.segments[0].records {
+		return s.segments[0].meta, nil
+	}
+
 	keys := make([][32]byte, 0, len(winners))
 	for key := range winners {
 		keys = append(keys, key)
@@ -783,8 +877,13 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 		}
 	}()
 
-	h := sha256.New()
-	out := io.MultiWriter(f, h)
+	bw := bufio.NewWriterSize(f, segWriteBuffer)
+	var h hash.Hash
+	var out io.Writer = bw
+	if !s.Mutable { // Immutable segments are transported; a peer verifies this
+		h = sha256.New()
+		out = io.MultiWriter(bw, h)
+	}
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
@@ -792,6 +891,11 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 	if _, err = out.Write(header[:]); err != nil {
 		return meta, err
 	}
+
+	// Record where each value lands, so the index needs no read-back
+	entries := make(map[[32]byte]*DBBKey, len(keys))
+	offset := uint64(segDataHdrSize)
+
 	var recHdr [segRecHdrSize]byte
 	for _, key := range keys {
 		w := winners[key]
@@ -807,6 +911,11 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 		if _, err = out.Write(value); err != nil {
 			return meta, err
 		}
+		entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
+		offset += segRecHdrSize + uint64(len(value))
+	}
+	if err = bw.Flush(); err != nil {
+		return meta, err
 	}
 	if err = f.Sync(); err != nil {
 		return meta, err
@@ -823,11 +932,14 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 		return meta, err
 	}
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = buildIndexFor(dataPath, indexPath); err != nil {
+	if err = writeIndexFile(indexPath, keys, entries); err != nil {
 		return meta, err
 	}
 
-	meta = SegmentMeta{Height: height, File: dataName, Count: uint64(len(keys)), Hash: fmt.Sprintf("%x", h.Sum(nil))}
+	meta = SegmentMeta{Height: height, File: dataName, Count: uint64(len(keys)), Hash: ""}
+	if h != nil {
+		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	}
 	seg, err := s.openSegment(meta)
 	if err != nil {
 		return meta, err
@@ -1015,12 +1127,18 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 	size := uint64(info.Size())
 
 	// Scan the records.  Later records win, matching lookup order.
+	// The scan is sequential, so it reads through a buffer rather than
+	// issuing a read per record.
+	if _, err = f.Seek(segDataHdrSize, io.SeekStart); err != nil {
+		return err
+	}
+	r := bufio.NewReaderSize(f, segWriteBuffer)
 	entries := make(map[[32]byte]*DBBKey)
 	var order [][32]byte
 	offset := uint64(segDataHdrSize)
 	var recHdr [segRecHdrSize]byte
 	for offset+segRecHdrSize <= size {
-		if _, err = f.ReadAt(recHdr[:], int64(offset)); err != nil {
+		if _, err = io.ReadFull(r, recHdr[:]); err != nil {
 			return err
 		}
 		var key [32]byte
@@ -1030,13 +1148,24 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 		if valueOffset+length > size {
 			return fmt.Errorf("%s is truncated at offset %d", dataPath, offset)
 		}
+		if _, err = r.Discard(int(length)); err != nil { // The index holds offsets, not values
+			return err
+		}
 		if _, seen := entries[key]; !seen {
 			order = append(order, key)
 		}
 		entries[key] = &DBBKey{Offset: valueOffset, Length: length}
 		offset = valueOffset + length
 	}
+	return writeIndexFile(indexPath, order, entries)
+}
 
+// writeIndexFile
+// Write a segment's index from records already in memory: the keys and
+// where each one's value sits in the data file.  Sealing and
+// compaction both know that as they write, so neither has to read the
+// segment back to index it.
+func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DBBKey) (err error) {
 	buff := make([]byte, 0, len(order)*DBKeyFullSize)
 	bloom := NewBloomSizedForKeys(uint64(len(order)), 3)
 	for _, key := range order {
@@ -1084,6 +1213,27 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 		return err
 	}
 	return syncDir(filepath.Dir(indexPath))
+}
+
+// identify
+// The manifest identity of a segment file on disk.  An immutable
+// store's segments travel to peers, so they carry a SHA-256; a mutable
+// store's never leave the node, and hashing one on every open would be
+// a full read of the store for nothing.
+func (s *SegmentStore) identify(path string) (hash string, count uint64, err error) {
+	if !s.Mutable {
+		return hashAndCount(path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	var header [segDataHdrSize]byte
+	if _, err = f.ReadAt(header[:], 0); err != nil {
+		return "", 0, err
+	}
+	return "", binary.BigEndian.Uint64(header[16:]), nil
 }
 
 // hashAndCount

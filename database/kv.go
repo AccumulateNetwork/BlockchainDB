@@ -137,10 +137,15 @@ func (k *KV) Open() (err error) {
 // Only meaningful for a mutable (history-disabled) KV: with history
 // enabled values are immutable, so the values file holds no trash.
 //
-// TODO(#5): the swap of the values file and the kfile rewrite are two
-// separate steps; a crash between them leaves the keys and values
-// inconsistent.  Making compaction crash-atomic needs the recovery
-// design tracked in issue #5.
+// No longer on the database's path.  KV2's Dyna layer is a mutable
+// SegmentStore and compacts by writing a new sealed generation and
+// committing it with one manifest rename; this remains for the legacy
+// KV and as the v1 baseline the segment benchmarks measure against.
+//
+// It is not crash-atomic (issue #19): the swap of the values file and
+// the kfile rewrite are two separate steps, and a crash between them
+// leaves keys pointing into the wrong values layout -- reads return
+// wrong bytes with no error.  That is why the Dyna layer moved off it.
 func (k *KV) Compress() (err error) {
 	if k.UseHistory {
 		return nil // Immutable values are never trash; nothing to reclaim

@@ -60,13 +60,14 @@ sequentially and the import writes it sequentially.
 - **Dyna layer**: state is mutable and belongs to a *snapshot*, not a
   segment chain. A state snapshot export (same file format, whole
   layer) composes with segments: sync = latest snapshot + segments
-  since.
-- **Sealed segments as storage** (v2 direction): today segments are a
-  transport format and the DB re-indexes on import. The deeper design —
-  keeping sealed segments as the storage itself with per-segment key
-  indexes — would make sync a file copy plus manifest update, remove
-  the history file's move-and-rewrite costs, and make Compress
-  crash-atomic (#19) by replacing in-place swaps with new sealed
-  generations.
+  since. The layer is *stored* as segments now (mutable mode, newest
+  shadows oldest, compaction reclaims what the shadowing left) — but
+  its segments stay local: they are not exported by `ExportBlock` and
+  carry no hash, because a peer never receives them one at a time.
+- **Sealed segments as storage**: done, for both layers — see
+  `segment-store.md`. Sync is a file copy plus a manifest update, the
+  history file's move-and-rewrite is off the write path, and
+  compaction is crash-atomic (#19) because a new sealed generation
+  replaces the in-place swap.
 - Transport (fetching manifests/segments from peers) is the
   application's concern; the DB provides the sealed, verifiable units.
