@@ -138,6 +138,19 @@ func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
 	return value, nil
 }
 
+// SealBlock
+// Seal every shard's Perm layer at a block height.  This is the
+// durability point for permanent data and the boundary a peer syncs;
+// ExportBlock calls it as its first step.
+func (k *KVShard) SealBlock(height uint64) (err error) {
+	for i, shard := range k.Shards {
+		if _, err = shard.Seal(height); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {

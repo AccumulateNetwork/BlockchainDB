@@ -57,23 +57,27 @@ return it. After `Close`, calls return `ErrWriterClosed`.
 values 100–500 B, 512 shards, warmed Bloom filters, buffered writes
 (no per-op fsync):
 
-| configuration                | puts/sec  | vs single |
-|------------------------------|-----------|-----------|
-| sync, 1 goroutine            |   232,000 |      1.0× |
-| sync, 4 goroutines           |   440,000 |      1.9× |
-| sync, 8 goroutines           | 2,103,000 |      9.1× |
-| sync, 16 goroutines          | 3,668,000 |     15.8× |
-| async, 1 producer, 8 workers | 1,999,000 |      8.6× |
+| configuration                | puts/sec   | vs single |
+|------------------------------|------------|-----------|
+| sync, 1 goroutine            |  1,299,000 |      1.0× |
+| sync, 4 goroutines           |  4,474,000 |      3.4× |
+| sync, 8 goroutines           |  7,521,000 |      5.8× |
+| sync, 16 goroutines          | 11,328,000 |      8.7× |
+| async, 1 producer, 8 workers |  2,624,000 |      2.0× |
+
+(Perm writes, measured after the Perm layer moved to sealed segments;
+the same run against the kfile+history layer peaked at 3.67M/s.)
 
 Notes:
 
 - Sync scaling is roughly linear per core at 8–16 workers. The low
   4-worker result is repeatable and consistent with hybrid P/E-core
   scheduling; treat low-worker numbers as noisy.
-- The async path is **producer-bound** at ~2M puts/s: a single
+- The async path is **producer-bound** at ~2.6M puts/s: a single
   goroutine generating and queuing writes is the ceiling, independent
-  of worker count. That ceiling is far above current chain throughput
-  needs; if it ever matters, batch the queue sends.
+  of worker count. Now that the apply side is much faster, this is the
+  binding constraint for single-producer ingest; batching the queue
+  sends is the fix if it ever matters.
 - Cold-start caveat (resolved by #12): fixed 10 MB Bloom filters made
   first-touch page faults dominate a cold `KVShard`. Filters are now
   layered and sized from the key count (~300 KB initial per KFile),

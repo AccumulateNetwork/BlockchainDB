@@ -1,6 +1,9 @@
 # Block Segmentation & Node Sync
 
-Status: v1 implemented (`database/segment.go`), 2026-08-24.
+Status: implemented (`database/segment.go`). Superseded in part by
+`segment-store.md`: the Perm layer now *stores* sealed segments, so a
+block export is seal-then-copy rather than a re-encode, and an import
+adopts files rather than re-inserting records.
 
 ## Why
 
