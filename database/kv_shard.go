@@ -70,7 +70,9 @@ func NewKVShard(directory string, offsetsCnt, keyLimit uint64, MaxCachedBlocks i
 // Find the right shard, and put the key/value in the DynaKV in the shard
 func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if writes, err := k.Shards[index].PutDyna(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
@@ -83,7 +85,9 @@ func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
 // Find the right shard, and put the key/value in the PermKV in the shard
 func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if writes, err := k.Shards[index].PutPerm(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
@@ -96,7 +100,9 @@ func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
 // Find the right shard, and put the key/value in said shard
 func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if writes, err := k.Shards[index].Put(key, value); err != nil {
 		return err
 	} else if writes > 5000 {
@@ -109,7 +115,9 @@ func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 // Find the right shard, and extract the value from the DynaKV in the shard
 func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if value, err = k.Shards[index].GetDyna(key); err != nil {
 		return nil, err
 	}
@@ -120,7 +128,9 @@ func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
 // Find the right shard, and extract the value from the PermKV in the shard
 func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if value, err = k.Shards[index].GetPerm(key); err != nil {
 		return nil, err
 	}
@@ -131,7 +141,9 @@ func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {
 // Find the right shard, and extract the value from said shard
 func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
 	index := ShardIndex(key[:])
-	k.Shards[index].Open()
+	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
+		return // shard empty, so a dropped error reads as "not found"
+	}
 	if value, err = k.Shards[index].Get(key); err != nil {
 		return nil, err
 	}
@@ -144,6 +156,9 @@ func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
 // ExportBlock calls it as its first step.
 func (k *KVShard) SealBlock(height uint64) (err error) {
 	for i, shard := range k.Shards {
+		if err = shard.Open(); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
 		if _, err = shard.Seal(height); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
@@ -154,9 +169,12 @@ func (k *KVShard) SealBlock(height uint64) (err error) {
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {
-	for _, kvs := range k.Shards {
+	for i, kvs := range k.Shards {
+		if err = kvs.Open(); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
 		if err = kvs.Compress(); err != nil {
-			return err
+			return fmt.Errorf("shard %d: %w", i, err)
 		}
 	}
 	return nil
