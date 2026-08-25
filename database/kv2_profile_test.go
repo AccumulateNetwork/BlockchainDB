@@ -24,8 +24,7 @@ func TestBuildBigKV2(t *testing.T) {
 	os.MkdirAll(dir, 0777)
 
 	// Create a single KV2 instance (no sharding)
-	// Parameters: directory, offsetsCnt, keyLimit, MaxCachedBlocks
-	kv2, err := NewKV2(dir, 1024, 1024*10, 100)
+	kv2, err := NewKV2(dir, 1024*10)
 	if err != nil {
 		t.Fatal(err)
 	}

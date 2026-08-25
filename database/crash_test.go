@@ -21,21 +21,30 @@ import (
 //
 // The durability contract under test:
 //
-//	KV.Close() is a durability point.  After a process is SIGKILLed at
-//	an arbitrary moment, OpenKV must succeed and every key written
+//	KV2.Close() is a durability point.  After a process is SIGKILLed at
+//	an arbitrary moment, OpenKV2 must succeed and every key written
 //	before the last completed Close must be readable with its correct
 //	value.  Writes after the last Close may or may not be present, but
 //	must never corrupt the database.
 //
 // TestCrashChildProcess is the workload: it opens the DB, writes
-// deterministic keys, and prints "CHECKPOINT n" after each completed
-// Close.  TestCrashRecovery runs it as a child process, kills it at a
-// random moment, reopens the database, and verifies the contract -
-// several rounds, so kills land in different code paths (buffered
-// writes, kfile rewrite, history push, bloom save).
-
+// deterministic keys to both layers, and prints "CHECKPOINT n" after
+// each completed Close.  TestCrashRecovery runs it as a child process,
+// kills it at a random moment, reopens the database, and verifies the
+// contract - several rounds, so kills land in different code paths
+// (buffered writes, a seal, a compaction, a manifest commit).
+//
+// The environment variables below are a parent/child handshake for the
+// re-executed test binary, not configuration: the child skips itself
+// when they are absent, so a typo cannot silently turn the test into a
+// pass of something that never ran.
 const crashChildEnv = "BDB_CRASH_CHILD_DIR"
 const crashChildStartEnv = "BDB_CRASH_CHILD_START"
+
+// crashSealLimit is deliberately small so a 100-key run seals many
+// times: seals and the compactions they enable are the crash windows
+// this test exists to land kills in.
+const crashSealLimit = 50
 
 // crashKV generates the deterministic key/value sequence, skipping the
 // first `skip` pairs
@@ -49,6 +58,17 @@ func crashKV(skip int) (kr, vr *FastRandom) {
 	return kr, vr
 }
 
+// crashPut writes pair i to the layer it belongs to.  Even pairs go to
+// Perm and odd to Dyna, so a kill can land in either layer's path.
+func crashPut(kv *KV2, i int, key [32]byte, value []byte) (err error) {
+	if i%2 == 0 {
+		_, err = kv.PutPerm(key, value)
+	} else {
+		_, err = kv.PutDyna(key, value)
+	}
+	return err
+}
+
 // TestCrashChildProcess
 // Helper process for TestCrashRecovery; skipped unless launched by it
 func TestCrashChildProcess(t *testing.T) {
@@ -58,14 +78,15 @@ func TestCrashChildProcess(t *testing.T) {
 	}
 	start, _ := strconv.Atoi(os.Getenv(crashChildStartEnv))
 
-	kv, err := OpenKV(dir)
+	kv, err := OpenKV2(dir)
 	require.NoError(t, err, "child: open")
 	require.NoError(t, kv.Open(), "child: open files")
+	kv.SealLimit = crashSealLimit
 
 	kr, vr := crashKV(start)
 	const batch = 20
 	for i := start; i < start+100_000; i++ {
-		require.NoError(t, kv.Put(kr.NextHash(), vr.RandBuff(10, 50)), "child: put")
+		require.NoError(t, crashPut(kv, i, kr.NextHash(), vr.RandBuff(10, 50)), "child: put")
 		if (i+1)%batch == 0 {
 			require.NoError(t, kv.Close(), "child: close")
 			fmt.Printf("CHECKPOINT %d\n", i+1) // Durability point reached
@@ -87,10 +108,7 @@ func TestCrashRecovery(t *testing.T) {
 	// Create the database once, durably, before any crashing starts.
 	// (Initial creation itself is not crash-atomic; see the durability
 	// design notes.)
-	// KeyLimit 50 forces history pushes; MaxCachedBlocks 2 forces
-	// frequent kfile rewrites - both are crash windows we want kills
-	// to land in.
-	kv, err := NewKV(true, dir, 16, 50, 2)
+	kv, err := NewKV2(dir, crashSealLimit)
 	require.NoError(t, err)
 	require.NoError(t, kv.Close())
 
@@ -137,7 +155,7 @@ func TestCrashRecovery(t *testing.T) {
 
 		// Wait until the child is past startup and actually writing
 		// (first new checkpoint), then kill it a random moment later so
-		// the kill lands inside the write/rewrite/push/bloom-save paths
+		// the kill lands inside the write/seal/compact/commit paths
 		select {
 		case <-progressed:
 		case <-time.After(10 * time.Second):
@@ -156,7 +174,7 @@ func TestCrashRecovery(t *testing.T) {
 
 		// The contract: the DB opens, and every checkpointed key reads
 		// back correctly
-		kv, err := OpenKV(dir)
+		kv, err := OpenKV2(dir)
 		require.NoErrorf(t, err, "round %d: reopen after kill (durable=%d)", round, durable)
 		require.NoErrorf(t, kv.Open(), "round %d: open files", round)
 		kr, vr := crashKV(0)

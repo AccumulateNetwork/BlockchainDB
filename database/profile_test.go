@@ -24,7 +24,7 @@ func TestBuildBigFor3Minutes(t *testing.T) {
 	os.MkdirAll(dir, 0777)
 
 	// Create a KVShard
-	kvShard, err := NewKVShard(dir, 1024, 1024*10, 100) // offsetsCnt, keyLimit, MaxCachedBlocks
+	kvShard, err := NewKVShard(dir, 1024*10) // sealLimit
 	if err != nil {
 		t.Fatal(err)
 	}

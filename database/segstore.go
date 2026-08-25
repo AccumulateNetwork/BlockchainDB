@@ -29,14 +29,15 @@ import (
 //	seg-<height>.idx    its key index: sorted 48-byte records + a bloom
 //	segments.json       the manifest: the segments, counts, and hashes
 //
-// What this buys over the kfile/history/values arrangement:
+// What this buys over the v1 kfile/history/values arrangement it
+// replaced (removed; see docs/design/segment-store.md):
 //
 //   - Sync is a file copy.  A sealed .dat is byte-identical to what a
 //     peer sends; importing means copying the file, building its index,
 //     and committing one manifest update -- no re-inserting records.
-//   - No move-and-rewrite.  history.dat relocates whole key bins when
-//     they grow (UpdateKeySet); sealed segments never move, so writes
-//     cost what they weigh.
+//   - No move-and-rewrite.  v1's history.dat relocated whole key bins
+//     when they grew; sealed segments never move, so writes cost what
+//     they weigh.
 //   - Compaction is crash-atomic (issue #19).  A compaction writes a
 //     new sealed generation and commits by replacing the manifest --
 //     one atomic rename.  There is no window where keys and values
@@ -1221,6 +1222,21 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 		offset = valueOffset + length
 	}
 	return writeIndexFile(indexPath, order, entries)
+}
+
+// recordSort
+// Sorts a buffer of 48-byte key records in place by their 32-byte key
+type recordSort []byte
+
+func (r recordSort) Len() int { return len(r) / DBKeyFullSize }
+func (r recordSort) Less(i, j int) bool {
+	return bytes.Compare(r[i*DBKeyFullSize:i*DBKeyFullSize+32], r[j*DBKeyFullSize:j*DBKeyFullSize+32]) < 0
+}
+func (r recordSort) Swap(i, j int) {
+	var tmp [DBKeyFullSize]byte
+	copy(tmp[:], r[i*DBKeyFullSize:])
+	copy(r[i*DBKeyFullSize:(i+1)*DBKeyFullSize], r[j*DBKeyFullSize:])
+	copy(r[j*DBKeyFullSize:(j+1)*DBKeyFullSize], tmp[:])
 }
 
 // writeIndexFile

@@ -21,7 +21,7 @@ func TestConcurrentShardAccess(t *testing.T) {
 	os.RemoveAll(dir)
 	defer os.RemoveAll(dir)
 
-	kvs, err := NewKVShard(dir, 64, 10_000, 5)
+	kvs, err := NewKVShard(dir, 10_000)
 	require.NoError(t, err, "create kvshard")
 
 	const workers = 8
@@ -96,7 +96,7 @@ func TestConcurrentViewAccess(t *testing.T) {
 	os.RemoveAll(dir)
 	defer os.RemoveAll(dir)
 
-	sdbv, err := NewShardDBViews(dir, 200*time.Millisecond, 1, 256, 1, 64, 10_000, 5)
+	sdbv, err := NewShardDBViews(dir, 200*time.Millisecond, 1, 256, 1, 10_000)
 	require.NoError(t, err, "create views")
 
 	const workers = 4

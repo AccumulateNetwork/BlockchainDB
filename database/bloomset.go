@@ -14,6 +14,12 @@ const (
 	bloomMagic       = 0x424C4D31      // "BLM1"
 )
 
+// DefaultBloomCapacity is the key capacity a fresh Bloom filter is
+// sized for (~150KB at 12 bits/key).  The filter grows a new layer
+// whenever the key count outgrows it, so this is a starting point,
+// not a limit.
+const DefaultBloomCapacity uint64 = 100_000
+
 // BloomSet
 // A scalable Bloom filter: a stack of layers where only the newest
 // layer accepts keys.  When the active layer reaches its capacity it is

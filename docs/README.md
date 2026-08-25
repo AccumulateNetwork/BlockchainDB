@@ -28,11 +28,21 @@ go get github.com/AccumulateNetwork/BlockchainDB
 
 BlockchainDB consists of several core components:
 
-- [Key-Value Store (KV)](components/kv.md) - The main database interface
+- **`KVShard`** - the main database interface: a sharded store of `KV2`
+  instances, each with an immutable (Perm) and a mutable (Dyna) layer
+- **`SegmentStore`** - the storage layer both layers are built on:
+  sealed, hashed segments that double as the sync transport.  See
+  [Segments as storage](design/segment-store.md)
 - [Buffered File (BFile)](components/bfile.md) - Efficient file I/O operations
-- [Key File (KFile)](components/kfile.md) - Key storage and management
-- [History File](components/history-file.md) - Historical data management
 - [Bloom Filter](components/bloom.md) - Efficient membership testing
+
+The design notes in [design/](design/) are the current description of
+how the database works:
+
+- [Segments as storage](design/segment-store.md)
+- [Block segmentation](design/block-segmentation.md)
+- [Crash durability](design/durability.md)
+- [Multi-core ingest](design/multicore-ingest.md)
 
 ## Usage Examples
 

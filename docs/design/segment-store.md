@@ -66,9 +66,9 @@ snapshots rather than syncing segment by segment. Hashing them would
 cost a full read of the store on every seal and every open, to verify
 bytes against nothing.
 
-**No move-and-rewrite.** `HistoryFile.UpdateKeySet` relocates a whole
-key bin whenever it outgrows its slot. Sealed segments never move, so
-a write costs what it weighs.
+**No move-and-rewrite.** v1's `HistoryFile.UpdateKeySet` relocated a
+whole key bin whenever it outgrew its slot. Sealed segments never
+move, so a write costs what it weighs.
 
 **Compaction is crash-atomic (issue #19).** `Compact(height)` writes a
 new generation holding only live keys, fsyncs it, and commits by
@@ -143,11 +143,22 @@ record from a crash mid-write is dropped.
    value carries in a segment; v1 stores values bare and keeps its keys
    in a separate file.
 
-3. Next — delete the now-unused Perm paths in `KFile`/`HistoryFile`
-   (`PushHistory` and the bin relocation logic), and drop `offsetsCnt`
-   and `MaxCachedBlocks` from `NewKV2`/`NewKVShard`, which no longer
-   reach anything.
-4. Then — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
+3. **Done** — v1 is gone. Nothing on the database's path reached
+   `KV`, `KFile`, or `HistoryFile` any more, so `PushHistory` and the
+   bin relocation logic went with the layer they belonged to, along
+   with `offsetsCnt` and `MaxCachedBlocks`, which no longer reached
+   anything: `NewKV2(directory, sealLimit)` and
+   `NewKVShard(directory, sealLimit)` are the constructors now.
+
+   `ShardIndex`, `recordSort`, and `DefaultBloomCapacity` moved to the
+   files that still use them. The measurement tests that compared the
+   two layers kept their v2 halves (`TestSyncCost`, `TestDynaCost`);
+   the numbers in this document are the last measured comparison, and
+   reproducing them means checking out a commit before the removal.
+   `TestCrashRecovery` was retargeted from `KV` to `KV2` rather than
+   deleted, so the SIGKILL durability contract is still enforced end
+   to end.
+4. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
 Not yet done here: a per-segment key count cap (segments grow with the

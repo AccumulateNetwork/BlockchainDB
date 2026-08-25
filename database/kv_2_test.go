@@ -14,15 +14,13 @@ func TestKV2(t *testing.T) {
 	defer rm()
 
 	const numKVs = 1000
-	const offsetCnt = 10240
 	const keyLimit = 100
-	const MaxCachedBlocks = 50
 
 	start := time.Now()
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kv2, err := NewKV2(dir, offsetCnt, keyLimit, MaxCachedBlocks)
+	kv2, err := NewKV2(dir, keyLimit)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -73,9 +71,7 @@ func TestKV2_2(t *testing.T) {
 
 	const numKVs = 10_000
 	const DynaPercent = 5
-	const offsetCnt = 1024
 	const keyLimit = 100_000
-	const MaxCachedBlocks = 50
 
 	fr := NewFastRandom([]byte{1})
 
@@ -85,7 +81,7 @@ func TestKV2_2(t *testing.T) {
 	start := time.Now()
 	var cntWrites, cntReads float64
 
-	kv2, err := NewKV2(dir, offsetCnt, keyLimit, MaxCachedBlocks)
+	kv2, err := NewKV2(dir, keyLimit)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")

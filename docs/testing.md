@@ -10,17 +10,25 @@ BlockchainDB uses Go's standard testing framework along with the `testify` packa
 
 The repository contains the following test files:
 
-- `bfile_test.go` - Tests for the Buffered File component
-- `bloom_test.go` - Tests for the Bloom Filter component
-- `fastrandom_test.go` - Tests for the random number generator used in testing
-- `history_file_test.go` - Tests for the History File component
-- `keys_test.go` - Tests for key operations
-- `kfile_header_test.go` - Tests for the KFile header
-- `kfile_test.go` - Tests for the Key File component
-- `kv_2_test.go` - Tests for the KV2 implementation
-- `kv_shard_test.go` - Tests for the KV Shard implementation
-- `kv_test.go` - Tests for the main Key-Value store
-- `view_kv_test.go` - Tests for the View KV implementation
+- `bfile_test.go` - Buffered File component
+- `bloom_test.go`, `bloomset_test.go` - Bloom filter and the layered,
+  persisted filter built on it
+- `concurrency_test.go` - Concurrent access to `KVShard` and `KVView`
+- `dyna_test.go` - The mutable (Dyna) layer: compaction, live-tail
+  bounds, and crash-midway recovery
+- `fastrandom_test.go` - The deterministic generator used to build test data
+- `keys_test.go` - Key record marshalling
+- `kv_2_test.go` - The two-layer `KV2` store
+- `kv_shard_test.go`, `kv_shard_writer_test.go` - The sharded store and
+  its multi-core ingest path
+- `kv_test.go` - End-to-end key/value round trips
+- `loadtest_test.go` - The `-load` flag that gates the multi-GB load tests
+- `profile_test.go`, `kv2_profile_test.go` - Profiling harnesses
+- `reopen_test.go` - The create -> write -> close -> open -> read round trip
+- `segment_test.go` - Block export/import between nodes
+- `segstore_test.go`, `segstore_bench_test.go` - `SegmentStore` behavior
+  and its cost measurements
+- `view_kv_test.go` - The View KV implementation
 
 ## Testing Utilities
 
@@ -122,22 +130,25 @@ func TestBloom(t *testing.T) {
 
 ### 4. Benchmarking
 
-While some tests measure performance, formal Go benchmarks using the `testing.B` type are not extensively used. Adding dedicated benchmark functions would provide more consistent performance measurements.
+Several tests measure performance by reporting rates, which is useful
+for tracking but noisy. Formal Go benchmarks using the `testing.B`
+type are used for lookups (`BenchmarkSegmentStoreGet`) but not for
+writes; adding them would give more consistent measurements.
 
 Example:
 ```go
 func BenchmarkKVPut(b *testing.B) {
     dir, rm := MakeDir()
     defer rm()
-    
-    kv, _ := NewKV(false, dir, 1024, 10000, 50)
+
+    kvs, _ := NewKVShard(dir, 100_000)
     fr := NewFastRandom([]byte{1})
-    
+
     b.ResetTimer()
     for i := 0; i < b.N; i++ {
         key := fr.NextHash()
         value := fr.RandBuff(100, 200)
-        kv.Put(key, value)
+        kvs.PutPerm(key, value)
     }
 }
 ```
@@ -162,11 +173,8 @@ To run the tests in BlockchainDB:
 # Run all tests
 go test ./...
 
-# Run tests for a specific package
-go test github.com/AccumulateNetwork/BlockchainDB/database
-
 # Run a specific test
-go test -run TestKV github.com/AccumulateNetwork/BlockchainDB/database
+go test -run TestKV ./database/
 
 # Run tests with verbose output
 go test -v ./...
@@ -175,6 +183,16 @@ go test -v ./...
 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out -o coverage.html
 ```
+
+Two flags change what runs:
+
+- `-load` opts in to the multi-GB load tests, which build databases
+  measured in tens of gigabytes and run for tens of minutes to hours.
+  They are skipped by default so `go test ./...` stays a suite someone
+  can wait for; the skip line names the flag.
+- `-short` skips the measurement tests (`TestSyncCost`,
+  `TestDynaCost`), which are correctness-neutral and exist to report
+  numbers.
 
 ## Conclusion
 

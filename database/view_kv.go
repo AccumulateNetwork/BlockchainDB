@@ -44,8 +44,7 @@ type KVView struct {
 	ActiveViews []*View       // List of all active Views, newest first
 	Map         map[int]View  // Fast lookup of a view
 	Timeout     time.Duration // How long before views timeout; every access resets timeout
-	OffsetCnt   uint64        // KeyOffset number for the key files
-	KeyLimit    uint64        // KeyLimit sets when to move keys to History
+	SealLimit   uint64        // SealLimit sets when a layer seals its live tail
 	FlushErr    error         // First error hit while flushing buffered writes to the DB
 }
 
@@ -54,14 +53,12 @@ func NewShardDBViews(
 	Timeout time.Duration,
 	Partition, ShardCnt,
 	BufferCnt,
-	OffsetCnt, KeyLimit uint64,
-	MaxCachedBlocks int) (sdbV *KVView, err error) {
+	SealLimit uint64) (sdbV *KVView, err error) {
 
 	sdbV = new(KVView)
 	sdbV.Timeout = Timeout
-	sdbV.OffsetCnt = OffsetCnt
-	sdbV.KeyLimit = KeyLimit
-	if sdbV.DB, err = NewKVShard(Directory, sdbV.OffsetCnt, sdbV.KeyLimit, MaxCachedBlocks); err == nil {
+	sdbV.SealLimit = SealLimit
+	if sdbV.DB, err = NewKVShard(Directory, sdbV.SealLimit); err == nil {
 		return sdbV, nil
 	}
 	return nil, err

@@ -53,10 +53,10 @@ sequentially and the import writes it sequentially.
 
 ## Scope and future work
 
-- **v1 export cost**: selecting "keys since offset X" scans the shard's
-  key records (kfile + one sequential pass of history.dat) per export.
-  Fine at major-block cadence; for per-minor-block sealing, add a
-  per-put segment journal so the export reads only the new records.
+- **Export cost**: resolved by sealed segments. Export selects whole
+  sealed files rather than scanning key records, so it reads only what
+  the block actually added. (In v1, since removed, selecting "keys
+  since offset X" scanned the shard's key records once per export.)
 - **Dyna layer**: state is mutable and belongs to a *snapshot*, not a
   segment chain. A state snapshot export (same file format, whole
   layer) composes with segments: sync = latest snapshot + segments
@@ -65,9 +65,9 @@ sequentially and the import writes it sequentially.
   its segments stay local: they are not exported by `ExportBlock` and
   carry no hash, because a peer never receives them one at a time.
 - **Sealed segments as storage**: done, for both layers — see
-  `segment-store.md`. Sync is a file copy plus a manifest update, the
-  history file's move-and-rewrite is off the write path, and
-  compaction is crash-atomic (#19) because a new sealed generation
-  replaces the in-place swap.
+  `segment-store.md`. Sync is a file copy plus a manifest update, v1's
+  move-and-rewrite is off the write path, and compaction is
+  crash-atomic (#19) because a new sealed generation replaces the
+  in-place swap.
 - Transport (fetching manifests/segments from peers) is the
   application's concern; the DB provides the sealed, verifiable units.

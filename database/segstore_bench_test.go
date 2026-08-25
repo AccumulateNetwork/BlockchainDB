@@ -11,16 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSyncCostComparison
+// TestSyncCost
 // The central claim of segments-as-storage: syncing a peer is a file
 // copy plus a manifest commit, not a re-insertion of every record.
 //
-// Measured twice, because the difference is structural rather than
+// Measured twice, because the point is structural rather than
 // constant: into an empty node, and into a node that already holds
 // data (the partially synced node the design targets).  Re-inserting
 // records costs a lookup per key against everything already stored;
-// adopting a sealed segment does not.
-func TestSyncCostComparison(t *testing.T) {
+// adopting a sealed segment does not, so the two numbers should be
+// the same.  (The measured comparison against the v1 re-insertion
+// path is in docs/design/segment-store.md; v1 itself is gone.)
+func TestSyncCost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("measurement; skipped in -short")
 	}
@@ -31,9 +33,8 @@ func TestSyncCostComparison(t *testing.T) {
 	os.RemoveAll(base)
 	defer os.RemoveAll(base)
 
-	// --- v2: SegmentStore, sync by copying sealed files ---
-	srcDir := filepath.Join(base, "v2src")
-	dstDir := filepath.Join(base, "v2dst")
+	srcDir := filepath.Join(base, "src")
+	dstDir := filepath.Join(base, "dst")
 	src, err := NewSegmentStore(srcDir, false)
 	require.NoError(t, err)
 	kr := NewFastRandom([]byte{111})
@@ -51,11 +52,11 @@ func TestSyncCostComparison(t *testing.T) {
 	for i, meta := range metas {
 		require.NoError(t, dst.ImportSegmentFile(paths[i], meta))
 	}
-	v2Empty := time.Since(start)
+	empty := time.Since(start)
 	require.NoError(t, dst.Close())
 
-	// v2 again, into a node that already holds `preloaded` keys
-	dst2Dir := filepath.Join(base, "v2dst2")
+	// Again, into a node that already holds `preloaded` keys
+	dst2Dir := filepath.Join(base, "dst2")
 	dst2, err := NewSegmentStore(dst2Dir, false)
 	require.NoError(t, err)
 	pk := NewFastRandom([]byte{121})
@@ -73,104 +74,18 @@ func TestSyncCostComparison(t *testing.T) {
 		m.Height = 100 + uint64(i) // Above the preloaded segments
 		require.NoError(t, dst2.ImportSegmentFile(paths[i], m))
 	}
-	v2Loaded := time.Since(start)
+	loaded := time.Since(start)
 	require.NoError(t, src.Close())
 	require.NoError(t, dst2.Close())
-
-	// --- v1: KV Perm layer, sync by re-inserting every record ---
-	v1SrcDir := filepath.Join(base, "v1src")
-	v1DstDir := filepath.Join(base, "v1dst")
-	v1Src, err := NewKV(true, v1SrcDir, 1024, 100_000, 50)
-	require.NoError(t, err)
-	kr2 := NewFastRandom([]byte{111})
-	vr2 := NewFastRandom([]byte{111, 111})
-	for i := 0; i < keys; i++ {
-		require.NoError(t, v1Src.Put(kr2.NextHash(), vr2.RandBuff(100, 500)))
-	}
-	segPath := filepath.Join(base, "v1.seg")
-	f, err := os.Create(segPath)
-	require.NoError(t, err)
-	_, _, _, err = v1Src.ExportSegment(f, 0)
-	require.NoError(t, err)
-	require.NoError(t, f.Close())
-
-	v1Dst, err := NewKV(true, v1DstDir, 1024, 100_000, 50)
-	require.NoError(t, err)
-	in, err := os.Open(segPath)
-	require.NoError(t, err)
-	start = time.Now()
-	n, err := v1Dst.ImportSegment(in)
-	v1Empty := time.Since(start)
-	require.NoError(t, err)
-	require.Equal(t, uint64(keys), n)
-	require.NoError(t, in.Close())
-	require.NoError(t, v1Dst.Close())
-
-	// v1 again, into a node that already holds `preloaded` keys
-	v1Dst2Dir := filepath.Join(base, "v1dst2")
-	v1Dst2, err := NewKV(true, v1Dst2Dir, 1024, 100_000, 50)
-	require.NoError(t, err)
-	pk2 := NewFastRandom([]byte{121})
-	pv2 := NewFastRandom([]byte{121, 121})
-	for i := 0; i < preloaded; i++ {
-		require.NoError(t, v1Dst2.Put(pk2.NextHash(), pv2.RandBuff(100, 500)))
-	}
-	in2, err := os.Open(segPath)
-	require.NoError(t, err)
-	start = time.Now()
-	_, err = v1Dst2.ImportSegment(in2)
-	v1Loaded := time.Since(start)
-	require.NoError(t, err)
-	require.NoError(t, in2.Close())
-	require.NoError(t, v1Src.Close())
-	require.NoError(t, v1Dst2.Close())
 
 	rate := func(d time.Duration) string {
 		return humanize.Comma(int64(float64(keys) / d.Seconds()))
 	}
-	fmt.Printf("syncing %s keys into a node:\n", humanize.Comma(keys))
+	fmt.Printf("adopting %s keys as sealed segments:\n", humanize.Comma(keys))
 	fmt.Printf("  %-34s %8s %14s\n", "", "seconds", "keys/s")
-	fmt.Printf("  %-34s %8.2f %14s\n", "v1 re-insert, empty node", v1Empty.Seconds(), rate(v1Empty))
-	fmt.Printf("  %-34s %8.2f %14s\n", "v2 copy segments, empty node", v2Empty.Seconds(), rate(v2Empty))
+	fmt.Printf("  %-34s %8.2f %14s\n", "into an empty node", empty.Seconds(), rate(empty))
 	fmt.Printf("  %-34s %8.2f %14s\n",
-		fmt.Sprintf("v1 re-insert, %s keys held", humanize.Comma(preloaded)), v1Loaded.Seconds(), rate(v1Loaded))
-	fmt.Printf("  %-34s %8.2f %14s\n",
-		fmt.Sprintf("v2 copy segments, %s keys held", humanize.Comma(preloaded)), v2Loaded.Seconds(), rate(v2Loaded))
-	fmt.Printf("  speedup: %.1fx empty, %.1fx partially synced\n",
-		v1Empty.Seconds()/v2Empty.Seconds(), v1Loaded.Seconds()/v2Loaded.Seconds())
-}
-
-// BenchmarkKVGet
-// Full key-to-value lookup through the v1 KV Perm layer, for
-// comparison with BenchmarkSegmentStoreGet (same key count, same
-// value sizes; both read the value, not just the key record).
-func BenchmarkKVGet(b *testing.B) {
-	dir := filepath.Join(os.TempDir(), "BenchKVGet")
-	os.RemoveAll(dir)
-	defer os.RemoveAll(dir)
-
-	kv, err := NewKV(true, dir, 1024, 250_000, 50)
-	if err != nil {
-		b.Fatal(err)
-	}
-	const n = 1_000_000
-	kr := NewFastRandom([]byte{112})
-	vr := NewFastRandom([]byte{112, 112})
-	keys := make([][32]byte, n)
-	for i := 0; i < n; i++ {
-		keys[i] = kr.NextHash()
-		if err := kv.Put(keys[i], vr.RandBuff(100, 500)); err != nil {
-			b.Fatal(err)
-		}
-	}
-
-	pick := NewFastRandom([]byte{113})
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := kv.Get(keys[int(pick.UintN(n))]); err != nil {
-			b.Fatal(err)
-		}
-	}
+		fmt.Sprintf("into a node holding %s keys", humanize.Comma(preloaded)), loaded.Seconds(), rate(loaded))
 }
 
 // BenchmarkSegmentStoreGet measures lookups against sealed segments
@@ -208,30 +123,29 @@ func BenchmarkSegmentStoreGet(b *testing.B) {
 	}
 }
 
-// TestDynaCostComparison
+// TestDynaCost
 // The Dyna layer's workload is overwrites: a fixed set of state keys
 // rewritten every block.  What that costs is dominated by two things
 // -- what a Put does beyond appending the value, and what reclaiming
-// the overwritten bytes costs.
+// the overwritten bytes costs.  A mutable SegmentStore appends the
+// value and inserts into a map; Compress writes one new sealed
+// generation and commits it with a single manifest rename.
 //
-// v1 (KFile, history disabled) writes the value, rewrites the key
-// record, and relocates key bins as they fill; Compress copies every
-// live value into a new values file and then rewrites every key offset.
-// v2 (a mutable SegmentStore) appends the value and inserts into a map;
-// Compress writes one new sealed generation and commits it with a
-// single manifest rename.
-func TestDynaCostComparison(t *testing.T) {
+// (The measured comparison against v1's kfile rewrite, bin relocation,
+// and copy-every-value Compress is in docs/design/segment-store.md;
+// v1 itself is gone.)
+func TestDynaCost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("measurement; skipped in -short")
 	}
 	const keyCount = 50_000       // Distinct state keys
 	const rounds = 8              // Times each is rewritten
 	const compressEvery = 100_000 // Writes between compactions
-	const sealLimit = 25_000      // v2 live-tail bound, in records
+	const sealLimit = 25_000      // Live-tail bound, in records
 
 	base := filepath.Join(os.TempDir(), t.Name())
 	os.RemoveAll(base)
-	require.NoError(t, os.MkdirAll(base, os.ModePerm)) // NewKV creates only its own directory
+	require.NoError(t, os.MkdirAll(base, os.ModePerm))
 	defer os.RemoveAll(base)
 
 	keys := make([][32]byte, keyCount)
@@ -239,82 +153,56 @@ func TestDynaCostComparison(t *testing.T) {
 	for i := range keys {
 		keys[i] = kr.NextHash()
 	}
+	want := make([][]byte, keyCount) // Last value written for each key
 
-	// --- v1: KFile with history disabled, compacted by KV.Compress ---
-	v1Dir := filepath.Join(base, "v1")
-	v1, err := NewKV(false, v1Dir, 1024, 100_000, 50)
+	dir := filepath.Join(base, "dyna")
+	store, err := NewSegmentStore(dir, true)
 	require.NoError(t, err)
 	vr := NewFastRandom([]byte{121, 121})
 	written := 0
 	start := time.Now()
 	for round := 0; round < rounds; round++ {
 		for i := range keys {
-			require.NoError(t, v1.Put(keys[i], vr.RandBuff(100, 300)))
-			if written++; written%compressEvery == 0 {
-				require.NoError(t, v1.Compress())
+			value := vr.RandBuff(100, 300)
+			require.NoError(t, store.Put(keys[i], value))
+			if round == rounds-1 {
+				want[i] = value
 			}
-		}
-	}
-	require.NoError(t, v1.Compress())
-	v1Elapsed := time.Since(start)
-	require.NoError(t, v1.Close())
-	v1Size := dirSize(t, v1Dir)
-
-	// --- v2: mutable SegmentStore, compacted by seal + Compact ---
-	v2Dir := filepath.Join(base, "v2")
-	v2, err := NewSegmentStore(v2Dir, true)
-	require.NoError(t, err)
-	vr = NewFastRandom([]byte{121, 121})
-	written = 0
-	start = time.Now()
-	for round := 0; round < rounds; round++ {
-		for i := range keys {
-			require.NoError(t, v2.Put(keys[i], vr.RandBuff(100, 300)))
-			if v2.LiveRecords() >= sealLimit { // What KV2.sealDynaIfFull does
-				_, err = v2.SealNext()
+			if store.LiveRecords() >= sealLimit { // What KV2.sealDynaIfFull does
+				_, err = store.SealNext()
 				require.NoError(t, err)
 			}
 			if written++; written%compressEvery == 0 {
-				_, err = v2.SealNext()
+				_, err = store.SealNext()
 				require.NoError(t, err)
-				_, err = v2.CompactNext()
+				_, err = store.CompactNext()
 				require.NoError(t, err)
 			}
 		}
 	}
-	_, err = v2.SealNext()
+	_, err = store.SealNext()
 	require.NoError(t, err)
-	_, err = v2.CompactNext()
+	_, err = store.CompactNext()
 	require.NoError(t, err)
-	v2Elapsed := time.Since(start)
-	require.NoError(t, v2.Close())
-	v2Size := dirSize(t, v2Dir)
+	elapsed := time.Since(start)
+	require.NoError(t, store.Close())
+	size := dirSize(t, dir)
 
-	// Both layers must still answer correctly
-	v1, err = OpenKV(v1Dir)
-	require.NoError(t, err)
-	v2, err = OpenSegmentStore(v2Dir)
+	// Compaction must not have lost or stale-ed any key
+	store, err = OpenSegmentStore(dir)
 	require.NoError(t, err)
 	for i := range keys {
-		a, err := v1.Get(keys[i])
-		require.NoErrorf(t, err, "v1 key %d", i)
-		b, err := v2.Get(keys[i])
-		require.NoErrorf(t, err, "v2 key %d", i)
-		require.Equalf(t, a, b, "layers disagree on key %d", i)
+		got, err := store.Get(keys[i])
+		require.NoErrorf(t, err, "key %d", i)
+		require.Equalf(t, want[i], got, "wrong value for key %d after compaction", i)
 	}
-	require.NoError(t, v1.Close())
-	require.NoError(t, v2.Close())
+	require.NoError(t, store.Close())
 
 	total := keyCount * rounds
-	rate := func(d time.Duration) string {
-		return humanize.Comma(int64(float64(total) / d.Seconds()))
-	}
 	fmt.Printf("Dyna layer: %s writes over %s keys, compacting every %s\n",
 		humanize.Comma(int64(total)), humanize.Comma(keyCount), humanize.Comma(compressEvery))
 	fmt.Printf("  %-28s %8s %14s %12s\n", "", "seconds", "puts/s", "on disk")
-	fmt.Printf("  %-28s %8.2f %14s %12s\n", "v1 kfile + Compress",
-		v1Elapsed.Seconds(), rate(v1Elapsed), humanize.Bytes(uint64(v1Size)))
-	fmt.Printf("  %-28s %8.2f %14s %12s\n", "v2 segments + Compact",
-		v2Elapsed.Seconds(), rate(v2Elapsed), humanize.Bytes(uint64(v2Size)))
-	fmt.Printf("  speedup: %.1fx\n", v1Elapsed.Seconds()/v2Elapsed.Seconds())
+	fmt.Printf("  %-28s %8.2f %14s %12s\n", "segments + Compact",
+		elapsed.Seconds(), humanize.Comma(int64(float64(total)/elapsed.Seconds())),
+		humanize.Bytes(uint64(size)))
 }

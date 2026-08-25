@@ -12,11 +12,6 @@ type DBBKey struct {
 	Length uint64
 }
 
-type DBBKeyFull struct {
-	Key    [32]byte //The Key
-	DBBKey          // And its offset and Length
-}
-
 // Bytes
 // Writes out the address with the offset and length of the DBBKey
 func (d *DBBKey) Bytes(address [32]byte) []byte {
