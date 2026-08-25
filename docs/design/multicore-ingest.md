@@ -74,14 +74,14 @@ Notes:
   goroutine generating and queuing writes is the ceiling, independent
   of worker count. That ceiling is far above current chain throughput
   needs; if it ever matters, batch the queue sends.
-- Cold-start caveat: a fresh `KVShard` allocates 1,024 × 10 MB Bloom
-  filters, and first-touch page faults dominate until they are warm —
-  hard evidence for right-sizing the filters (issue #12).
+- Cold-start caveat (resolved by #12): fixed 10 MB Bloom filters made
+  first-touch page faults dominate a cold `KVShard`. Filters are now
+  layered and sized from the key count (~300 KB initial per KFile),
+  and persisted at push time so opens load them instead of scanning
+  history.
 
 ## Future work
 
-- Right-size Bloom filters (#12): shrinks the cold-start fault storm
-  and ~10 GB reserved memory.
 - Crash-consistent flush: `Flush` is an application barrier, not a
   durability barrier — it does not fsync. Couple it with the recovery
   design (#5) so a block boundary can be made durable atomically.
