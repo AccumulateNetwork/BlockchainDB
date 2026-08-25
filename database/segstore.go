@@ -309,8 +309,19 @@ func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 // lookups use.
 func (s *SegmentStore) openLive() (err error) {
 	path := filepath.Join(s.Directory, segLiveName)
-	if _, err = os.Stat(path); err != nil {
+	fi, err := os.Stat(path)
+	if err != nil {
 		return s.newLiveFile() // No live tail (e.g. crash right after a seal)
+	}
+	if fi.Size() < segDataHdrSize {
+		// seal() creates the new live file and leaves its header in the
+		// BFile buffer, so a crash before the first flush leaves the
+		// file existing at 0 bytes.  Such a file holds no records, so
+		// rewriting it loses nothing -- while keeping it would put the
+		// next record at offset 0 and shift the whole tail under the
+		// header, where replay reads a key fragment as a record header
+		// and silently discards the tail.
+		return s.newLiveFile()
 	}
 	if s.liveFile, err = OpenBFile(path); err != nil {
 		return err
@@ -332,6 +343,23 @@ func (s *SegmentStore) openLive() (err error) {
 		s.live[key] = &DBBKey{Offset: valueOffset, Length: length}
 		s.liveRecords++
 		offset = valueOffset + length
+	}
+
+	// Drop whatever follows the last complete record: a torn record
+	// from a crash mid-write, or bytes too few to form a header.
+	// Truncating is what makes the drop real -- leaving the bytes puts
+	// the next append after them, so every later open reads that
+	// record's key as a header and mis-parses the whole tail from
+	// there.  The bytes being discarded were never replayable, so no
+	// durable record is lost.
+	if offset < s.liveFile.EOD {
+		if err = s.liveFile.File.Truncate(int64(offset)); err != nil {
+			return err
+		}
+		if err = s.liveFile.File.Sync(); err != nil {
+			return err
+		}
+		s.liveFile.EOD = offset
 	}
 	return nil
 }
@@ -459,6 +487,25 @@ func (s *SegmentStore) writeManifest() (err error) {
 	return syncDir(s.Directory)
 }
 
+// errStoreClosed is returned by every operation that would read or
+// mutate a store whose files are shut.  Close() drops the sealed
+// segment list but leaves the live map populated, so without this an
+// operation on a closed store runs against half a store: a Seal or
+// Compact would commit a manifest built from no segments at all and
+// silently drop every sealed segment on the next open, and a Get would
+// answer "not found" for keys that are simply not loaded.  Callers
+// reopen with Open, which is cheap and safe on an already-open store.
+var errStoreClosed = errors.New("segment store is closed")
+
+// checkOpen reports whether the store can be operated on.  The caller
+// must hold the Mutex.
+func (s *SegmentStore) checkOpen() error {
+	if s.closed {
+		return errStoreClosed
+	}
+	return nil
+}
+
 // Get
 // Return the value for a key.  Checks the live tail, then the sealed
 // segments newest to oldest.
@@ -470,6 +517,9 @@ func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 
 // get is Get; the caller must hold the Mutex
 func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
+	if err = s.checkOpen(); err != nil {
+		return nil, err
+	}
 	if dbb, ok := s.live[key]; ok {
 		value = make([]byte, dbb.Length)
 		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
@@ -503,6 +553,9 @@ func (s *SegmentStore) Put(key [32]byte, value []byte) (err error) {
 
 // put is Put; the caller must hold the Mutex
 func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
+	if err = s.checkOpen(); err != nil {
+		return err
+	}
 	if !s.Mutable {
 		if existing, err := s.get(key); err == nil {
 			if bytes.Equal(existing, value) {
@@ -581,6 +634,9 @@ func (s *SegmentStore) Seal(height uint64) (meta SegmentMeta, err error) {
 
 // seal is Seal; the caller must hold the Mutex
 func (s *SegmentStore) seal(height uint64) (meta SegmentMeta, err error) {
+	if err = s.checkOpen(); err != nil {
+		return meta, err
+	}
 	if len(s.live) == 0 {
 		return meta, nil // Nothing to seal
 	}
@@ -816,6 +872,9 @@ func (s *SegmentStore) CompactNext() (meta SegmentMeta, err error) {
 
 // compact is Compact; the caller must hold the Mutex
 func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
+	if err = s.checkOpen(); err != nil {
+		return meta, err
+	}
 	if len(s.segments) == 0 {
 		return meta, nil
 	}
@@ -989,6 +1048,10 @@ func (s *SegmentStore) SegmentPaths() (metas []SegmentMeta, paths []string) {
 func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+
+	if err = s.checkOpen(); err != nil {
+		return err
+	}
 
 	for _, seg := range s.segments {
 		if seg.meta.Height == meta.Height && seg.meta.Hash == meta.Hash {
