@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -375,4 +376,162 @@ func TestSegmentStoreGenesisHeight(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("genesis"), v)
 	require.NoError(t, store.Close())
+}
+
+// TestSegmentStoreLiveTailAfterInterruptedSeal
+// Regression test: a crash between seal()'s os.Create of the new live
+// file and its first flush leaves live.dat existing at 0 bytes.
+//
+// seal() renames live.dat to seg-N.dat and calls newLiveFile(), which
+// os.Create()s a fresh live.dat (0 bytes on disk) and writes the
+// 24-byte header into the BFile *buffer*.  A crash in that window
+// leaves live.dat existing at 0 bytes.
+//
+// Abandoning the store without Close reproduces exactly that on-disk
+// state, so this needs no SIGKILL.
+func TestSegmentStoreLiveTailAfterInterruptedSeal(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	k1, v1 := [32]byte{1}, []byte("first")
+	require.NoError(t, store.Put(k1, v1))
+	_, err = store.Seal(1)
+	require.NoError(t, err)
+
+	// The crash window: live.dat exists, header still only in memory
+	fi, err := os.Stat(filepath.Join(dir, segLiveName))
+	require.NoError(t, err, "live.dat must exist after a seal")
+	require.Equal(t, int64(0), fi.Size(), "live.dat is 0 bytes: header is buffered, not written")
+
+	// Crash here: `store` is abandoned, never closed.
+
+	s2, err := OpenSegmentStore(dir)
+	require.NoError(t, err, "reopen must succeed")
+	k2, v2 := [32]byte{2}, []byte("written after the crash, then durably closed")
+	require.NoError(t, s2.Put(k2, v2))
+	require.NoError(t, s2.Close(), "Close is the durability point")
+
+	// k2 was written and Close returned.  The contract says it survives.
+	s3, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	got, err := s3.Get(k2)
+	require.NoError(t, err, "key lost after a completed Close")
+	require.Equal(t, v2, got)
+
+	// k1 was sealed before the crash and must also survive
+	got1, err := s3.Get(k1)
+	require.NoError(t, err, "sealed key lost")
+	require.Equal(t, v1, got1)
+	require.NoError(t, s3.Close())
+}
+
+// TestSegmentStoreClosedRejectsOperations
+// Regression test: Close() drops the sealed segment list but leaves
+// the live map populated.  Without a closed guard, a Seal or Compact
+// after Close commits a manifest built from no segments at all, and
+// the next open deletes every segment that manifest no longer names.
+func TestSegmentStoreClosedRejectsOperations(t *testing.T) {
+	dir := storeDir(t, "closed")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{57})
+	keys := make([][32]byte, 250)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, store.Put(keys[i], []byte("v")))
+		if (i+1)%50 == 0 {
+			_, err = store.SealNext()
+			require.NoError(t, err)
+		}
+	}
+	sealed := len(store.segments)
+	require.Equal(t, 5, sealed, "expected five sealed segments")
+	require.NoError(t, store.Close())
+
+	// Every operation must refuse rather than run against half a store
+	_, err = store.Get(keys[0])
+	require.ErrorIs(t, err, errStoreClosed, "Get on a closed store")
+	require.ErrorIs(t, store.Put(kr.NextHash(), []byte("v")), errStoreClosed, "Put on a closed store")
+	_, err = store.Seal(99)
+	require.ErrorIs(t, err, errStoreClosed, "Seal on a closed store")
+	_, err = store.SealNext()
+	require.ErrorIs(t, err, errStoreClosed, "SealNext on a closed store")
+	_, err = store.Compact(99)
+	require.ErrorIs(t, err, errStoreClosed, "Compact on a closed store")
+	_, err = store.CompactNext()
+	require.ErrorIs(t, err, errStoreClosed, "CompactNext on a closed store")
+
+	// and nothing they did may have reached the manifest
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.Len(t, reopened.segments, sealed, "sealed segments lost")
+	for i, key := range keys {
+		got, err := reopened.Get(key)
+		require.NoErrorf(t, err, "key %d lost", i)
+		require.Equal(t, []byte("v"), got)
+	}
+	require.NoError(t, reopened.Close())
+}
+
+// TestSegmentStoreTornTailIsTruncated
+// Regression test: openLive stops replaying at a torn record, but the
+// bytes stay on disk unless it also truncates.  Left in place, the
+// next append lands after them, so the following open reads the torn
+// record's key as a record header and mis-parses everything written
+// since -- losing records that a completed Close made durable.
+func TestSegmentStoreTornTailIsTruncated(t *testing.T) {
+	dir := storeDir(t, "torn")
+	store, err := NewSegmentStore(dir, true) // Mutable, as the Dyna layer is
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{7})
+	before := make([][32]byte, 5)
+	for i := range before {
+		before[i] = kr.NextHash()
+		require.NoError(t, store.Put(before[i], []byte("value-before")))
+	}
+	require.NoError(t, store.Close())
+
+	// The crash: a record header reached disk, its value bytes did not
+	livePath := filepath.Join(dir, segLiveName)
+	f, err := os.OpenFile(livePath, os.O_RDWR|os.O_APPEND, 0644)
+	require.NoError(t, err)
+	var hdr [segRecHdrSize]byte
+	tornKey := kr.NextHash()
+	copy(hdr[:32], tornKey[:])
+	binary.BigEndian.PutUint64(hdr[32:], 500) // Claims 500 value bytes that never arrived
+	_, err = f.Write(hdr[:])
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Reopen, write more, and close durably
+	s2, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	after := make([][32]byte, 5)
+	for i := range after {
+		after[i] = kr.NextHash()
+		require.NoError(t, s2.Put(after[i], []byte("value-after")))
+	}
+	require.NoError(t, s2.Close())
+
+	// Everything durable must read back
+	s3, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	for i, key := range before {
+		got, err := s3.Get(key)
+		require.NoErrorf(t, err, "pre-crash key %d lost", i)
+		require.Equal(t, []byte("value-before"), got)
+	}
+	for i, key := range after {
+		got, err := s3.Get(key)
+		require.NoErrorf(t, err, "post-crash key %d lost", i)
+		require.Equal(t, []byte("value-after"), got)
+	}
+	_, err = s3.Get(tornKey)
+	require.Error(t, err, "the torn record must not resolve")
+	require.NoError(t, s3.Close())
 }
