@@ -29,14 +29,15 @@ import (
 //	seg-<height>.idx    its key index: sorted 48-byte records + a bloom
 //	segments.json       the manifest: the segments, counts, and hashes
 //
-// What this buys over the kfile/history/values arrangement:
+// What this buys over the v1 kfile/history/values arrangement it
+// replaced (removed; see docs/design/segment-store.md):
 //
 //   - Sync is a file copy.  A sealed .dat is byte-identical to what a
 //     peer sends; importing means copying the file, building its index,
 //     and committing one manifest update -- no re-inserting records.
-//   - No move-and-rewrite.  history.dat relocates whole key bins when
-//     they grow (UpdateKeySet); sealed segments never move, so writes
-//     cost what they weigh.
+//   - No move-and-rewrite.  v1's history.dat relocated whole key bins
+//     when they grew; sealed segments never move, so writes cost what
+//     they weigh.
 //   - Compaction is crash-atomic (issue #19).  A compaction writes a
 //     new sealed generation and commits by replacing the manifest --
 //     one atomic rename.  There is no window where keys and values
@@ -79,8 +80,9 @@ type SegmentMeta struct {
 // The authoritative list of a store's sealed segments.  Replacing it
 // is the commit point for both sealing and compaction.
 type StoreManifest struct {
-	Mutable  bool          `json:"mutable"`
-	Segments []SegmentMeta `json:"segments"` // Oldest first
+	Mutable   bool          `json:"mutable"`
+	SealLimit uint64        `json:"sealLimit"` // 0: unset, caller decides
+	Segments  []SegmentMeta `json:"segments"`  // Oldest first
 }
 
 // segment
@@ -153,6 +155,13 @@ type SegmentStore struct {
 	Directory string
 	Mutable   bool // Mutable: newer segments shadow older; immutable: conflicts error
 
+	// SealLimit is the live-tail bound this store was configured with.
+	// The store records and restores it but does not act on it: KV2
+	// owns the decision to seal (sealPermIfFull/sealDynaIfFull), and
+	// before this was persisted a reopened database silently fell back
+	// to a default, discarding the only parameter its constructor takes.
+	SealLimit uint64
+
 	segments    []*segment           // Sealed segments, oldest first
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
@@ -204,6 +213,19 @@ func OpenSegmentStore(directory string) (store *SegmentStore, err error) {
 	return store, nil
 }
 
+// SetSealLimit
+// Record the live-tail bound in the manifest so a reopened store
+// reports the value it was built with rather than a default.
+func (s *SegmentStore) SetSealLimit(limit uint64) (err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if err = s.checkOpen(); err != nil {
+		return err
+	}
+	s.SealLimit = limit
+	return s.writeManifest()
+}
+
 // Open
 // Reopen a closed store.  Cheap and safe to call on an open store,
 // which callers on the hot path rely on.
@@ -229,6 +251,7 @@ func (s *SegmentStore) load() (err error) {
 		return err
 	}
 	s.Mutable = m.Mutable
+	s.SealLimit = m.SealLimit
 
 	for _, meta := range m.Segments {
 		seg, err := s.openSegment(meta)
@@ -457,7 +480,7 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 // Replace the manifest atomically.  This is the commit point for
 // sealing, importing, and compaction.
 func (s *SegmentStore) writeManifest() (err error) {
-	m := StoreManifest{Mutable: s.Mutable}
+	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}
@@ -1221,6 +1244,21 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 		offset = valueOffset + length
 	}
 	return writeIndexFile(indexPath, order, entries)
+}
+
+// recordSort
+// Sorts a buffer of 48-byte key records in place by their 32-byte key
+type recordSort []byte
+
+func (r recordSort) Len() int { return len(r) / DBKeyFullSize }
+func (r recordSort) Less(i, j int) bool {
+	return bytes.Compare(r[i*DBKeyFullSize:i*DBKeyFullSize+32], r[j*DBKeyFullSize:j*DBKeyFullSize+32]) < 0
+}
+func (r recordSort) Swap(i, j int) {
+	var tmp [DBKeyFullSize]byte
+	copy(tmp[:], r[i*DBKeyFullSize:])
+	copy(r[i*DBKeyFullSize:(i+1)*DBKeyFullSize], r[j*DBKeyFullSize:])
+	copy(r[j*DBKeyFullSize:(j+1)*DBKeyFullSize], tmp[:])
 }
 
 // writeIndexFile

@@ -22,9 +22,9 @@ func TestSegmentRoundTrip(t *testing.T) {
 		defer os.RemoveAll(d)
 	}
 
-	// Node A: two "blocks" of writes.  KeyLimit 50 forces history
-	// pushes, so exported keys come from both the kfile and history.
-	nodeA, err := NewKVShard(dirA, 16, 50, 5)
+	// Node A: two "blocks" of writes.  A seal limit of 50 forces
+	// auto-seals, so a block exports more than one segment per shard.
+	nodeA, err := NewKVShard(dirA, 50)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{91})
@@ -62,7 +62,7 @@ func TestSegmentRoundTrip(t *testing.T) {
 	assert.Equal(t, uint64(300), c2, "block 2 record count")
 
 	// Node B: verify + import in height order
-	nodeB, err := NewKVShard(dirB, 16, 50, 5)
+	nodeB, err := NewKVShard(dirB, 50)
 	require.NoError(t, err)
 	n1, err := nodeB.ImportBlock(filepath.Join(exportDir, "block-00000001"))
 	require.NoError(t, err, "import block 1")
@@ -103,7 +103,7 @@ func TestSegmentTamperDetection(t *testing.T) {
 		defer os.RemoveAll(d)
 	}
 
-	nodeA, err := NewKVShard(dirA, 16, 1000, 5)
+	nodeA, err := NewKVShard(dirA, 1000)
 	require.NoError(t, err)
 	kr := NewFastRandom([]byte{92})
 	vr := NewFastRandom([]byte{92, 92})
@@ -129,7 +129,7 @@ func TestSegmentTamperDetection(t *testing.T) {
 	data[len(data)/2] ^= 0xFF
 	require.NoError(t, os.WriteFile(target, data, 0644))
 
-	nodeB, err := NewKVShard(dirB, 16, 1000, 5)
+	nodeB, err := NewKVShard(dirB, 1000)
 	require.NoError(t, err)
 	_, err = nodeB.ImportBlock(blockDir)
 	require.Error(t, err, "tampered segment must fail verification")
@@ -148,7 +148,7 @@ func TestSegmentImmutableConflict(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer os.RemoveAll(exportDir)
 
-	nodeA, err := NewKVShard(filepath.Join(dir, "A"), 16, 1000, 5)
+	nodeA, err := NewKVShard(filepath.Join(dir, "A"), 1000)
 	require.NoError(t, err)
 	kr := NewFastRandom([]byte{93})
 	key := kr.NextHash()
@@ -157,7 +157,7 @@ func TestSegmentImmutableConflict(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, nodeA.Close())
 
-	nodeB, err := NewKVShard(filepath.Join(dir, "B"), 16, 1000, 5)
+	nodeB, err := NewKVShard(filepath.Join(dir, "B"), 1000)
 	require.NoError(t, err)
 	require.NoError(t, nodeB.PutPerm(key, []byte("a conflicting value")))
 	_, err = nodeB.ImportBlock(filepath.Join(exportDir, "block-00000001"))

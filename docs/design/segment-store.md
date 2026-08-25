@@ -66,9 +66,9 @@ snapshots rather than syncing segment by segment. Hashing them would
 cost a full read of the store on every seal and every open, to verify
 bytes against nothing.
 
-**No move-and-rewrite.** `HistoryFile.UpdateKeySet` relocates a whole
-key bin whenever it outgrows its slot. Sealed segments never move, so
-a write costs what it weighs.
+**No move-and-rewrite.** v1's `HistoryFile.UpdateKeySet` relocated a
+whole key bin whenever it outgrew its slot. Sealed segments never
+move, so a write costs what it weighs.
 
 **Compaction is crash-atomic (issue #19).** `Compact(height)` writes a
 new generation holding only live keys, fsyncs it, and commits by
@@ -130,7 +130,7 @@ record from a crash mid-write is dropped.
    count flat while the tail — replayed in full on every open — grew
    without bound.
 
-   Measured on the layer's own workload (`TestDynaCostComparison`:
+   Measured on the layer's own workload (`TestDynaCost`:
    400,000 writes over 50,000 keys, compacting every 100,000):
 
    | | puts/s | on disk |
@@ -143,11 +143,36 @@ record from a crash mid-write is dropped.
    value carries in a segment; v1 stores values bare and keeps its keys
    in a separate file.
 
-3. Next — delete the now-unused Perm paths in `KFile`/`HistoryFile`
-   (`PushHistory` and the bin relocation logic), and drop `offsetsCnt`
-   and `MaxCachedBlocks` from `NewKV2`/`NewKVShard`, which no longer
-   reach anything.
-4. Then — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
+3. **Done** — v1 is gone. Nothing on the database's path reached
+   `KV`, `KFile`, or `HistoryFile` any more, so `PushHistory` and the
+   bin relocation logic went with the layer they belonged to, along
+   with `offsetsCnt` and `MaxCachedBlocks`, which no longer reached
+   anything: `NewKV2(directory, sealLimit)` and
+   `NewKVShard(directory, sealLimit)` are the constructors now.
+
+   `ShardIndex` and `recordSort` moved to the files that still use
+   them.  `DefaultBloomCapacity` moved to `bloomset.go` for lack
+   of a better home: despite the name, nothing sizes a filter with it
+   -- segments size theirs from their own key count -- and its only
+   consumer is `KV2.Open`, as the fallback for a store written before
+   `SealLimit` was persisted.  Renaming it is follow-up work.
+
+   `SealLimit` itself is now persisted in each layer's manifest
+   alongside `Mutable`.  It had not been, which would have made
+   retiring v1 a regression rather than a simplification: v1's `Header`
+   round-tripped the equivalent `KeyLimit`, so deleting v1 deleted the
+   last implementation of that guarantee.  `NewKV2` also rejects a
+   limit above `MaxInt32`, which used to narrow to a negative number
+   and silently disable sealing altogether.
+
+   The measurement tests that compared the
+   two layers kept their v2 halves (`TestSyncCost`, `TestDynaCost`);
+   the numbers in this document are the last measured comparison, and
+   reproducing them means checking out a commit before the removal.
+   `TestCrashRecovery` was retargeted from `KV` to `KV2` rather than
+   deleted, so the SIGKILL durability contract is still enforced end
+   to end.
+4. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
 Not yet done here: a per-segment key count cap (segments grow with the

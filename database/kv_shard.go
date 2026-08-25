@@ -1,12 +1,23 @@
 package blockchainDB
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
 const NumShards = 512
+
+// indexShards is the byte offset of the 32-bit field in a key that
+// selects its shard
+const indexShards = 4
+
+// ShardIndex
+// Returns the shard a key routes to
+func ShardIndex(key []byte) int {
+	return int(binary.BigEndian.Uint32(key[indexShards:]) % NumShards)
+}
 
 // KVShard
 // A sharded KV database.  Keys route to one of NumShards KV2 instances
@@ -15,7 +26,7 @@ const NumShards = 512
 // Concurrency: KVShard methods are safe for concurrent use.  The Shards
 // array is fixed after creation, and each KV2 serializes access with its
 // own mutex - so operations on different shards run in parallel, while
-// operations on the same shard are serialized.  (KV, KFile, and BFile
+// operations on the same shard are serialized.  (BFile and SegmentStore
 // are NOT safe for concurrent use on their own; they rely on the KV2
 // lock when accessed through this layer.)
 type KVShard struct {
@@ -48,7 +59,11 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 // NewKVShard
 // Create a new KVShard database.  This database creates database shards to
 // reduce the overhead of compressing large database files.
-func NewKVShard(directory string, offsetsCnt, keyLimit uint64, MaxCachedBlocks int) (kvs *KVShard, err error) {
+//
+// This DESTROYS any existing database in directory.  Use OpenKVShard to
+// reopen one.  sealLimit is recorded in each shard's manifest, so
+// OpenKVShard restores it.
+func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 	os.RemoveAll(directory)                                    // Get rid of any existing directory
 	if err = os.MkdirAll(directory, os.ModePerm); err != nil { // Make the directory
 		return nil, err
@@ -58,7 +73,7 @@ func NewKVShard(directory string, offsetsCnt, keyLimit uint64, MaxCachedBlocks i
 	kvs.Directory = directory   // Keep the directory
 	for i := range kvs.Shards { // Then create all the shards
 		shardDir := kvs.ShardDir(i)
-		if kvs.Shards[i], err = NewKV2(shardDir, offsetsCnt, keyLimit, MaxCachedBlocks); err != nil { // Create the KV2 for each shard
+		if kvs.Shards[i], err = NewKV2(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
 			return nil, err
 		}
 	}

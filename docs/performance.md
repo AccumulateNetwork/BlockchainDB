@@ -1,137 +1,158 @@
 # BlockchainDB Performance Guide
 
-This guide provides information about optimizing performance and understanding the trade-offs in different usage scenarios for BlockchainDB.
+This guide covers the knobs that affect BlockchainDB's performance and
+the trade-offs behind them.
 
 ## Performance Characteristics
 
-BlockchainDB is designed with specific performance characteristics that make it well-suited for blockchain applications:
+1. **Writes are appends.**  A `Put` appends a record to the live tail
+   and inserts into a map.  Nothing already written is moved or
+   rewritten, so a write costs what it weighs no matter how much the
+   database already holds.
 
-1. **Optimized for Write-Once, Read-Many**: The database structure is optimized for scenarios where data is written once and read many times, which is common in blockchain applications.
+2. **Reads are bounded by segment count, not key count.**  A lookup
+   checks the live tail, then each sealed segment newest to oldest.
+   Every segment carries a Bloom filter sized from its own key count,
+   so a segment that does not hold the key is rejected from memory.
 
-2. **Efficient Key Lookups**: The key organization strategy in KFile enables efficient key lookups, which is critical for blockchain state verification.
+3. **Sync is a file copy.**  Sealed segments are the storage format
+   *and* the transport format, so adopting a peer's segment is a copy
+   plus one manifest commit -- not a re-insertion of every record.
+   The cost does not grow with what the receiving node already holds.
 
-3. **Reduced Disk I/O**: The buffered file implementation significantly reduces disk I/O operations, improving overall performance.
+4. **Shards give you cores.**  Keys route to one of 512 shards by
+   `ShardIndex`, and each shard has its own lock, so writes to
+   different shards proceed in parallel.
 
-4. **Historical State Access**: When enabled, the history tracking mechanism provides efficient access to historical states, which is essential for blockchain applications.
+Measured on the running database (see
+[Segments as storage](design/segment-store.md) for methodology):
+
+| | puts/s |
+|---|---|
+| Perm writes, 1 goroutine | 1,299,000 |
+| Perm writes, 16 goroutines | 11,328,000 |
+| Dyna writes with compaction | 223,000-248,000 |
 
 ## Performance Tuning Parameters
 
-Several parameters can be tuned to optimize BlockchainDB performance for specific use cases:
+### Seal Limit
+
+`NewKVShard(directory, sealLimit)` sets the point at which a layer
+seals its live tail into an immutable segment.  It is the main knob:
+
+- **Higher** means fewer, larger segments.  Lookups check fewer
+  segments, and sealing happens less often -- but the unsealed tail
+  (and the memory tracking it) is bigger, and it is replayed in full
+  on every open.
+- **Lower** means a bounded tail and a fast open, at the cost of more
+  segments to search and more time spent sealing.
+
+The Perm layer seals on distinct keys; the Dyna layer seals on
+*physical records*, because a mutable layer leaves one record per
+write and a handful of hot keys rewritten every block would hold the
+key count flat while the tail grew without bound.
 
 ### Buffer Size
 
-The `BufferSize` constant (default: 32KB) determines the size of the buffer used for file I/O operations. Increasing this value can improve performance for write-heavy workloads but increases memory usage.
+The `BufferSize` constant (default: 32KB) is the buffer `BFile` uses
+for I/O.  Increasing it can help write-heavy workloads at the cost of
+memory.
 
-### Maximum Cached Blocks
+### Block Cadence
 
-The `MaxCachedBlocks` parameter controls how many blocks are cached in memory before being flushed to disk. Higher values improve write performance but increase memory usage.
-
-### Key Limit
-
-The `KeyLimit` parameter determines how many keys are stored in the KFile before being pushed to the history file. Higher values can improve write performance but may increase memory usage during history pushes.
-
-### Offset Count
-
-The `OffsetCnt` parameter affects how keys are organized in the KFile and HistoryFile. Higher values can improve lookup performance but increase memory usage.
+`SealBlock(height)` is the durability point for permanent data and the
+boundary a peer syncs.  Sealing is where the Perm layer's time goes --
+about 60% of it at a 25,000-key block, most of that the SHA-256
+read-back of the segment just written.  Sealing more often costs more
+of that; sealing less often makes blocks coarser for peers.
 
 ## Performance Optimization Strategies
 
-### 1. Tune Memory Usage
+### 1. Put immutable data in Perm
 
-Balance memory usage with performance by adjusting the buffer size and maximum cached blocks based on your available memory and workload characteristics.
+The Perm layer assumes values never change, which is what lets it
+append without a read-modify-write.  Content-addressed data -- keyed
+by its own hash -- belongs there.  State that changes belongs in Dyna.
 
-```go
-// Example: Increase buffer size for write-heavy workloads with ample memory
-const BufferSize = 1024 * 64 // 64KB instead of 32KB
+### 2. Compact Dyna, not Perm
 
-// Example: Reduce cached blocks for memory-constrained environments
-kv, err := blockchainDB.NewKV(
-    true,
-    "/path/to/db",
-    1024,
-    10000,
-    50, // Reduced from default 100
-)
-```
-
-### 2. Disable History for Read-Only Use Cases
-
-If historical state access is not required, disabling history tracking can significantly improve performance and reduce storage requirements.
+`Compress()` writes a new sealed generation of the Dyna layer and
+commits it with a single manifest rename, reclaiming the space that
+overwritten values still occupy.  It is proportional to live data, so
+run it on a cadence tied to write volume rather than on every block.
+It is a no-op on the Perm layer, which has nothing to reclaim.
 
 ```go
-// Example: Create KV without history
-kv, err := blockchainDB.NewKV(
-    false, // Disable history
-    "/path/to/db",
-    1024,
-    10000,
-    100,
-)
-```
-
-### 3. Batch Operations
-
-When performing multiple operations, batch them together to minimize disk I/O.
-
-```go
-// Example: Batch multiple put operations
-for _, item := range items {
-    kv.Put(item.Key, item.Value)
-    // No intermediate flush or close operations
-}
-// Single close operation after all puts
-kv.Close()
-```
-
-### 4. Use Compression Strategically
-
-The `Compress()` method can reclaim space from deleted or updated values, but it's an expensive operation. Use it strategically during low-usage periods.
-
-```go
-// Example: Compress during off-peak hours
-if isOffPeakHours() {
-    kv.Compress()
+// Example: compact once per N writes rather than per block
+if writes%compactEvery == 0 {
+    kvs.Compress()
 }
 ```
+
+### 3. Write from multiple goroutines
+
+Shards are independently locked, so concurrent writers scale until
+they saturate the disk.  `ShardWriter` does this for you; see
+[Multi-core ingest](design/multicore-ingest.md).
+
+### 4. Batch before closing
+
+`Close` is the durability point.  Put everything, then close once --
+an intermediate close forces a flush and sync that the next write
+would otherwise have amortized.
 
 ## Performance Benchmarks
 
-The BlockchainDB test suite includes benchmarks that can be used to measure performance on your specific hardware and with your specific configuration.
+The test suite includes benchmarks and measurement tests you can run
+on your own hardware:
 
 ```bash
-# Run benchmarks
-go test -bench=. github.com/AccumulateNetwork/BlockchainDB/database
+# Benchmarks
+go test -bench=. ./database/
+
+# Measurement tests (skipped with -short)
+go test -run 'TestSyncCost|TestDynaCost|TestMultiCoreScaling' -v ./database/
+
+# The multi-GB load tests are opt-in
+go test -load ./database/
 ```
 
 ## Common Performance Issues and Solutions
 
-### Issue: Slow Key Lookups
+### Issue: Slow key lookups
 
 **Possible causes:**
-- Inefficient offset count
-- Large number of keys in a single section
+- Many small segments, because `sealLimit` is too low
+- A compaction that has not run, leaving stale generations to search
 
 **Solutions:**
-- Increase the offset count to distribute keys more evenly
-- Ensure keys are well-distributed across the hash space
+- Raise `sealLimit` so seals produce fewer, larger segments
+- Run `Compress()` on the Dyna layer
 
-### Issue: High Memory Usage
+### Issue: Slow open
+
+**Possible cause:** a large unsealed live tail, which is replayed
+record by record on open.
+
+**Solution:** lower `sealLimit`, or seal on a block boundary, so the
+tail stays bounded.
+
+### Issue: High memory usage
 
 **Possible causes:**
-- Too many cached blocks
-- Large buffer size
+- A large live tail: every unsealed record is tracked in a map
+- Bloom filters, which are sized from each segment's key count
 
 **Solutions:**
-- Reduce the maximum cached blocks
-- Consider reducing the buffer size if memory constraints are severe
+- Lower `sealLimit`
+- Reduce `BufferSize` if memory is severely constrained
 
-### Issue: Slow Write Performance
+### Issue: Slow write performance
 
 **Possible causes:**
-- Frequent flushing to disk
-- Small buffer size
+- Sealing too often
+- A single writer goroutine leaving shards idle
 
 **Solutions:**
-- Increase the buffer size
-- Increase the maximum cached blocks
-- Batch operations where possible
+- Raise `sealLimit` or lengthen the block cadence
+- Write concurrently; see [Multi-core ingest](design/multicore-ingest.md)

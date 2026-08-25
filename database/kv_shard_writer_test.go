@@ -22,7 +22,7 @@ func TestShardWriter(t *testing.T) {
 	os.RemoveAll(dir)
 	defer os.RemoveAll(dir)
 
-	kvs, err := NewKVShard(dir, 64, 10_000, 5)
+	kvs, err := NewKVShard(dir, 10_000)
 	require.NoError(t, err, "create kvshard")
 
 	writer := kvs.NewShardWriter(8, 256)
@@ -97,7 +97,7 @@ func TestShardWriterConcurrentProducers(t *testing.T) {
 	os.RemoveAll(dir)
 	defer os.RemoveAll(dir)
 
-	kvs, err := NewKVShard(dir, 64, 10_000, 5)
+	kvs, err := NewKVShard(dir, 10_000)
 	require.NoError(t, err, "create kvshard")
 	writer := kvs.NewShardWriter(8, 64)
 
@@ -135,8 +135,8 @@ func TestMultiCoreScaling(t *testing.T) {
 	const warmupOps = 100_000 // Untimed; faults in the fresh Bloom filter pages
 	const minVal, maxVal = 100, 500
 
-	// First-touch page faults on the 10MB-per-KFile Bloom filters (issue
-	// #12) dominate a cold KVShard, so each configuration warms up with
+	// First-touch page faults on the per-shard Bloom filters (issue #12)
+	// dominate a cold KVShard, so each configuration warms up with
 	// untimed puts before the measured run.
 	warmup := func(kvs *KVShard) {
 		kr := NewFastRandom([]byte{61})
@@ -151,7 +151,7 @@ func TestMultiCoreScaling(t *testing.T) {
 		dir := filepath.Join(os.TempDir(), fmt.Sprintf("Scale_sync_%d", workers))
 		os.RemoveAll(dir)
 		defer os.RemoveAll(dir)
-		kvs, err := NewKVShard(dir, 1024, 100_000, 50)
+		kvs, err := NewKVShard(dir, 100_000)
 		require.NoError(t, err)
 		defer kvs.Close()
 		warmup(kvs)
@@ -182,7 +182,7 @@ func TestMultiCoreScaling(t *testing.T) {
 		dir := filepath.Join(os.TempDir(), fmt.Sprintf("Scale_async_%d", workers))
 		os.RemoveAll(dir)
 		defer os.RemoveAll(dir)
-		kvs, err := NewKVShard(dir, 1024, 100_000, 50)
+		kvs, err := NewKVShard(dir, 100_000)
 		require.NoError(t, err)
 		defer kvs.Close()
 		warmup(kvs)

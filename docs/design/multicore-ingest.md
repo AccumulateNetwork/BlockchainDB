@@ -66,7 +66,8 @@ values 100–500 B, 512 shards, warmed Bloom filters, buffered writes
 | async, 1 producer, 8 workers |  2,624,000 |      2.0× |
 
 (Perm writes, measured after the Perm layer moved to sealed segments;
-the same run against the kfile+history layer peaked at 3.67M/s.)
+the same run against the v1 kfile+history layer peaked at 3.67M/s.
+v1 has since been removed.)
 
 Notes:
 
@@ -80,9 +81,8 @@ Notes:
   sends is the fix if it ever matters.
 - Cold-start caveat (resolved by #12): fixed 10 MB Bloom filters made
   first-touch page faults dominate a cold `KVShard`. Filters are now
-  layered and sized from the key count (~300 KB initial per KFile),
-  and persisted at push time so opens load them instead of scanning
-  history.
+  layered and sized from the key count, and each sealed segment
+  carries its own, so opens load them instead of rebuilding them.
 
 ## Future work
 

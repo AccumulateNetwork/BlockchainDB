@@ -2,6 +2,8 @@ package blockchainDB
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -62,11 +64,20 @@ type KV2 struct {
 // This design efficiently separates immutable data (content-addressed storage)
 // from mutable data (state storage) in a blockchain-style database.
 //
-// KeyLimit sets SealLimit, the point at which a layer seals its live tail.
-// offsetsCnt and MaxCachedBlocks configured the KFile both layers used to be
-// built on; neither layer reads them now.  They are kept in the signature so
-// callers need not change ahead of the KFile removal.
-func NewKV2(directory string, offsetsCnt, KeyLimit uint64, MaxCachedBlocks int) (kv2 *KV2, err error) {
+// sealLimit sets SealLimit, the point at which a layer seals its live
+// tail.  It is recorded in the layers' manifests, so OpenKV2 restores
+// it; only a store written before the field existed falls back to
+// DefaultBloomCapacity.
+//
+// This DESTROYS any existing database in directory.  Use OpenKV2 to
+// reopen one.
+func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
+	// SealLimit is an int, and sealPermIfFull/sealDynaIfFull read
+	// "<= 0" as sealing disabled, so a large limit would silently mean
+	// never seal -- an unbounded live tail replayed in full on open
+	if sealLimit > math.MaxInt32 {
+		return nil, fmt.Errorf("sealLimit %d is too large (max %d)", sealLimit, math.MaxInt32)
+	}
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
 		return nil, err
@@ -80,7 +91,16 @@ func NewKV2(directory string, offsetsCnt, KeyLimit uint64, MaxCachedBlocks int) 
 	if kv2.DynaKV, err = NewSegmentStore(filepath.Join(directory, DynaDirName), true); err != nil {
 		return nil, err
 	}
-	kv2.SealLimit = int(KeyLimit)
+	kv2.SealLimit = int(sealLimit)
+	// Record it durably: it is the only parameter either public
+	// constructor takes, and a reopened database used to fall back to a
+	// default and discard it silently
+	if err = kv2.PermKV.SetSealLimit(sealLimit); err != nil {
+		return nil, err
+	}
+	if err = kv2.DynaKV.SetSealLimit(sealLimit); err != nil {
+		return nil, err
+	}
 	return kv2, nil
 }
 
@@ -105,7 +125,13 @@ func (k *KV2) Open() error {
 		return err
 	}
 	if k.SealLimit == 0 {
-		k.SealLimit = int(DefaultBloomCapacity) // Reopened stores: a sane default
+		// Restore what the database was built with; only a store
+		// predating the persisted field falls back to a default
+		if limit := k.PermKV.SealLimit; limit > 0 {
+			k.SealLimit = int(limit)
+		} else {
+			k.SealLimit = int(DefaultBloomCapacity)
+		}
 	}
 	return k.DynaKV.Open()
 }
@@ -260,7 +286,7 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 // before the manifest names it, so there is no window in which keys
 // and values disagree (issue #19); a crash before the commit costs
 // only the space the old generation still occupies, which the next
-// compaction reclaims.  The KFile-based Compress this replaced swapped
+// compaction reclaims.  The v1 kfile Compress this replaced swapped
 // the values file and rewrote the key offsets as two separate steps,
 // and a crash between them left keys pointing into the wrong layout --
 // reads returned wrong bytes with no error.

@@ -20,7 +20,7 @@ func dynaDir(kv2 *KV2) string { return filepath.Join(kv2.Directory, DynaDirName)
 // values file in place.
 func TestDynaCompressReclaims(t *testing.T) {
 	dir := storeDir(t, "kv2")
-	kv2, err := NewKV2(dir, 16, 500, 5) // SealLimit 500 records
+	kv2, err := NewKV2(dir, 500) // SealLimit 500 records
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{201})
@@ -72,7 +72,7 @@ func TestDynaCompressReclaims(t *testing.T) {
 // whose keys rarely repeat hits this path often.
 func TestDynaCompressIsIdempotent(t *testing.T) {
 	dir := storeDir(t, "kv2")
-	kv2, err := NewKV2(dir, 16, 1000, 5)
+	kv2, err := NewKV2(dir, 1000)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{202})
@@ -109,7 +109,7 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 func TestDynaLiveTailBounded(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	const sealLimit = 100
-	kv2, err := NewKV2(dir, 16, sealLimit, 5)
+	kv2, err := NewKV2(dir, sealLimit)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{203})
@@ -146,7 +146,7 @@ func TestDynaLiveTailBounded(t *testing.T) {
 func TestDynaCompressCrashMidway(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	crashed := storeDir(t, "crashed")
-	kv2, err := NewKV2(dir, 16, 200, 5)
+	kv2, err := NewKV2(dir, 200)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{204})
@@ -213,7 +213,7 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 // which is still on disk underneath it.
 func TestKV2PermOverwriteSurvivesCompress(t *testing.T) {
 	dir := storeDir(t, "kv2")
-	kv2, err := NewKV2(dir, 16, 100, 5)
+	kv2, err := NewKV2(dir, 100)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{205})

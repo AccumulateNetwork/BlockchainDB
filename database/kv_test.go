@@ -19,7 +19,7 @@ func TestKV(t *testing.T) {
 	var cntWrites, cntReads float64
 
 	fr := NewFastRandom([]byte{1})
-	kv, err := NewKVShard(dir, 1024, 100_000, 50)
+	kv, err := NewKVShard(dir, 100_000)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")
@@ -76,7 +76,7 @@ func TestKV_2(t *testing.T) {
 	frKeys := NewFastRandom([]byte{1})
 	frValues := NewFastRandom([]byte{2})
 
-	kv2, err := NewKV2(dir, 1024, 10_000, 50)
+	kv2, err := NewKV2(dir, 10_000)
 	assert.NoError(t, err, "create kv")
 
 	fmt.Print("Writing\n")

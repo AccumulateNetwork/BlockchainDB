@@ -70,39 +70,3 @@ func TestBloomSetSaveLoad(t *testing.T) {
 	loaded.Set(extra)
 	assert.True(t, loaded.Test(extra))
 }
-
-// TestBloomPersistedOpen
-// After history pushes, bloom.dat must exist, and a reopened KFile
-// must find keys via the loaded filter (covering both the persisted
-// layers and the kfile scan for keys added after the last push).
-func TestBloomPersistedOpen(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), t.Name())
-	os.RemoveAll(dir)
-	defer os.RemoveAll(dir)
-
-	kv, err := NewKV(true, dir, 16, 50, 5)
-	require.NoError(t, err)
-	kr := NewFastRandom([]byte{73})
-	vr := NewFastRandom([]byte{73, 73})
-	keys := make([][32]byte, 220) // 220 keys, KeyLimit 50 -> several pushes
-	values := make([][]byte, 220)
-	for i := range keys {
-		keys[i] = kr.NextHash()
-		values[i] = vr.RandBuff(10, 50)
-		require.NoError(t, kv.Put(keys[i], values[i]))
-	}
-	require.NoError(t, kv.Close())
-
-	_, err = os.Stat(filepath.Join(dir, bloomFilename))
-	require.NoError(t, err, "bloom.dat should exist after history pushes")
-
-	kv2, err := OpenKV(dir)
-	require.NoError(t, err)
-	require.NoError(t, kv2.Open())
-	for i := range keys {
-		v, err := kv2.Get(keys[i])
-		require.NoErrorf(t, err, "key %d missing after reopen with persisted bloom", i)
-		assert.Equal(t, values[i], v)
-	}
-	require.NoError(t, kv2.Close())
-}
