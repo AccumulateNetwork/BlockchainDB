@@ -80,8 +80,9 @@ type SegmentMeta struct {
 // The authoritative list of a store's sealed segments.  Replacing it
 // is the commit point for both sealing and compaction.
 type StoreManifest struct {
-	Mutable  bool          `json:"mutable"`
-	Segments []SegmentMeta `json:"segments"` // Oldest first
+	Mutable   bool          `json:"mutable"`
+	SealLimit uint64        `json:"sealLimit"` // 0: unset, caller decides
+	Segments  []SegmentMeta `json:"segments"`  // Oldest first
 }
 
 // segment
@@ -154,6 +155,13 @@ type SegmentStore struct {
 	Directory string
 	Mutable   bool // Mutable: newer segments shadow older; immutable: conflicts error
 
+	// SealLimit is the live-tail bound this store was configured with.
+	// The store records and restores it but does not act on it: KV2
+	// owns the decision to seal (sealPermIfFull/sealDynaIfFull), and
+	// before this was persisted a reopened database silently fell back
+	// to a default, discarding the only parameter its constructor takes.
+	SealLimit uint64
+
 	segments    []*segment           // Sealed segments, oldest first
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
@@ -205,6 +213,19 @@ func OpenSegmentStore(directory string) (store *SegmentStore, err error) {
 	return store, nil
 }
 
+// SetSealLimit
+// Record the live-tail bound in the manifest so a reopened store
+// reports the value it was built with rather than a default.
+func (s *SegmentStore) SetSealLimit(limit uint64) (err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if err = s.checkOpen(); err != nil {
+		return err
+	}
+	s.SealLimit = limit
+	return s.writeManifest()
+}
+
 // Open
 // Reopen a closed store.  Cheap and safe to call on an open store,
 // which callers on the hot path rely on.
@@ -230,6 +251,7 @@ func (s *SegmentStore) load() (err error) {
 		return err
 	}
 	s.Mutable = m.Mutable
+	s.SealLimit = m.SealLimit
 
 	for _, meta := range m.Segments {
 		seg, err := s.openSegment(meta)
@@ -458,7 +480,7 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 // Replace the manifest atomically.  This is the commit point for
 // sealing, importing, and compaction.
 func (s *SegmentStore) writeManifest() (err error) {
-	m := StoreManifest{Mutable: s.Mutable}
+	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}

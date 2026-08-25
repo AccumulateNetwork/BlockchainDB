@@ -151,11 +151,21 @@ record from a crash mid-write is dropped.
    `NewKVShard(directory, sealLimit)` are the constructors now.
 
    `ShardIndex` and `recordSort` moved to the files that still use
-   them.  `DefaultBloomCapacity` moved to `bloomset.go` for lack of a
-   better home: despite the name its only consumer is `KV2.Open`,
-   which uses it as a seal limit for a store reopened without one.
-   Renaming it, and giving `SealLimit` a persisted home, is follow-up
-   work. The measurement tests that compared the
+   them.  `DefaultBloomCapacity` moved to `bloomset.go` for lack
+   of a better home: despite the name, nothing sizes a filter with it
+   -- segments size theirs from their own key count -- and its only
+   consumer is `KV2.Open`, as the fallback for a store written before
+   `SealLimit` was persisted.  Renaming it is follow-up work.
+
+   `SealLimit` itself is now persisted in each layer's manifest
+   alongside `Mutable`.  It had not been, which would have made
+   retiring v1 a regression rather than a simplification: v1's `Header`
+   round-tripped the equivalent `KeyLimit`, so deleting v1 deleted the
+   last implementation of that guarantee.  `NewKV2` also rejects a
+   limit above `MaxInt32`, which used to narrow to a negative number
+   and silently disable sealing altogether.
+
+   The measurement tests that compared the
    two layers kept their v2 halves (`TestSyncCost`, `TestDynaCost`);
    the numbers in this document are the last measured comparison, and
    reproducing them means checking out a commit before the removal.

@@ -38,8 +38,8 @@ func main() {
 	//
 	// sealLimit is the point at which a layer seals its live tail into
 	// an immutable segment: bigger means fewer, larger segments and a
-	// longer replay on open.  It is not persisted, so a reopened
-	// database falls back to a default of 100,000.
+	// longer replay on open.  It is recorded in the database, so
+	// OpenKVShard reopens at the same limit.
 	kvs, err := blockchainDB.NewKVShard(dbDir, 100_000)
 	if err != nil {
 		fmt.Printf("Error creating database: %v\n", err)

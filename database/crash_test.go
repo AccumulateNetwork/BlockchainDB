@@ -101,7 +101,6 @@ func TestCrashChildProcess(t *testing.T) {
 	kv, err := OpenKV2(dir)
 	require.NoError(t, err, "child: open")
 	require.NoError(t, kv.Open(), "child: open files")
-	kv.SealLimit = crashSealLimit
 
 	kr, vr := crashKV(start)
 	const batch = 20

@@ -61,7 +61,8 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 // reduce the overhead of compressing large database files.
 //
 // This DESTROYS any existing database in directory.  Use OpenKVShard to
-// reopen one.  sealLimit is not persisted; see NewKV2.
+// reopen one.  sealLimit is recorded in each shard's manifest, so
+// OpenKVShard restores it.
 func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 	os.RemoveAll(directory)                                    // Get rid of any existing directory
 	if err = os.MkdirAll(directory, os.ModePerm); err != nil { // Make the directory

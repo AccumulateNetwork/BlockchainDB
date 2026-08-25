@@ -2,6 +2,8 @@ package blockchainDB
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -63,12 +65,19 @@ type KV2 struct {
 // from mutable data (state storage) in a blockchain-style database.
 //
 // sealLimit sets SealLimit, the point at which a layer seals its live
-// tail.  It is not persisted: a store reopened with OpenKV2 falls back
-// to DefaultBloomCapacity unless the caller sets SealLimit again.
+// tail.  It is recorded in the layers' manifests, so OpenKV2 restores
+// it; only a store written before the field existed falls back to
+// DefaultBloomCapacity.
 //
 // This DESTROYS any existing database in directory.  Use OpenKV2 to
 // reopen one.
 func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
+	// SealLimit is an int, and sealPermIfFull/sealDynaIfFull read
+	// "<= 0" as sealing disabled, so a large limit would silently mean
+	// never seal -- an unbounded live tail replayed in full on open
+	if sealLimit > math.MaxInt32 {
+		return nil, fmt.Errorf("sealLimit %d is too large (max %d)", sealLimit, math.MaxInt32)
+	}
 	os.RemoveAll(directory)
 	if err = os.Mkdir(directory, os.ModePerm); err != nil {
 		return nil, err
@@ -83,6 +92,15 @@ func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
 		return nil, err
 	}
 	kv2.SealLimit = int(sealLimit)
+	// Record it durably: it is the only parameter either public
+	// constructor takes, and a reopened database used to fall back to a
+	// default and discard it silently
+	if err = kv2.PermKV.SetSealLimit(sealLimit); err != nil {
+		return nil, err
+	}
+	if err = kv2.DynaKV.SetSealLimit(sealLimit); err != nil {
+		return nil, err
+	}
 	return kv2, nil
 }
 
@@ -107,7 +125,13 @@ func (k *KV2) Open() error {
 		return err
 	}
 	if k.SealLimit == 0 {
-		k.SealLimit = int(DefaultBloomCapacity) // Reopened stores: a sane default
+		// Restore what the database was built with; only a store
+		// predating the persisted field falls back to a default
+		if limit := k.PermKV.SealLimit; limit > 0 {
+			k.SealLimit = int(limit)
+		} else {
+			k.SealLimit = int(DefaultBloomCapacity)
+		}
 	}
 	return k.DynaKV.Open()
 }
