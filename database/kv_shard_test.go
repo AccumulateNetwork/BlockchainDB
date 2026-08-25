@@ -68,6 +68,7 @@ func TestKVShard(t *testing.T) {
 }
 
 func TestKVShard_2(t *testing.T) {
+	skipUnlessLoad(t)
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
 	//dir, rm := MakeDir()
@@ -185,6 +186,7 @@ func TestKVShard_2(t *testing.T) {
 }
 
 func TestBuildBig(t *testing.T) {
+	skipUnlessLoad(t)
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
 	const numPermKeys = 200_000_000
@@ -240,6 +242,7 @@ func TestBuildBig(t *testing.T) {
 }
 
 func TestBuildBig2(t *testing.T) {
+	skipUnlessLoad(t)
 	dir := filepath.Join(os.TempDir(), "BigDB")
 
 	const numPermKeys = 20_000_000
