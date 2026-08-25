@@ -152,6 +152,7 @@ type SegmentStore struct {
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
+	closed      bool                 // Set by Close; cleared by Open
 }
 
 // NewSegmentStore
@@ -192,29 +193,54 @@ func (s *SegmentStore) newLiveFile() (err error) {
 // an interrupted seal, and replay the live tail.
 func OpenSegmentStore(directory string) (store *SegmentStore, err error) {
 	store = &SegmentStore{Directory: directory}
-	store.live = make(map[[32]byte]*DBBKey)
-
-	m, err := store.readManifest()
-	if err != nil {
-		return nil, err
-	}
-	store.Mutable = m.Mutable
-
-	for _, meta := range m.Segments {
-		seg, err := store.openSegment(meta)
-		if err != nil {
-			return nil, err
-		}
-		store.segments = append(store.segments, seg)
-	}
-
-	if err = store.recoverOrphans(); err != nil {
-		return nil, err
-	}
-	if err = store.openLive(); err != nil {
+	if err = store.load(); err != nil {
 		return nil, err
 	}
 	return store, nil
+}
+
+// Open
+// Reopen a closed store.  Cheap and safe to call on an open store,
+// which callers on the hot path rely on.
+func (s *SegmentStore) Open() (err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if !s.closed {
+		return nil
+	}
+	return s.load()
+}
+
+// load
+// Read the store off disk.  The caller must hold the Mutex (or hold
+// the only reference, as the constructors do).
+func (s *SegmentStore) load() (err error) {
+	s.live = make(map[[32]byte]*DBBKey)
+	s.segments = nil
+	s.liveRecords = 0
+
+	m, err := s.readManifest()
+	if err != nil {
+		return err
+	}
+	s.Mutable = m.Mutable
+
+	for _, meta := range m.Segments {
+		seg, err := s.openSegment(meta)
+		if err != nil {
+			return err
+		}
+		s.segments = append(s.segments, seg)
+	}
+
+	if err = s.recoverOrphans(); err != nil {
+		return err
+	}
+	if err = s.openLive(); err != nil {
+		return err
+	}
+	s.closed = false
+	return nil
 }
 
 // openSegment opens a sealed segment's data and index files
@@ -488,6 +514,28 @@ func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
 	s.live[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
 	s.liveRecords++
 	return nil
+}
+
+// LiveCount
+// The number of keys in the live tail (not yet sealed)
+func (s *SegmentStore) LiveCount() int {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return len(s.live)
+}
+
+// SealNext
+// Seal the live tail at the next available height.  Used to bound the
+// live tail when no block boundary has arrived; block boundaries call
+// Seal with the block height instead.
+func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
+	s.Mutex.Lock()
+	next := uint64(0)
+	if newest, ok := s.newestHeight(); ok {
+		next = newest + 1
+	}
+	s.Mutex.Unlock()
+	return s.Seal(next)
 }
 
 // Seal
@@ -866,8 +914,60 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	}
 	meta.Count = uint64(seg.count)
 	seg.meta = meta
+
+	// An immutable store must not silently shadow a value it already
+	// holds: that is a divergence, not an update.  Checking is cheap
+	// because the keys a syncing node receives are almost all new --
+	// the existing segments' bloom filters reject them from memory, and
+	// only a bloom hit costs a real lookup.
+	if !s.Mutable {
+		if err = s.checkNoConflicts(seg); err != nil {
+			seg.close()
+			os.Remove(dataPath)
+			os.Remove(indexPath)
+			return err
+		}
+	}
+
 	s.segments = append(s.segments, seg)
 	return s.writeManifest() // Commit
+}
+
+// checkNoConflicts
+// Verify that no key in an incoming segment already has a different
+// value in this store.  The caller must hold the Mutex, and seg must
+// not yet be in s.segments.
+func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
+	const batch = 4096 // Index records read per pass
+	buff := make([]byte, batch*DBKeyFullSize)
+	for i := int64(0); i < seg.count; i += batch {
+		n := seg.count - i
+		if n > batch {
+			n = batch
+		}
+		chunk := buff[:n*DBKeyFullSize]
+		if _, err = seg.index.ReadAt(chunk, segIndexHdrSize+i*DBKeyFullSize); err != nil {
+			return err
+		}
+		for pos := 0; pos+DBKeyFullSize <= len(chunk); pos += DBKeyFullSize {
+			key, dbb, err := GetDBBKey(chunk[pos : pos+DBKeyFullSize])
+			if err != nil {
+				return err
+			}
+			existing, err := s.get(key) // Bloom-gated; no disk I/O unless a filter hits
+			if err != nil {
+				continue // Not held locally: the common case
+			}
+			incoming, err := seg.value(dbb)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(existing, incoming) {
+				return fmt.Errorf("segment conflicts with the value already stored for key %x", key)
+			}
+		}
+	}
+	return nil
 }
 
 // Close
@@ -885,6 +985,7 @@ func (s *SegmentStore) Close() (err error) {
 		seg.close()
 	}
 	s.segments = nil
+	s.closed = true
 	return nil
 }
 

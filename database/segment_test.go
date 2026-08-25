@@ -49,8 +49,8 @@ func TestSegmentRoundTrip(t *testing.T) {
 	m2, err := nodeA.ExportBlock(exportDir, 2, m1)
 	require.NoError(t, err, "export block 2")
 
-	// The two blocks must partition the data: block 2 exports only what
-	// came after block 1
+	// The two blocks must partition the data: block 2 exports only the
+	// segments sealed after block 1
 	var c1, c2 uint64
 	for _, s := range m1.Segments {
 		c1 += s.Count

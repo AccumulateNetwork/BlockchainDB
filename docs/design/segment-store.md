@@ -80,20 +80,44 @@ record from a crash mid-write is dropped.
 
 ## Status and integration path
 
-`SegmentStore` is a complete, tested store, not yet wired in as KV2's
-layers. Migration, in order:
+1. **Done** — `SegmentStore` is KV2's Perm layer. `KV2.Seal(height)` /
+   `KVShard.SealBlock(height)` seal at block boundaries, and the layer
+   auto-seals when its live tail reaches `SealLimit` keys (carried over
+   from `KeyLimit`) so unsealed state stays bounded between blocks.
+   Block export is now seal-then-copy: `ExportBlock` copies the sealed
+   files, and `ImportBlock` adopts them.
 
-1. Use it as the Perm layer behind the existing `KV` interface
-   (`Put`/`Get`/`Close` already match; `Seal` is the added call, at
-   block boundaries).
-2. Use it as the Dyna layer — mutable mode plus `Compact` retires
-   `KV.Compress` and #19 with it.
-3. Retire `kfile.dat`/`history.dat` for Perm data, and with them
-   `PushHistory` and the bin relocation logic.
-4. Wire `ShardWriter.Flush` to `Seal` so a block boundary is one
+   Measured effect on the running database (`TestMultiCoreScaling`,
+   Perm writes, same seal cadence as the old history-push cadence):
+
+   | | before (kfile+history) | after (segments) |
+   |---|---|---|
+   | 1 goroutine | 683,000 puts/s | **1,299,000** |
+   | 16 goroutines | 3,668,000 puts/s | **11,328,000** |
+
+   The Perm write path is now an append plus a map insert: no history
+   push, no kfile rewrite, no bin relocation, and no `Stat` per put.
+
+2. Next — use it as the Dyna layer; mutable mode plus `Compact`
+   retires `KV.Compress` and #19 with it.
+3. Then — delete the now-unused Perm paths in `KFile`/`HistoryFile`
+   (`PushHistory` and the bin relocation logic).
+4. Then — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
 Not yet done here: a per-segment key count cap (segments grow with the
 seal cadence; a size-triggered seal or a tiered merge keeps the
 segment count bounded on long chains), and reading a value with one
 `ReadAt` on the value bytes rather than through the record header.
+
+### Divergence detection on import
+
+Adopting a segment file skips the per-key immutability check that
+re-inserting records performed, so an immutable store verifies the
+incoming keys against what it already holds before committing the
+adoption. That check is bloom-gated: a syncing node's incoming keys
+are almost all new, so the existing segments' filters reject them from
+memory and only a filter hit costs a real lookup. Measured cost is
+within noise of an unchecked import (724K keys/s into a node holding
+600K keys), and a conflicting value fails the import instead of being
+silently shadowed.

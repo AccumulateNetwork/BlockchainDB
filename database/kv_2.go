@@ -13,7 +13,7 @@ const DynaDirName = "dyna"
 // KV2
 // Maintains 2 layers of key value pairs with different immutability characteristics:
 //
-// 1. PermKV (Permanent KV): Uses KFile with history enabled
+// 1. PermKV (Permanent KV): a SegmentStore in immutable mode
 //    - Values are immutable - once a key is associated with a value, it cannot be changed
 //    - Suitable for content-addressed storage where keys are derived from values (e.g., hash of value)
 //    - Typically used for data that doesn't change, like transaction data or blockchain blocks
@@ -38,12 +38,13 @@ const DynaDirName = "dyna"
 // could then be used to rapidly sync partially synced nodes
 
 type KV2 struct {
-	Mutex     sync.Mutex // Serializes access; KV2 methods are safe for concurrent use
-	Directory string     // Directory where the PermKV and DynaKV directories are
-	PermKV    *KV        // The Perm KV
-	DynaKV    *KV        // the Dyna KV
-	DWrites   int        // Number of writes to the DynaKV since the last compress
-	PWrites   int        // Number of writes to the PermKV since the last compress
+	Mutex     sync.Mutex    // Serializes access; KV2 methods are safe for concurrent use
+	Directory string        // Directory where the PermKV and DynaKV directories are
+	PermKV    *SegmentStore // The Perm layer: sealed, immutable segments
+	DynaKV    *KV           // the Dyna KV
+	DWrites   int           // Number of writes to the DynaKV since the last compress
+	PWrites   int           // Number of writes to the PermKV since the last compress
+	SealLimit int           // Seal the Perm layer when the live tail reaches this many keys
 }
 
 // NewKV2
@@ -68,9 +69,10 @@ func NewKV2(directory string, offsetsCnt, KeyLimit uint64, MaxCachedBlocks int) 
 
 	kv2 = new(KV2)
 	kv2.Directory = directory
-	if kv2.PermKV, err = NewKV(true, filepath.Join(directory, PermDirName), offsetsCnt, KeyLimit, MaxCachedBlocks); err != nil {
+	if kv2.PermKV, err = NewSegmentStore(filepath.Join(directory, PermDirName), false); err != nil {
 		return nil, err
 	}
+	kv2.SealLimit = int(KeyLimit)
 	if kv2.DynaKV, err = NewKV(false, filepath.Join(directory, DynaDirName), offsetsCnt, KeyLimit, MaxCachedBlocks); err != nil {
 		return nil, err
 	}
@@ -82,7 +84,7 @@ func OpenKV2(directory string) (kv2 *KV2, err error) {
 	kv2.Directory = directory
 	permDirName := filepath.Join(directory, PermDirName) // Add directory names
 	dynaDirName := filepath.Join(directory, DynaDirName) // Add directory names
-	if kv2.PermKV, err = OpenKV(permDirName); err != nil {
+	if kv2.PermKV, err = OpenSegmentStore(permDirName); err != nil {
 		return nil, err
 	}
 	if kv2.DynaKV, err = OpenKV(dynaDirName); err != nil {
@@ -96,6 +98,9 @@ func (k *KV2) Open() error {
 	defer k.Mutex.Unlock()
 	if err := k.PermKV.Open(); err != nil {
 		return err
+	}
+	if k.SealLimit == 0 {
+		k.SealLimit = int(DefaultBloomCapacity) // Reopened stores: a sane default
 	}
 	return k.DynaKV.Open()
 }
@@ -158,13 +163,36 @@ func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
 }
 
 // PutPerm
-// Use when the k/v is known to be a dynamic k/v
+// Use when the k/v is known to be a permanent (immutable) k/v
 func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
 	k.PWrites++
-	err = k.PermKV.Put(key, value)
-	return k.DWrites, err
+	if err = k.PermKV.Put(key, value); err != nil {
+		return k.DWrites, err
+	}
+	return k.DWrites, k.sealIfFull()
+}
+
+// sealIfFull
+// Seal the Perm layer once its live tail reaches SealLimit keys, so
+// the unsealed tail (and the memory tracking it) stays bounded between
+// block boundaries.  The caller must hold the Mutex.
+func (k *KV2) sealIfFull() (err error) {
+	if k.SealLimit <= 0 || k.PermKV.LiveCount() < k.SealLimit {
+		return nil
+	}
+	_, err = k.PermKV.SealNext()
+	return err
+}
+
+// Seal
+// Seal the Perm layer at a block height.  Sealing is the Perm layer's
+// durability point and the unit a peer syncs.
+func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
+	return k.PermKV.Seal(height)
 }
 
 // Put
@@ -191,8 +219,10 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	}
 	// If not yet a DynaKV or not in k.PermKV, default to k.PermKV
 	k.PWrites++
-	err = k.PermKV.Put(key, value)
-	return k.DWrites, err // We do not compress the PermKV ... Only report DWrites
+	if err = k.PermKV.Put(key, value); err != nil {
+		return k.DWrites, err
+	}
+	return k.DWrites, k.sealIfFull() // We do not compress the PermKV ... Only report DWrites
 }
 
 // Compress

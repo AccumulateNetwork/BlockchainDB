@@ -44,13 +44,13 @@ const (
 )
 
 // SegmentInfo
-// One shard's segment within a block export
+// One sealed segment within a block export
 type SegmentInfo struct {
-	Shard     int    `json:"shard"`
-	File      string `json:"file"`      // Segment file name within the block directory
-	Count     uint64 `json:"count"`     // Number of key/value records
-	EndOffset uint64 `json:"endOffset"` // values.dat offset the segment reaches
-	Hash      string `json:"hash"`      // SHA-256 of the segment file, hex
+	Shard  int    `json:"shard"`
+	Height uint64 `json:"height"` // The segment's own seal height within its shard
+	File   string `json:"file"`   // Segment file name within the block directory
+	Count  uint64 `json:"count"`  // Number of keys in the segment
+	Hash   string `json:"hash"`   // SHA-256 of the segment file, hex
 }
 
 // Manifest
@@ -244,49 +244,52 @@ func VerifySegmentFile(path string, wantHex string) error {
 }
 
 // ExportBlock
-// Seal a block: export every shard's Perm data written since the
-// previous block into <exportDir>/block-<height>/ and write a manifest
-// with the record counts, end offsets, and SHA-256 of each segment.
-// prev is the previous block's manifest (nil for the first block); it
-// supplies the offsets to export from.
+// Seal a block and export it: every shard seals its live tail at the
+// block height, and every segment sealed since the previous block is
+// copied into <exportDir>/block-<height>/ with a manifest recording
+// its shard, seal height, key count, and SHA-256.
+//
+// Copying sealed files is the whole export: the segments are already
+// the storage format, so nothing is re-encoded.  prev is the previous
+// block's manifest (nil for the first block); it says which segments
+// a peer already has.  A shard that sealed more than once since the
+// previous block (an auto-seal when its live tail filled) contributes
+// each of those segments.
 func (k *KVShard) ExportBlock(exportDir string, height uint64, prev *Manifest) (m *Manifest, err error) {
 	blockDir := filepath.Join(exportDir, fmt.Sprintf("block-%08d", height))
 	if err = os.MkdirAll(blockDir, os.ModePerm); err != nil {
 		return nil, err
 	}
 
-	since := make([]uint64, NumShards)
+	// The newest seal height a peer already has, per shard
+	exported := make(map[int]uint64)
 	if prev != nil {
 		for _, s := range prev.Segments {
-			if s.Shard >= 0 && s.Shard < NumShards {
-				since[s.Shard] = s.EndOffset
+			if h, ok := exported[s.Shard]; !ok || s.Height > h {
+				exported[s.Shard] = s.Height
 			}
 		}
 	}
 
 	m = &Manifest{Height: height}
 	for i, shard := range k.Shards {
-		name := fmt.Sprintf("shard-%04d.seg", i)
-		f, err := os.Create(filepath.Join(blockDir, name))
-		if err != nil {
-			return nil, err
-		}
-		end, count, hash, err := shard.ExportPermSegment(f, since[i])
-		if err != nil {
-			f.Close()
+		if _, err = shard.Seal(height); err != nil {
 			return nil, fmt.Errorf("shard %d: %w", i, err)
 		}
-		if err = f.Sync(); err != nil {
-			f.Close()
-			return nil, err
+		metas, paths := shard.PermKV.SegmentPaths()
+		for j, meta := range metas {
+			if last, ok := exported[i]; ok && meta.Height <= last {
+				continue // The peer already has this one
+			}
+			name := fmt.Sprintf("shard-%04d-%08d.seg", i, meta.Height)
+			if err = copyFileSynced(paths[j], filepath.Join(blockDir, name)); err != nil {
+				return nil, fmt.Errorf("shard %d: %w", i, err)
+			}
+			m.Segments = append(m.Segments, SegmentInfo{
+				Shard: i, Height: meta.Height, File: name,
+				Count: meta.Count, Hash: meta.Hash,
+			})
 		}
-		if err = f.Close(); err != nil {
-			return nil, err
-		}
-		m.Segments = append(m.Segments, SegmentInfo{
-			Shard: i, File: name, Count: count, EndOffset: end,
-			Hash: fmt.Sprintf("%x", hash),
-		})
 	}
 
 	// Write the manifest last: its presence marks a complete export
@@ -304,22 +307,13 @@ func (k *KVShard) ExportBlock(exportDir string, height uint64, prev *Manifest) (
 	return m, syncDir(blockDir)
 }
 
-// ExportPermSegment
-// KV2-level export of the Perm layer, serialized with the shard's
-// other operations by the KV2 mutex
-func (k *KV2) ExportPermSegment(w io.Writer, sinceOffset uint64) (endOffset uint64, count uint64, hash [32]byte, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-	return k.PermKV.ExportSegment(w, sinceOffset)
-}
-
 // ImportPermSegment
-// KV2-level import into the Perm layer, serialized with the shard's
-// other operations by the KV2 mutex
-func (k *KV2) ImportPermSegment(r io.Reader) (count uint64, err error) {
+// KV2-level adoption of a sealed segment file into the Perm layer,
+// serialized with the shard's other operations by the KV2 mutex
+func (k *KV2) ImportPermSegment(path string, meta SegmentMeta) (err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
-	return k.PermKV.ImportSegment(r)
+	return k.PermKV.ImportSegmentFile(path, meta)
 }
 
 // LoadManifest
@@ -337,39 +331,38 @@ func LoadManifest(blockDir string) (m *Manifest, err error) {
 }
 
 // ImportBlock
-// Verify and import one exported block directory into this KVShard.
-// Every segment is checked against its manifest hash before any record
-// is imported.  Idempotent: re-importing a block is a no-op.
+// Verify and import one exported block directory.  Every segment is
+// checked against its manifest hash before any of them is adopted,
+// and adopting one is a file copy plus a manifest commit -- no record
+// is re-inserted.
+//
+// Idempotent: a segment the store already has is skipped, so an
+// interrupted sync resumes by re-running.
 func (k *KVShard) ImportBlock(blockDir string) (count uint64, err error) {
 	m, err := LoadManifest(blockDir)
 	if err != nil {
 		return 0, err
 	}
 
-	// Verify everything before importing anything
+	// Verify everything before adopting anything
 	for _, s := range m.Segments {
+		if s.Shard < 0 || s.Shard >= NumShards {
+			return 0, fmt.Errorf("manifest references invalid shard %d", s.Shard)
+		}
 		if err = VerifySegmentFile(filepath.Join(blockDir, s.File), s.Hash); err != nil {
 			return 0, err
 		}
 	}
 
-	for _, s := range m.Segments {
-		if s.Shard < 0 || s.Shard >= NumShards {
-			return count, fmt.Errorf("manifest references invalid shard %d", s.Shard)
-		}
-		f, err := os.Open(filepath.Join(blockDir, s.File))
-		if err != nil {
-			return count, err
-		}
-		n, err := k.Shards[s.Shard].ImportPermSegment(f)
-		f.Close()
-		count += n
-		if err != nil {
+	// Adopt in seal order so heights stay ascending within each shard
+	segments := append([]SegmentInfo(nil), m.Segments...)
+	sort.Slice(segments, func(i, j int) bool { return segments[i].Height < segments[j].Height })
+	for _, s := range segments {
+		meta := SegmentMeta{Height: s.Height, Count: s.Count, Hash: s.Hash}
+		if err = k.Shards[s.Shard].ImportPermSegment(filepath.Join(blockDir, s.File), meta); err != nil {
 			return count, fmt.Errorf("shard %d: %w", s.Shard, err)
 		}
-		if n != s.Count {
-			return count, fmt.Errorf("shard %d: imported %d records, manifest says %d", s.Shard, n, s.Count)
-		}
+		count += s.Count
 	}
 	return count, nil
 }
