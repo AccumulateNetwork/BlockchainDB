@@ -226,3 +226,16 @@ func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 	}
 	return err
 }
+
+// syncDir
+// Sync a directory so that renames and file creations within it are
+// durable.  An fsync on a file makes its content durable; the rename
+// that put it in place lives in the directory, which needs its own sync.
+func syncDir(directory string) error {
+	d, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}

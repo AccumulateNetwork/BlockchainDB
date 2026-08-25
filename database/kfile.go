@@ -218,26 +218,38 @@ func (k *KFile) PushHistory() (err error) {
 		}
 	}
 
-	// The keys are durable in history; now reset the kfile
+	// The keys are durable in history; now reset the kfile.  The reset
+	// is atomic: a fresh header-only kfile is written to the tmp name
+	// and renamed over the old one, so kfile.dat always exists no
+	// matter where a crash lands.
 	if k.File.File != nil { // GetKeyList leaves the file open
 		if err = k.File.File.Close(); err != nil {
 			return err
 		}
 		k.File.File = nil
 	}
-	if err = os.Remove(filepath.Join(k.Directory, kFileName)); err != nil {
-		return err
-	}
-
-	if k.File, err = NewBFile(filepath.Join(k.Directory, kFileName)); err != nil {
-		return err
-	}
 
 	k.Header.Init(uint64(k.OffsetsCnt))
-	k.Close()
-	k.Open()
-
-	return nil
+	tmpPath := filepath.Join(k.Directory, kTmpFileName)
+	tmp, err := NewBFile(tmpPath)
+	if err != nil {
+		return err
+	}
+	if _, err = tmp.Write(k.Header.Marshal()); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil { // Flush + sync + close
+		return err
+	}
+	if err = os.Rename(tmpPath, k.File.Filename); err != nil {
+		return err
+	}
+	if err = syncDir(k.Directory); err != nil {
+		return err
+	}
+	k.File.EOB = 0
+	k.File.EOD = uint64(k.HeaderSize)
+	return k.File.Open()
 }
 
 // Open
@@ -485,15 +497,23 @@ func (k *KFile) kGet(Key [32]byte) (dbBKey *DBBKey, err error) {
 		return nil, err
 	}
 
-	var dbKey DBBKey                 //          Search the keys by unmarshaling each key as we search
-	for len(keys) >= DBKeyFullSize { //          Search all DBBKey entries, note they are not sorted.
+	// Search all DBBKey entries.  The kfile is append-ordered within a
+	// bin, and the same key can appear more than once (an overwrite, or
+	// a replayed write after a crash), so the NEWEST record -- the last
+	// match -- wins.
+	var dbKey DBBKey
+	found := false
+	for len(keys) >= DBKeyFullSize {
 		if [32]byte(keys) == Key {
 			if _, err := dbKey.Unmarshal(keys); err != nil {
 				return nil, err
 			}
-			return &dbKey, nil
+			found = true
 		}
 		keys = keys[DBKeyFullSize:] //       Move to the next DBBKey
+	}
+	if found {
+		return &dbKey, nil
 	}
 	return nil, errors.New("not found")
 }
@@ -711,6 +731,9 @@ func (k *KFile) Close() (err error) {
 		return err
 	}
 	if err = os.Rename(tmpPath, k.File.Filename); err != nil {
+		return err
+	}
+	if err = syncDir(k.Directory); err != nil {
 		return err
 	}
 
