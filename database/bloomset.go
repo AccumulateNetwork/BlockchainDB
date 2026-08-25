@@ -118,7 +118,10 @@ func (b *BloomSet) Save(directory string) (err error) {
 		return err
 	}
 	f = nil
-	return os.Rename(tmpPath, filepath.Join(directory, bloomFilename))
+	if err = os.Rename(tmpPath, filepath.Join(directory, bloomFilename)); err != nil {
+		return err
+	}
+	return syncDir(directory)
 }
 
 // LoadBloomSet

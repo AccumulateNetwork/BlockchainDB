@@ -1,6 +1,8 @@
 package blockchainDB
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 )
@@ -55,7 +57,26 @@ func OpenKV(directory string) (kv *KV, err error) {
 
 // Put
 // Put the key into the kFile, and the value in the vFile
+//
+// With history enabled, values are immutable: a Put of a key that
+// already exists is a no-op when the value is identical (this is what
+// makes crash recovery by replay work -- a node re-applying writes
+// after a restart must not fail on the ones that were already durable)
+// and an error when the value differs.
 func (k *KV) Put(key [32]byte, value []byte) (err error) {
+
+	if k.UseHistory {
+		if existing, err := k.Get(key); err == nil {
+			if bytes.Equal(existing, value) {
+				return nil // Same value: no-op (e.g. replay after a crash)
+			}
+			return errors.New("cannot overwrite immutable value when history is enabled")
+		}
+		// Not found -- or unreadable, as when a crash persisted the key
+		// but not its value bytes.  Either way the write proceeds; the
+		// new record supersedes any dangling one (kGet prefers the
+		// newest record).
+	}
 
 	dbbKey := new(DBBKey)
 	dbbKey.Offset, err = k.vFile.Offset()
@@ -176,6 +197,9 @@ func (k *KV) Compress() (err error) {
 		k.vFile.File = nil
 	}
 	if err = os.Rename(tvFile.Filename, k.vFile.Filename); err != nil {
+		return err
+	}
+	if err = syncDir(k.Directory); err != nil {
 		return err
 	}
 	k.vFile.EOB = 0
