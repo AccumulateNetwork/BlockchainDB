@@ -44,6 +44,22 @@ import (
 const crashChildEnv = "BDB_CRASH_CHILD_DIR"
 const crashChildStartEnv = "BDB_CRASH_CHILD_START"
 
+// crashChildModeEnv selects which durability point the child reaches at
+// each checkpoint.  Both are part of the contract and they fail
+// differently:
+//
+//	close -- Close() flushes and fsyncs both layers and shuts the files.
+//	seal  -- Seal(height) closes a block on a running store.  This is
+//	         what a node actually does per block; it does not Close, so
+//	         it is the only one that catches a layer whose writes are
+//	         still sitting in a buffer (issue #29).
+const crashChildModeEnv = "BDB_CRASH_CHILD_MODE"
+
+const (
+	crashModeClose = "close"
+	crashModeSeal  = "seal"
+)
+
 // crashSealLimit is deliberately small so that the few hundred keys a
 // round gets through before the kill still seal many times.  Seals,
 // and the compactions they enable, are the crash windows this test
@@ -98,6 +114,10 @@ func TestCrashChildProcess(t *testing.T) {
 	start, err := strconv.Atoi(startEnv)
 	require.NoErrorf(t, err, "child: %s must be an integer, got %q", crashChildStartEnv, startEnv)
 
+	mode := os.Getenv(crashChildModeEnv)
+	require.Containsf(t, []string{crashModeClose, crashModeSeal}, mode,
+		"child: %s must be %q or %q, got %q", crashChildModeEnv, crashModeClose, crashModeSeal, mode)
+
 	kv, err := OpenKV2(dir)
 	require.NoError(t, err, "child: open")
 	require.NoError(t, kv.Open(), "child: open files")
@@ -109,21 +129,53 @@ func TestCrashChildProcess(t *testing.T) {
 		if (i+1)%crashCompressEvery == 0 {
 			require.NoError(t, kv.Compress(), "child: compress")
 		}
-		if (i+1)%batch == 0 {
+		if (i+1)%batch != 0 {
+			continue
+		}
+		switch mode {
+		case crashModeClose:
 			require.NoError(t, kv.Close(), "child: close")
 			fmt.Printf("CHECKPOINT %d\n", i+1) // Durability point reached
 			require.NoError(t, kv.Open(), "child: reopen")
+		case crashModeSeal:
+			// Seal the block being accumulated rather than a counted
+			// one: a kill between a seal and its CHECKPOINT rolls the
+			// parent's start back to before that seal, and re-sealing
+			// a block the store has already closed is an error.
+			_, err := kv.Seal(kv.PermKV.BlockHeight())
+			require.NoError(t, err, "child: seal")
+			fmt.Printf("CHECKPOINT %d\n", i+1)
 		}
 	}
 }
 
 // TestCrashRecovery
-// Kill the child at random moments; verify the durability contract
+// Kill the child at random moments; verify that Close is a durability
+// point.
 func TestCrashRecovery(t *testing.T) {
+	runCrashRounds(t, crashModeClose)
+}
+
+// TestCrashRecoverySeal
+// The same contract with Seal as the durability point and no Close:
+// what a node does at a block boundary.
+//
+// This is the case issue #29 broke.  Seal made the Perm layer durable
+// and left the Dyna layer's newest writes in a 32 KB buffer, so a
+// SIGKILL here came back with permanent records -- the even-numbered
+// keys -- present and the dynamic records interleaved with them gone.
+// Close hid it, because Close flushes and fsyncs both layers.
+func TestCrashRecoverySeal(t *testing.T) {
+	runCrashRounds(t, crashModeSeal)
+}
+
+// runCrashRounds is the crash-injection loop: run the child, kill it at
+// a random moment, and verify every key it reported durable
+func runCrashRounds(t *testing.T, mode string) {
 	if os.Getenv(crashChildEnv) != "" {
 		t.Skip("running as child")
 	}
-	dir := filepath.Join(os.TempDir(), "CrashRecovery")
+	dir := filepath.Join(os.TempDir(), "CrashRecovery_"+mode)
 	os.RemoveAll(dir)
 	defer os.RemoveAll(dir)
 
@@ -143,6 +195,7 @@ func TestCrashRecovery(t *testing.T) {
 		cmd := exec.Command(os.Args[0], "-test.run", "TestCrashChildProcess$")
 		cmd.Env = append(os.Environ(),
 			crashChildEnv+"="+dir,
+			crashChildModeEnv+"="+mode,
 			crashChildStartEnv+"="+strconv.Itoa(durable))
 		stdout, err := cmd.StdoutPipe()
 		require.NoError(t, err)

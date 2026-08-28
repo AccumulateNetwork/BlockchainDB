@@ -22,12 +22,23 @@ and hashed, is a **segment**: the verifiable unit of node sync.
     ...more writes...
     m2, _ := kvs.ExportBlock(exportDir, 2, m1)    // block 2: only what's new
 
-Each block directory holds one segment file per shard plus a
-`manifest.json` recording, per shard: record count, the `values.dat`
-end offset reached, and the SHA-256 of the segment file. Manifests
-chain: block N+1 exports from block N's end offsets, so consecutive
-blocks partition the data exactly. The manifest is written last (tmp +
-rename), so its presence marks a complete export.
+Each block directory holds a `manifest.json` and the segment files it
+names, recording for each: its shard, its `(height, seq)`, its record
+count, and the SHA-256 of the file. A shard contributes as many
+segments as it sealed during the block — one per auto-seal when its
+live tail filled, plus the boundary seal — and a shard that took no
+writes contributes none. The manifest is written last (tmp + rename),
+so its presence marks a complete export.
+
+Manifests chain on the **block number**: block N+1 exports every
+segment whose height is above N. That works because a boundary seal
+advances the block each shard accumulates into, so every segment
+sealed after block N's export carries a height above N. It is
+deliberately not a per-shard high-water mark taken from the previous
+manifest: a shard quiet during block N appears nowhere in it, and a
+per-shard rule has no entry to skip that shard by, so it re-exports
+every segment the shard holds — into every block until it next seals
+(`TestExportBlockQuietShardNotReexported`).
 
 **Syncing (new node):**
 

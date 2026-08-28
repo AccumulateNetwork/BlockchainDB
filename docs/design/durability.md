@@ -8,8 +8,8 @@ Tracks issue #5.
 ## The contract
 
 **`KV2.Close()` is a durability point**, as is a `Seal` (and so
-`KVShard.SealBlock`). After a process dies (SIGKILL, power loss) at an
-arbitrary moment:
+`KVShard.SealBlock` and `ExportBlock`) — **for both layers**. After a
+process dies (SIGKILL, power loss) at an arbitrary moment:
 
 1. `OpenKV2` succeeds — the database is never left unopenable.
 2. Every key written before the last completed durability point is
@@ -17,6 +17,37 @@ arbitrary moment:
 3. Writes after the last durability point may be wholly present,
    partially present, or absent — but they never corrupt the database,
    and **replaying them succeeds** (see below).
+
+### A block boundary covers both layers
+
+`Seal` closes a block on a *running* store, and until issue #29 it
+only half did.  Sealing is the Perm layer's durability point, so
+permanent records were on disk the moment it returned.  The Dyna layer
+was not sealed at a block boundary — its segments are local, never a
+peer's unit of sync — so its newest writes sat in `BFile`'s 32 KB
+buffer until the tail filled, a compaction ran, or the store was
+closed.
+
+That is not a slow write, it is a *torn commit*.  In Accumulate every
+chain element is permanent and every mutable record — account state,
+chain heads, BPT nodes — is dynamic, so a node killed after a commit
+came back holding chain elements newer than the heads that index them:
+the two layers disagreed about where the block ended.
+
+`KV2.Seal` now seals Perm and **syncs** Dyna: flush the live tail,
+fsync it, done.  Syncing rather than sealing is deliberate — cutting a
+Dyna segment per block per shard would buy nothing (no peer receives
+one) and cost a seal's hash and manifest commit every block.  No
+manifest is written either, because the live tail is recovered by
+replaying the file, and a tail fsynced mid-record is fine: open
+truncates the torn record and resumes on the boundary before it.  A
+sync of a tail that took no writes is a no-op, so the shards a block
+did not touch cost nothing.
+
+`SegmentStore.Sync()` is exported, so a caller wanting a durability
+point without a block boundary has one.
+
+## The tests
 
 `TestCrashRecovery` enforces this: a child process writes to both
 layers with checkpoints at each `Close`, the parent SIGKILLs it at
@@ -27,6 +58,19 @@ because nothing in `KV2` compacts by itself -- `sealPermIfFull` and
 `sealDynaIfFull` seal and stop there -- so without it the compaction
 path would never be under the kill.  Adding it is what surfaced the
 three defects listed under *Fixed here*.
+
+`TestCrashRecoverySeal` runs the same rounds against the other
+durability point: the child checkpoints at `Seal` and never closes.
+It is the only one of the two that can see issue #29, because `Close`
+flushes and fsyncs both layers and so hides a layer that a block
+boundary was leaving buffered.  Against the unfixed code it loses the
+first dynamic key in the first round.
+
+The child seals the block the store is *accumulating*
+(`PermKV.BlockHeight()`) rather than a counted one: a kill between a
+seal and the `CHECKPOINT` line that reports it rolls the parent's
+restart point back to before that seal, and re-sealing a block the
+store has already closed is an error.
 
 ## How the windows are covered
 
@@ -95,10 +139,11 @@ unfixed code.
   directory. Create once, verify, then rely on the contract. Recovery:
   delete and recreate.
 - `Flush` on the `ShardWriter` is an application barrier, not an
-  fsync; pair it with `Close` (or `SealBlock`) at block boundaries that
-  must be durable. Wiring `Flush` to `Seal` so that a block boundary is
-  one durability, sync, and compaction boundary is the next step in
-  [Segments as storage](segment-store.md).
+  fsync: it drains the queues so the writes have *reached* the store,
+  and says nothing about the disk. Follow it with `SealBlock` (or
+  `Close`) at a block boundary that must be durable — `SealBlock` is
+  now the whole durability point for both layers, so that pair is the
+  block boundary.
 - A key written to Dyna keeps a stale copy in Perm. `Get` resolves the
   layer order, so the copy is dead weight rather than a wrong answer,
   but compaction does not reclaim it.

@@ -234,12 +234,34 @@ func (k *KV2) sealDynaIfFull() (err error) {
 }
 
 // Seal
-// Seal the Perm layer at a block height.  Sealing is the Perm layer's
-// durability point and the unit a peer syncs.
+// Close a block: seal the Perm layer at the block height, and make the
+// Dyna layer's live tail durable.
+//
+// Both halves matter, and the second one used to be missing.  Sealing
+// is the Perm layer's durability point and the unit a peer syncs, so
+// permanent records were durable the moment Seal returned.  Dynamic
+// writes were not: they sat in a 32 KB buffer until the tail filled,
+// was compacted, or the store was closed.  A node killed after a
+// commit therefore came back with permanent records -- chain elements
+// -- newer than the mutable state that indexes them, and the two
+// layers disagreed about where the block ended (issue #29).
+//
+// The Dyna layer is synced rather than sealed: its segments are local
+// (a peer never receives one), so there is nothing to gain from
+// cutting one per block and a full seal per block per shard to pay
+// for.  A sync on a tail that took no writes is free.
+//
+// Both layers are advanced before either error is returned, so a
+// failure to sync Dyna does not leave Perm unsealed and the block
+// unrepeatable.
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
-	return k.PermKV.Seal(height)
+	meta, err = k.PermKV.Seal(height)
+	if syncErr := k.DynaKV.Sync(); err == nil {
+		err = syncErr
+	}
+	return meta, err
 }
 
 // Put
@@ -258,22 +280,28 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		}
 		return k.DWrites, k.sealDynaIfFull()
 	}
-	if value2, err2 := k.PermKV.Get(key); err2 == nil { // Check. Is it a PermKV
-		if bytes.Equal(value, value2) { // If no change, ignore;
-			return k.PWrites, nil
-		}
-		k.DWrites++
-		if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
-			return k.DWrites, err
-		}
-		return k.DWrites, k.sealDynaIfFull()
-	}
-	// If not yet a DynaKV or not in k.PermKV, default to k.PermKV
-	k.PWrites++
-	if err = k.PermKV.Put(key, value); err != nil {
+	// One lookup settles all three Perm cases: absent (in which case the
+	// write has already happened), present and identical (nothing to
+	// do), present and different (the key becomes dynamic).  Asking
+	// whether the key was there and then calling Put, which asked again
+	// to enforce immutability, made a new key -- the common case, and a
+	// miss by definition -- pay for the answer twice.
+	existing, existed, err := k.PermKV.PutIfAbsent(key, value)
+	if err != nil {
 		return k.DWrites, err
 	}
-	return k.DWrites, k.sealPermIfFull() // We do not compact the PermKV ... Only report DWrites
+	if !existed { // It is a new permanent key, and it is now written
+		k.PWrites++
+		return k.DWrites, k.sealPermIfFull() // PermKV is never compacted; report DWrites
+	}
+	if bytes.Equal(existing, value) { // If no change, ignore;
+		return k.PWrites, nil
+	}
+	k.DWrites++
+	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
+		return k.DWrites, err
+	}
+	return k.DWrites, k.sealDynaIfFull()
 }
 
 // Compress

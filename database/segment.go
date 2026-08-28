@@ -44,7 +44,8 @@ const (
 // One sealed segment within a block export
 type SegmentInfo struct {
 	Shard  int    `json:"shard"`
-	Height uint64 `json:"height"` // The segment's own seal height within its shard
+	Height uint64 `json:"height"` // The block the segment belongs to
+	Seq    uint64 `json:"seq"`    // Its order within that block
 	File   string `json:"file"`   // Segment file name within the block directory
 	Count  uint64 `json:"count"`  // Number of keys in the segment
 	Hash   string `json:"hash"`   // SHA-256 of the segment file, hex
@@ -94,32 +95,46 @@ func (k *KVShard) ExportBlock(exportDir string, height uint64, prev *Manifest) (
 		return nil, err
 	}
 
-	// The newest seal height a peer already has, per shard
-	exported := make(map[int]uint64)
+	// The last block a peer already has.  The boundary is the block
+	// number, not a per-shard high-water mark taken from prev.Segments:
+	// a shard that took no writes during the previous block sealed
+	// nothing and so appears nowhere in prev, and a per-shard map has no
+	// entry to skip it by -- every segment it holds would be copied
+	// again, into every block until it next seals.
+	//
+	// The block number works because sealing at a boundary advances the
+	// block each shard accumulates into, so a segment sealed after the
+	// export of block N -- auto-seal or boundary -- carries a height
+	// above N, and one sealed before it does not.
+	//
+	// exportedOK distinguishes "no previous export" from one at block 0,
+	// which a genesis block is.
+	exported, exportedOK := uint64(0), false
 	if prev != nil {
-		for _, s := range prev.Segments {
-			if h, ok := exported[s.Shard]; !ok || s.Height > h {
-				exported[s.Shard] = s.Height
-			}
-		}
+		exported, exportedOK = prev.Height, true
+	}
+
+	// Seal every shard before copying anything.  Sealing is durable and
+	// cannot be rolled back, so a failure partway through the copy
+	// phase would otherwise leave a block half-built on disk with some
+	// shards already closed at this height.
+	if err = k.SealBlock(height); err != nil {
+		return nil, err
 	}
 
 	m = &Manifest{Height: height}
 	for i, shard := range k.Shards {
-		if _, err = shard.Seal(height); err != nil {
-			return nil, fmt.Errorf("shard %d: %w", i, err)
-		}
 		metas, paths := shard.PermKV.SegmentPaths()
 		for j, meta := range metas {
-			if last, ok := exported[i]; ok && meta.Height <= last {
+			if exportedOK && meta.Height <= exported {
 				continue // The peer already has this one
 			}
-			name := fmt.Sprintf("shard-%04d-%08d.seg", i, meta.Height)
+			name := fmt.Sprintf("shard-%04d-%08d-%04d.seg", i, meta.Height, meta.Seq)
 			if err = copyFileSynced(paths[j], filepath.Join(blockDir, name)); err != nil {
 				return nil, fmt.Errorf("shard %d: %w", i, err)
 			}
 			m.Segments = append(m.Segments, SegmentInfo{
-				Shard: i, Height: meta.Height, File: name,
+				Shard: i, Height: meta.Height, Seq: meta.Seq, File: name,
 				Count: meta.Count, Hash: meta.Hash,
 			})
 		}
@@ -187,11 +202,15 @@ func (k *KVShard) ImportBlock(blockDir string) (count uint64, err error) {
 		}
 	}
 
-	// Adopt in seal order so heights stay ascending within each shard
+	// Adopt in seal order so (block, seq) stays ascending within each shard
 	segments := append([]SegmentInfo(nil), m.Segments...)
-	sort.Slice(segments, func(i, j int) bool { return segments[i].Height < segments[j].Height })
+	sort.Slice(segments, func(i, j int) bool {
+		a := SegmentMeta{Height: segments[i].Height, Seq: segments[i].Seq}
+		b := SegmentMeta{Height: segments[j].Height, Seq: segments[j].Seq}
+		return b.after(a)
+	})
 	for _, s := range segments {
-		meta := SegmentMeta{Height: s.Height, Count: s.Count, Hash: s.Hash}
+		meta := SegmentMeta{Height: s.Height, Seq: s.Seq, Count: s.Count, Hash: s.Hash}
 		if err = k.Shards[s.Shard].ImportPermSegment(filepath.Join(blockDir, s.File), meta); err != nil {
 			return count, fmt.Errorf("shard %d: %w", s.Shard, err)
 		}
