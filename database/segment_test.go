@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,6 +104,66 @@ func TestSegmentRoundTrip(t *testing.T) {
 
 	require.NoError(t, nodeA.Close())
 	require.NoError(t, nodeB.Close())
+}
+
+// keyForShard
+// A key that routes to the given shard, so a test can decide which
+// shards take writes in a block rather than relying on the spread of
+// random keys across 512 of them.
+func keyForShard(kr *FastRandom, shard int) [32]byte {
+	key := kr.NextHash()
+	binary.BigEndian.PutUint32(key[indexShards:], uint32(shard))
+	return key
+}
+
+// TestExportBlockQuietShardNotReexported
+// A shard that takes no writes during a block seals nothing, so it
+// appears nowhere in that block's manifest.  The next export must still
+// know the peer already has its older segments.
+//
+// prev carries only the previous block's segments, so a per-shard
+// high-water map built from it has no entry for a shard that was quiet
+// -- and every segment that shard holds is copied again, into every
+// block until it next seals.  Three blocks is the shortest sequence
+// that shows it: shard A seals in block 1 and is quiet thereafter, so
+// block 3 is where its segment reappears.
+func TestExportBlockQuietShardNotReexported(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	exportDir := filepath.Join(os.TempDir(), t.Name()+"_export")
+	for _, d := range []string{dir, exportDir} {
+		os.RemoveAll(d)
+		defer os.RemoveAll(d)
+	}
+
+	const shardA, shardB = 3, 7
+	node, err := NewKVShard(dir, 1000)
+	require.NoError(t, err)
+	defer node.Close()
+
+	kr := NewFastRandom([]byte{94})
+	vr := NewFastRandom([]byte{94, 94})
+
+	require.NoError(t, node.PutPerm(keyForShard(kr, shardA), vr.RandBuff(20, 100)))
+	m1, err := node.ExportBlock(exportDir, 1, nil)
+	require.NoError(t, err)
+	require.Len(t, m1.Segments, 1, "block 1 seals shard A only")
+	require.Equal(t, shardA, m1.Segments[0].Shard)
+
+	// Shard A is quiet from here on
+	require.NoError(t, node.PutPerm(keyForShard(kr, shardB), vr.RandBuff(20, 100)))
+	m2, err := node.ExportBlock(exportDir, 2, m1)
+	require.NoError(t, err)
+	require.Len(t, m2.Segments, 1, "block 2 seals shard B only")
+	require.Equal(t, shardB, m2.Segments[0].Shard)
+
+	require.NoError(t, node.PutPerm(keyForShard(kr, shardB), vr.RandBuff(20, 100)))
+	m3, err := node.ExportBlock(exportDir, 3, m2)
+	require.NoError(t, err)
+	for _, s := range m3.Segments {
+		assert.NotEqualf(t, shardA, s.Shard,
+			"shard %d sealed in block 1 and was quiet since; block 3 must not re-export it", s.Shard)
+	}
+	assert.Len(t, m3.Segments, 1, "block 3 seals shard B only")
 }
 
 // TestSegmentTamperDetection

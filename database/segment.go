@@ -95,33 +95,38 @@ func (k *KVShard) ExportBlock(exportDir string, height uint64, prev *Manifest) (
 		return nil, err
 	}
 
-	// The newest segment a peer already has, per shard
-	exported := make(map[int]SegmentMeta)
+	// The last block a peer already has.  The boundary is the block
+	// number, not a per-shard high-water mark taken from prev.Segments:
+	// a shard that took no writes during the previous block sealed
+	// nothing and so appears nowhere in prev, and a per-shard map has no
+	// entry to skip it by -- every segment it holds would be copied
+	// again, into every block until it next seals.
+	//
+	// The block number works because sealing at a boundary advances the
+	// block each shard accumulates into, so a segment sealed after the
+	// export of block N -- auto-seal or boundary -- carries a height
+	// above N, and one sealed before it does not.
+	//
+	// exportedOK distinguishes "no previous export" from one at block 0,
+	// which a genesis block is.
+	exported, exportedOK := uint64(0), false
 	if prev != nil {
-		for _, s := range prev.Segments {
-			cur, ok := exported[s.Shard]
-			m := SegmentMeta{Height: s.Height, Seq: s.Seq}
-			if !ok || m.after(cur) {
-				exported[s.Shard] = m
-			}
-		}
+		exported, exportedOK = prev.Height, true
 	}
 
 	// Seal every shard before copying anything.  Sealing is durable and
 	// cannot be rolled back, so a failure partway through the copy
 	// phase would otherwise leave a block half-built on disk with some
 	// shards already closed at this height.
-	for i, shard := range k.Shards {
-		if _, err = shard.Seal(height); err != nil {
-			return nil, fmt.Errorf("shard %d: %w", i, err)
-		}
+	if err = k.SealBlock(height); err != nil {
+		return nil, err
 	}
 
 	m = &Manifest{Height: height}
 	for i, shard := range k.Shards {
 		metas, paths := shard.PermKV.SegmentPaths()
 		for j, meta := range metas {
-			if last, ok := exported[i]; ok && !meta.after(last) {
+			if exportedOK && meta.Height <= exported {
 				continue // The peer already has this one
 			}
 			name := fmt.Sprintf("shard-%04d-%08d-%04d.seg", i, meta.Height, meta.Seq)
