@@ -197,6 +197,7 @@ type SegmentStore struct {
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
+	liveDirty   bool                 // Records written to the tail since the last fsync of it
 	closed      bool                 // Set by Close; cleared by Open
 
 	// keys is a membership filter over everything the store holds --
@@ -295,6 +296,10 @@ func (s *SegmentStore) newLiveFile() (err error) {
 		return err
 	}
 	s.liveRecords = 0
+	// The header is buffered, not written: a crash here leaves a 0-byte
+	// file, and open rewrites the header rather than trusting it to be
+	// there.  So there is nothing to lose until a record is appended.
+	s.liveDirty = false
 	return nil
 }
 
@@ -591,6 +596,8 @@ func (s *SegmentStore) openLive() (err error) {
 		}
 		s.liveFile.EOD = offset
 	}
+	// Everything replayed came off the disk, so it is already durable
+	s.liveDirty = false
 	return nil
 }
 
@@ -869,6 +876,7 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 	}
 	s.live[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
 	s.liveRecords++
+	s.liveDirty = true
 	if s.keys != nil {
 		s.keys.Set(key)
 	}
@@ -931,6 +939,61 @@ func (s *SegmentStore) LiveRecords() uint64 {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	return s.liveRecords
+}
+
+// BlockHeight
+// The block the live tail is accumulating into: the lowest height
+// Seal will accept.  A caller sealing at its own block numbers does
+// not need this, but one resuming after a crash does -- the block it
+// was about to seal may already be sealed and recorded.
+func (s *SegmentStore) BlockHeight() uint64 {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.blockHeight
+}
+
+// Sync
+// Make the live tail durable without sealing it: flush the buffer and
+// fsync the file, so every record written so far survives a power loss.
+//
+// This is the durability point for a store that is not being sealed.
+// Sealing is the other one, and it is the only one the Perm layer
+// needs, because a block boundary seals its whole tail.  The Dyna
+// layer is not sealed at a block boundary -- its segments are local,
+// not a peer's unit of sync -- so without this its newest writes sat
+// in a 32 KB buffer until the tail filled, and a crash restarted the
+// node with permanent records newer than the mutable state that
+// indexes them (issue #29).
+//
+// No manifest is written: the manifest names sealed segments, and the
+// live tail is recovered by replaying the file itself.  A tail
+// fsynced mid-record is fine -- open truncates a torn record and
+// replay resumes on the boundary before it.
+//
+// Sync is a no-op on a tail that has taken no writes since the last
+// one, so the shards a block did not touch cost nothing.
+func (s *SegmentStore) Sync() (err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	return s.sync()
+}
+
+// sync is Sync; the caller must hold the Mutex
+func (s *SegmentStore) sync() (err error) {
+	if err = s.checkOpen(); err != nil {
+		return err
+	}
+	if !s.liveDirty {
+		return nil
+	}
+	if err = s.liveFile.Flush(); err != nil {
+		return err
+	}
+	if err = s.liveFile.File.Sync(); err != nil {
+		return err
+	}
+	s.liveDirty = false
+	return nil
 }
 
 // SealNext

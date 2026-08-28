@@ -234,12 +234,34 @@ func (k *KV2) sealDynaIfFull() (err error) {
 }
 
 // Seal
-// Seal the Perm layer at a block height.  Sealing is the Perm layer's
-// durability point and the unit a peer syncs.
+// Close a block: seal the Perm layer at the block height, and make the
+// Dyna layer's live tail durable.
+//
+// Both halves matter, and the second one used to be missing.  Sealing
+// is the Perm layer's durability point and the unit a peer syncs, so
+// permanent records were durable the moment Seal returned.  Dynamic
+// writes were not: they sat in a 32 KB buffer until the tail filled,
+// was compacted, or the store was closed.  A node killed after a
+// commit therefore came back with permanent records -- chain elements
+// -- newer than the mutable state that indexes them, and the two
+// layers disagreed about where the block ended (issue #29).
+//
+// The Dyna layer is synced rather than sealed: its segments are local
+// (a peer never receives one), so there is nothing to gain from
+// cutting one per block and a full seal per block per shard to pay
+// for.  A sync on a tail that took no writes is free.
+//
+// Both layers are advanced before either error is returned, so a
+// failure to sync Dyna does not leave Perm unsealed and the block
+// unrepeatable.
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
-	return k.PermKV.Seal(height)
+	meta, err = k.PermKV.Seal(height)
+	if syncErr := k.DynaKV.Sync(); err == nil {
+		err = syncErr
+	}
+	return meta, err
 }
 
 // Put
