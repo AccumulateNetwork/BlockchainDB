@@ -751,6 +751,20 @@ var errStoreClosed = errors.New("segment store is closed")
 // matters wherever absence is what authorises a write.
 var errNotFound = errors.New("not found")
 
+// ErrImmutable is returned when a key already in an immutable store is
+// written with a different value.
+//
+// It is exported because refusing the write is a fact about the
+// caller's record model, not a store failure: a caller that classifies
+// its own records into the two layers -- which is the point of having
+// two, and what ShardWriter assumes by exposing only PutPerm and
+// PutDyna -- can carry on from a refusal by writing the record to the
+// dynamic layer, but must stop for a store that failed.  Without a
+// sentinel the two arrive as a bare error and the only way to separate
+// them is to match the message, which made the wording load-bearing
+// API that nothing here knew it had promised (issue #28).
+var ErrImmutable = errors.New("cannot overwrite immutable value")
+
 // checkOpen reports whether the store can be operated on.  The caller
 // must hold the Mutex.
 func (s *SegmentStore) checkOpen() error {
@@ -831,7 +845,7 @@ func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
 				return nil // Same value: no-op
 			}
 			s.stats.PutConflict++
-			return errors.New("cannot overwrite immutable value")
+			return ErrImmutable
 		}
 	}
 	s.stats.PutNew++

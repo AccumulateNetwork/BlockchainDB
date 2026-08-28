@@ -99,13 +99,16 @@ func TestSegmentStoreImmutability(t *testing.T) {
 	require.NoError(t, store.Put(key, []byte("original")))
 
 	require.NoError(t, store.Put(key, []byte("original")), "identical rewrite must be a no-op")
-	require.Error(t, store.Put(key, []byte("different")), "conflicting value must fail")
+	// ErrorIs, not Error: a caller routing its own records between the
+	// layers has to tell a refusal from a store failure without matching
+	// on the message (issue #28)
+	require.ErrorIs(t, store.Put(key, []byte("different")), ErrImmutable, "conflicting value must fail")
 
 	_, err = store.Seal(1)
 	require.NoError(t, err)
 
 	require.NoError(t, store.Put(key, []byte("original")), "identical rewrite of a sealed key must be a no-op")
-	require.Error(t, store.Put(key, []byte("different")), "conflicting value with a sealed key must fail")
+	require.ErrorIs(t, store.Put(key, []byte("different")), ErrImmutable, "conflicting value with a sealed key must fail")
 
 	v, err := store.Get(key)
 	require.NoError(t, err)

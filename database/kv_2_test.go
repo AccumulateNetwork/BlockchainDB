@@ -190,3 +190,42 @@ func TestKV2BlockSealAfterAutoSeals(t *testing.T) {
 	}
 	require.NoError(t, kv.Close())
 }
+
+// TestPutPermImmutableSentinel
+// A caller classifying its own records into the two layers has to tell
+// "I put this in the wrong layer" from "the store failed", and the
+// first is survivable: the record belongs in the dynamic layer.  Both
+// used to arrive as a bare error, so the only way to separate them was
+// to match the message (issue #28).  PutPerm returns the Perm layer's
+// error unwrapped, at both the KV2 and the sharded layer, so errors.Is
+// has to reach ErrImmutable through either.
+func TestPutPermImmutableSentinel(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+	// NewKV2 creates its own directory with Mkdir, not MkdirAll, so the
+	// parent this test puts the two databases under has to exist first
+	require.NoError(t, os.MkdirAll(dir, os.ModePerm))
+
+	kv, err := NewKV2(filepath.Join(dir, "kv2"), 1000)
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{43})
+	key := kr.NextHash()
+	_, err = kv.PutPerm(key, []byte("original"))
+	require.NoError(t, err)
+
+	_, err = kv.PutPerm(key, []byte("original"))
+	require.NoError(t, err, "an identical rewrite is a replay, not a refusal")
+
+	_, err = kv.PutPerm(key, []byte("different"))
+	require.ErrorIs(t, err, ErrImmutable)
+	require.NoError(t, kv.Close())
+
+	// And through the shard router, which is what a node writes to
+	kvs, err := NewKVShard(filepath.Join(dir, "shard"), 1000)
+	require.NoError(t, err)
+	require.NoError(t, kvs.PutPerm(key, []byte("original")))
+	require.ErrorIs(t, kvs.PutPerm(key, []byte("different")), ErrImmutable)
+	require.NoError(t, kvs.Close())
+}
