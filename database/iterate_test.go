@@ -2,7 +2,9 @@ package blockchainDB
 
 import (
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -135,4 +137,110 @@ func TestForEachStopsOnError(t *testing.T) {
 	require.ErrorIs(t, err, stop)
 	require.Equal(t, 10, seen, "iteration continued past the error")
 	require.NoError(t, store.Close())
+}
+
+// TestForEachCallbackMayUseTheStore
+// The callback runs with no lock held, so it can read and write the
+// store it is walking.  Both used to deadlock: ForEach took the
+// store's mutex for the whole iteration, so the first Get inside the
+// callback blocked forever on a lock its own caller held (issue #31).
+//
+// A deadlock hangs rather than failing, so this runs on its own
+// goroutine against a deadline: a timeout is the failure.
+func TestForEachCallbackMayUseTheStore(t *testing.T) {
+	dir := storeDir(t, "cb")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+
+	kr := NewFastRandom([]byte{47})
+	keys := make([][32]byte, 50)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, store.Put(keys[i], []byte(fmt.Sprintf("v%d", i))))
+	}
+	_, err = store.Seal(1)
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		seen := 0
+		done <- store.ForEach(func(key [32]byte, value []byte) error {
+			// Read the store from inside its own iteration
+			got, err := store.Get(key)
+			if err != nil {
+				return fmt.Errorf("Get inside ForEach: %w", err)
+			}
+			if string(got) != string(value) {
+				return fmt.Errorf("Get disagreed with ForEach for a key")
+			}
+			// And write to it: the snapshot means this is not re-emitted
+			if seen == 0 {
+				if err := store.Put(kr.NextHash(), []byte("added during iteration")); err != nil {
+					return fmt.Errorf("Put inside ForEach: %w", err)
+				}
+			}
+			seen++
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("ForEach deadlocked: the callback could not use the store")
+	}
+}
+
+// TestForEachSurvivesConcurrentCompaction
+// A compaction that commits mid-iteration replaces the sealed
+// generation and deletes the files the iteration is reading.  The
+// iteration must still complete and still report the snapshot it
+// started from.
+func TestForEachSurvivesConcurrentCompaction(t *testing.T) {
+	dir := storeDir(t, "compact")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+
+	kr := NewFastRandom([]byte{48})
+	keys := make([][32]byte, 400)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, store.Put(keys[i], []byte(fmt.Sprintf("v%d", i))))
+		if i%100 == 99 {
+			_, err = store.Seal(uint64(i/100 + 1))
+			require.NoError(t, err)
+		}
+	}
+	require.Greater(t, len(store.segments), 1, "need several generations to compact away")
+
+	compacted := make(chan error, 1)
+	var once sync.Once
+	seen := 0
+	err = store.ForEach(func(key [32]byte, value []byte) error {
+		seen++
+		if seen == 10 { // Well into the sealed segments
+			once.Do(func() {
+				go func() {
+					_, err := store.CompactNext()
+					compacted <- err
+				}()
+			})
+			// Give the compaction a chance to commit and delete
+			time.Sleep(200 * time.Millisecond)
+		}
+		return nil
+	})
+	require.NoError(t, err, "iteration must survive the files being retired under it")
+	require.NoError(t, <-compacted, "the compaction itself must succeed")
+	require.Equal(t, len(keys), seen, "the snapshot must still report every key")
+
+	// And the store is intact afterwards
+	for i, key := range keys {
+		v, err := store.Get(key)
+		require.NoErrorf(t, err, "key %d lost", i)
+		require.Equal(t, fmt.Sprintf("v%d", i), string(v))
+	}
 }

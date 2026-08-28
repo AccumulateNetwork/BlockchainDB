@@ -67,9 +67,15 @@ func TestDynaCompressReclaims(t *testing.T) {
 }
 
 // TestDynaCompressIsIdempotent
-// Compress on an already-compacted layer must not rewrite it, and must
-// not lose anything.  KVShard compresses on a write count, so a shard
-// whose keys rarely repeat hits this path often.
+// Compress must not rewrite a layer that has nothing to reclaim, and
+// must not lose anything either way.  KVShard compresses on a write
+// count, so a shard whose keys rarely repeat hits this path often.
+//
+// "Nothing to reclaim" now means Compress does nothing at all, rather
+// than sealing the tail and rewriting the single generation that
+// produced.  The seal was the reason it could not opt out: it added a
+// second segment, so the single-generation early-out never applied and
+// every call paid for a full rewrite of the layer (issue #31).
 func TestDynaCompressIsIdempotent(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	kv2, err := NewKV2(dir, 1000)
@@ -85,10 +91,29 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	// Distinct keys, so not one record is superseded
 	require.NoError(t, kv2.Compress())
-	require.Len(t, kv2.DynaKV.segments, 1)
+	assert.Empty(t, kv2.DynaKV.segments,
+		"nothing was overwritten: Compress must not seal a generation in order to rewrite it")
+	for i := range keys {
+		v, err := kv2.Get(keys[i])
+		require.NoErrorf(t, err, "key %d after a no-op compress", i)
+		assert.Equal(t, values[i], v)
+	}
+
+	// Now overwrite every key enough times to be worth reclaiming
+	for round := 0; round < 3; round++ {
+		for i := range keys {
+			values[i] = vr.RandBuff(20, 100)
+			_, err = kv2.PutDyna(keys[i], values[i])
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, kv2.Compress())
+	require.Len(t, kv2.DynaKV.segments, 1, "three quarters of the layer is garbage: it must compact")
 	first := kv2.DynaKV.segments[0].meta
 
+	// The generation just written has nothing superseded in it
 	require.NoError(t, kv2.Compress(), "second compress")
 	require.Len(t, kv2.DynaKV.segments, 1)
 	assert.Equal(t, first, kv2.DynaKV.segments[0].meta, "nothing to reclaim: the generation should stand as it is")
