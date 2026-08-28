@@ -102,12 +102,24 @@ type StoreManifest struct {
 	Segments    []SegmentMeta `json:"segments"`    // Oldest first
 
 	// BloomValid says the persisted key filter (bloom.dat) covers
-	// exactly the sealed segments listed here, and BloomHeight/BloomSeq
-	// name the newest of them.  Height 0, Seq 0 is a legitimate
-	// segment, so the flag carries the claim rather than the numbers.
-	BloomValid  bool   `json:"bloomValid,omitempty"`
-	BloomHeight uint64 `json:"bloomHeight,omitempty"`
-	BloomSeq    uint64 `json:"bloomSeq,omitempty"`
+	// exactly the sealed segments listed here; BloomHeight/BloomSeq name
+	// the newest of them and BloomSegments counts them.
+	//
+	// The count is not redundant.  A filter saved when the store had no
+	// segments records the zero value for the newest one -- (0, 0) --
+	// and (0, 0) is also the identity of the FIRST segment a store
+	// seals.  The Dyna layer numbers every segment at height 0, so its
+	// first is exactly (0, 0): an empty filter's "covers nothing" was
+	// indistinguishable from "covers segment (0, 0)", and a crash that
+	// left a segment for recoverOrphans to adopt without rewriting the
+	// manifest produced exactly that pair.  The empty filter was then
+	// accepted as covering it, and every key in that segment answered
+	// "not found" -- a false negative, which is silent data loss rather
+	// than the slow lookup a false positive costs (issue #35).
+	BloomValid    bool   `json:"bloomValid,omitempty"`
+	BloomHeight   uint64 `json:"bloomHeight,omitempty"`
+	BloomSeq      uint64 `json:"bloomSeq,omitempty"`
+	BloomSegments uint64 `json:"bloomSegments,omitempty"`
 }
 
 // segment
@@ -223,8 +235,9 @@ type SegmentStore struct {
 	// bloomValid/bloomAt are the coverage claim writeManifest records.
 	// It is a one-shot: only the manifest written immediately after a
 	// save carries it.
-	bloomValid bool
-	bloomAt    SegmentMeta
+	bloomValid    bool
+	bloomAt       SegmentMeta
+	bloomSegments uint64
 
 	stats StoreStats // Counted under the Mutex, like everything else here
 }
@@ -416,9 +429,14 @@ func (s *SegmentStore) load() (err error) {
 // behind the segment list, so each of them rebuilds.
 func (s *SegmentStore) loadKeyFilter(m *StoreManifest) (err error) {
 	newest, ok := s.newestMeta()
-	covered := m.BloomValid &&
-		((ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq) ||
-			(!ok && len(s.segments) == 0)) // An empty filter covers no segments
+	// The count first: it is what separates "covers nothing" from
+	// "covers segment (0, 0)", which the newest-segment identity alone
+	// cannot do.  A manifest written before the count existed reads as
+	// 0, so a store with segments falls through to a rebuild -- slower,
+	// and correct.
+	covered := m.BloomValid && uint64(len(s.segments)) == m.BloomSegments &&
+		(m.BloomSegments == 0 || // An empty filter covers no segments
+			(ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq))
 	if covered {
 		if s.keys, err = LoadBloomSet(s.Directory); err == nil {
 			return nil
@@ -712,7 +730,8 @@ func (s *SegmentStore) writeManifest() (err error) {
 	defer func() { s.bloomValid = false }()
 
 	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
-		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq}
+		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq,
+		BloomSegments: s.bloomSegments}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}
@@ -1612,7 +1631,8 @@ func (s *SegmentStore) Close() (err error) {
 	// reason to fail the close: the next open rebuilds.
 	if !s.closed && s.keys != nil {
 		if err := s.keys.Save(s.Directory); err == nil {
-			s.bloomAt, _ = s.newestMeta() // Zero when there are none, which is what covers none
+			s.bloomAt, _ = s.newestMeta()
+			s.bloomSegments = uint64(len(s.segments)) // What "covers none" needs to say so
 			s.bloomValid = true
 			if err := s.writeManifest(); err != nil {
 				return err
