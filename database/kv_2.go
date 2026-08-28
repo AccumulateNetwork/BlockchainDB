@@ -258,22 +258,28 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		}
 		return k.DWrites, k.sealDynaIfFull()
 	}
-	if value2, err2 := k.PermKV.Get(key); err2 == nil { // Check. Is it a PermKV
-		if bytes.Equal(value, value2) { // If no change, ignore;
-			return k.PWrites, nil
-		}
-		k.DWrites++
-		if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
-			return k.DWrites, err
-		}
-		return k.DWrites, k.sealDynaIfFull()
-	}
-	// If not yet a DynaKV or not in k.PermKV, default to k.PermKV
-	k.PWrites++
-	if err = k.PermKV.Put(key, value); err != nil {
+	// One lookup settles all three Perm cases: absent (in which case the
+	// write has already happened), present and identical (nothing to
+	// do), present and different (the key becomes dynamic).  Asking
+	// whether the key was there and then calling Put, which asked again
+	// to enforce immutability, made a new key -- the common case, and a
+	// miss by definition -- pay for the answer twice.
+	existing, existed, err := k.PermKV.PutIfAbsent(key, value)
+	if err != nil {
 		return k.DWrites, err
 	}
-	return k.DWrites, k.sealPermIfFull() // We do not compact the PermKV ... Only report DWrites
+	if !existed { // It is a new permanent key, and it is now written
+		k.PWrites++
+		return k.DWrites, k.sealPermIfFull() // PermKV is never compacted; report DWrites
+	}
+	if bytes.Equal(existing, value) { // If no change, ignore;
+		return k.PWrites, nil
+	}
+	k.DWrites++
+	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
+		return k.DWrites, err
+	}
+	return k.DWrites, k.sealDynaIfFull()
 }
 
 // Compress
