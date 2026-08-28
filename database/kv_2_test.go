@@ -3,10 +3,13 @@ package blockchainDB
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestKV2(t *testing.T) {
@@ -143,4 +146,47 @@ func TestKV2_2(t *testing.T) {
 
 	fmt.Printf("Writes per second %10.3f Reads per second %10.3f\n", wps, rps)
 	fmt.Printf("Writes %s Reads %s\n", ComputeTimePerOp(wps), ComputeTimePerOp(rps))
+}
+
+// TestKV2BlockSealAfterAutoSeals
+// The reproduction from issue #27, at the layer a node actually uses:
+// a live tail that fills eight times before the first block boundary
+// used to make Seal(1) -- and so every later block -- fail forever.
+func TestKV2BlockSealAfterAutoSeals(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	defer os.RemoveAll(dir)
+
+	kv, err := NewKV2(dir, 60) // sealLimit 60
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{41})
+	keys := make([][32]byte, 500)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		_, err = kv.PutPerm(keys[i], []byte("v"))
+		require.NoError(t, err)
+	}
+	require.Greater(t, len(kv.PermKV.segments), 1, "the tail must have auto-sealed for this to test anything")
+
+	_, err = kv.Seal(1)
+	require.NoError(t, err, "the first block boundary must be sealable after auto-seals")
+
+	// Keep going: more writes, more auto-seals, more blocks
+	for b := uint64(2); b <= 4; b++ {
+		for i := 0; i < 200; i++ {
+			k := kr.NextHash()
+			keys = append(keys, k)
+			_, err = kv.PutPerm(k, []byte("v"))
+			require.NoError(t, err)
+		}
+		_, err = kv.Seal(b)
+		require.NoErrorf(t, err, "block %d must be sealable", b)
+	}
+
+	for i, k := range keys {
+		v, err := kv.Get(k)
+		require.NoErrorf(t, err, "key %d lost across blocks", i)
+		require.Equal(t, []byte("v"), v)
+	}
+	require.NoError(t, kv.Close())
 }

@@ -10,13 +10,28 @@ v1 keeps data in `kfile.dat` + `history.dat` + `values.dat` and treats
 segments as an *export format*: syncing a peer re-inserts every record.
 v2 makes the segment format the *storage* itself.
 
-    live.dat            records accepted since the last seal
-    seg-<height>.dat    a sealed, immutable segment (the transport format)
-    seg-<height>.idx    its index: sorted 48-byte key records + a bloom
-    segments.json       the manifest: segments, counts, hashes
+    live.dat                  records accepted since the last seal
+    seg-<block>-<seq>.dat     a sealed, immutable segment (the transport format)
+    seg-<block>-<seq>.idx     its index: sorted 48-byte key records + a bloom
+    segments.json             the manifest: segments, counts, hashes
 
 Writes append to the live tail. `Seal(height)` turns the tail into an
 immutable segment; nothing already written is ever moved or rewritten.
+
+A segment is identified by **(block, seq)**, not by block alone. The
+block is globally agreed, which is what lets a peer decide whether it
+already holds a segment; `seq` orders the segments within one block. A
+tail that fills mid-block seals itself, and those auto-seals take the
+next `seq` rather than a block number of their own. Conflating the two
+was issue #27: auto-seals consumed block numbers, so once a shard's
+tail had filled more times than the current block, every subsequent
+block boundary failed permanently and block export stopped working
+altogether.
+
+`Seal(height)` closes a block and advances the block the tail
+accumulates into, so auto-seals that follow are tagged with the block
+they actually belong to. Re-closing a block that is already closed is
+rejected.
 Lookups check the tail, then segments newest to oldest — each segment's
 bloom filter (sized from its own key count) keeps that to about one
 binary search.
@@ -88,13 +103,13 @@ pins the behaviour.)
 ## Crash recovery
 
 The manifest is the commit point for sealing, importing, and
-compaction, and its newest height decides what to do with a data file
-the manifest does not name:
+compaction, and its newest `(block, seq)` decides what to do with a
+data file the manifest does not name:
 
-- **above** the newest height — a seal or import that reached disk but
-  not the manifest. It is complete by construction (fsync precedes the
-  rename), so it is adopted, its index rebuilt if missing, and the
-  manifest updated.
+- **above** the newest `(block, seq)` — a seal or import that reached
+  disk but not the manifest. It is complete by construction (fsync
+  precedes the rename), so it is adopted, its index rebuilt if missing,
+  and the manifest updated.
 - **at or below** — superseded by a committed compaction; deleted.
 - `*.tmp` — never complete; deleted.
 
@@ -172,7 +187,13 @@ record from a crash mid-write is dropped.
    `TestCrashRecovery` was retargeted from `KV` to `KV2` rather than
    deleted, so the SIGKILL durability contract is still enforced end
    to end.
-4. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
+4. **Done** — a segment is identified by `(block, seq)` rather than by
+   block alone, so a tail that fills mid-block no longer consumes block
+   numbers (issue #27). `ExportBlock` also seals every shard before
+   copying any of them: sealing is durable and cannot be rolled back,
+   so a failure partway through the copy phase would otherwise leave a
+   block half-built with some shards already closed at that height.
+5. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
 Not yet done here: a per-segment key count cap (segments grow with the

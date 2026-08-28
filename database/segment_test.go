@@ -22,9 +22,13 @@ func TestSegmentRoundTrip(t *testing.T) {
 		defer os.RemoveAll(d)
 	}
 
-	// Node A: two "blocks" of writes.  A seal limit of 50 forces
-	// auto-seals, so a block exports more than one segment per shard.
-	nodeA, err := NewKVShard(dirA, 50)
+	// Node A: two "blocks" of writes.  The seal limit is deliberately
+	// tiny relative to the keys per shard, so tails fill mid-block and
+	// auto-seal -- the case ExportBlock claims to support and issue #27
+	// showed it did not.  At 512 shards this needs thousands of keys to
+	// reach even a handful per shard; the previous 400 never auto-sealed
+	// once, so the test certified a path it never entered.
+	nodeA, err := NewKVShard(dirA, 2)
 	require.NoError(t, err)
 
 	kr := NewFastRandom([]byte{91})
@@ -41,11 +45,21 @@ func TestSegmentRoundTrip(t *testing.T) {
 		}
 	}
 
-	writeBlock(400)
+	writeBlock(4000)
+
+	// Confirm the premise: some shard really did auto-seal
+	autoSealed := 0
+	for _, sh := range nodeA.Shards {
+		if len(sh.PermKV.segments) > 0 {
+			autoSealed += len(sh.PermKV.segments)
+		}
+	}
+	require.Greater(t, autoSealed, 0, "no shard auto-sealed; the test would not exercise issue #27")
+
 	m1, err := nodeA.ExportBlock(exportDir, 1, nil)
 	require.NoError(t, err, "export block 1")
 
-	writeBlock(300)
+	writeBlock(3000)
 	m2, err := nodeA.ExportBlock(exportDir, 2, m1)
 	require.NoError(t, err, "export block 2")
 
@@ -58,18 +72,18 @@ func TestSegmentRoundTrip(t *testing.T) {
 	for _, s := range m2.Segments {
 		c2 += s.Count
 	}
-	assert.Equal(t, uint64(400), c1, "block 1 record count")
-	assert.Equal(t, uint64(300), c2, "block 2 record count")
+	assert.Equal(t, uint64(4000), c1, "block 1 record count")
+	assert.Equal(t, uint64(3000), c2, "block 2 record count")
 
 	// Node B: verify + import in height order
-	nodeB, err := NewKVShard(dirB, 50)
+	nodeB, err := NewKVShard(dirB, 2)
 	require.NoError(t, err)
 	n1, err := nodeB.ImportBlock(filepath.Join(exportDir, "block-00000001"))
 	require.NoError(t, err, "import block 1")
-	assert.Equal(t, uint64(400), n1)
+	assert.Equal(t, uint64(4000), n1)
 	n2, err := nodeB.ImportBlock(filepath.Join(exportDir, "block-00000002"))
 	require.NoError(t, err, "import block 2")
-	assert.Equal(t, uint64(300), n2)
+	assert.Equal(t, uint64(3000), n2)
 
 	// Node B must now hold every key with the correct value
 	for i, key := range keys {

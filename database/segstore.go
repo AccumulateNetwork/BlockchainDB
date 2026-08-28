@@ -69,20 +69,45 @@ const (
 
 // SegmentMeta
 // One sealed segment as recorded in the manifest
+// A segment is identified by (Height, Seq), not by Height alone.
+// Height is the block the segment belongs to and is globally agreed,
+// which is what lets a peer decide whether it already has a segment.
+// Seq orders the segments within one block: a live tail that fills
+// mid-block seals on its own, and those auto-seals must not consume
+// block numbers -- doing so made every later block boundary fail
+// permanently (issue #27).
 type SegmentMeta struct {
-	Height uint64 `json:"height"` // Block height the segment was sealed at
+	Height uint64 `json:"height"` // Block the segment belongs to
+	Seq    uint64 `json:"seq"`    // Order within that block
 	File   string `json:"file"`   // Data file name within the store directory
 	Count  uint64 `json:"count"`  // Number of keys indexed
 	Hash   string `json:"hash"`   // SHA-256 of the data file, hex
+}
+
+// after reports whether a is a strictly later segment than b
+func (a SegmentMeta) after(b SegmentMeta) bool {
+	if a.Height != b.Height {
+		return a.Height > b.Height
+	}
+	return a.Seq > b.Seq
 }
 
 // StoreManifest
 // The authoritative list of a store's sealed segments.  Replacing it
 // is the commit point for both sealing and compaction.
 type StoreManifest struct {
-	Mutable   bool          `json:"mutable"`
-	SealLimit uint64        `json:"sealLimit"` // 0: unset, caller decides
-	Segments  []SegmentMeta `json:"segments"`  // Oldest first
+	Mutable     bool          `json:"mutable"`
+	SealLimit   uint64        `json:"sealLimit"`   // 0: unset, caller decides
+	BlockHeight uint64        `json:"blockHeight"` // Block currently being accumulated
+	Segments    []SegmentMeta `json:"segments"`    // Oldest first
+
+	// BloomValid says the persisted key filter (bloom.dat) covers
+	// exactly the sealed segments listed here, and BloomHeight/BloomSeq
+	// name the newest of them.  Height 0, Seq 0 is a legitimate
+	// segment, so the flag carries the claim rather than the numbers.
+	BloomValid  bool   `json:"bloomValid,omitempty"`
+	BloomHeight uint64 `json:"bloomHeight,omitempty"`
+	BloomSeq    uint64 `json:"bloomSeq,omitempty"`
 }
 
 // segment
@@ -161,6 +186,12 @@ type SegmentStore struct {
 	// before this was persisted a reopened database silently fell back
 	// to a default, discarding the only parameter its constructor takes.
 	SealLimit uint64
+
+	// blockHeight is the block whose writes the live tail is
+	// accumulating.  A block boundary seals at its own height and then
+	// advances this, so auto-seals in between are tagged with the block
+	// they actually belong to rather than allocating one of their own.
+	blockHeight uint64
 
 	segments    []*segment           // Sealed segments, oldest first
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
@@ -252,6 +283,7 @@ func (s *SegmentStore) load() (err error) {
 	}
 	s.Mutable = m.Mutable
 	s.SealLimit = m.SealLimit
+	s.blockHeight = m.BlockHeight
 
 	for _, meta := range m.Segments {
 		seg, err := s.openSegment(meta)
@@ -406,7 +438,7 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 	for _, seg := range s.segments {
 		known[seg.meta.File] = true
 	}
-	newest, haveSegments := s.newestHeight()
+	newest, haveSegments := s.newestMeta()
 
 	var adopted []SegmentMeta
 	for _, e := range entries {
@@ -418,12 +450,13 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 		if !strings.HasPrefix(name, segFilePrefix) || !strings.HasSuffix(name, segDataSuffix) || known[name] {
 			continue
 		}
-		height, err := heightFromName(name)
+		height, seq, err := keyFromName(name)
 		if err != nil {
 			continue // Not ours
 		}
+		orphan := SegmentMeta{Height: height, Seq: seq}
 		path := filepath.Join(s.Directory, name)
-		if haveSegments && height <= newest { // Superseded by a committed compaction
+		if haveSegments && !orphan.after(newest) { // Superseded by a committed compaction
 			os.Remove(path)
 			os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
 			continue
@@ -432,13 +465,13 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 		if err != nil {
 			return err
 		}
-		adopted = append(adopted, SegmentMeta{Height: height, File: name, Count: count, Hash: hash})
+		adopted = append(adopted, SegmentMeta{Height: height, Seq: seq, File: name, Count: count, Hash: hash})
 	}
 	if len(adopted) == 0 {
 		return nil
 	}
 
-	sort.Slice(adopted, func(i, j int) bool { return adopted[i].Height < adopted[j].Height })
+	sort.Slice(adopted, func(i, j int) bool { return adopted[j].after(adopted[i]) })
 	for _, meta := range adopted {
 		seg, err := s.openSegment(meta)
 		if err != nil {
@@ -452,15 +485,25 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 }
 
 // heightFromName parses seg-<height>.dat
-func heightFromName(name string) (height uint64, err error) {
+// keyFromName recovers (height, seq) from a data file name.  Files
+// written before segments carried a sequence have no "-seq" part and
+// read back as seq 0, which is what they were.
+func keyFromName(name string) (height, seq uint64, err error) {
 	body := strings.TrimSuffix(strings.TrimPrefix(name, segFilePrefix), segDataSuffix)
+	if h, s, ok := strings.Cut(body, "-"); ok {
+		if _, err = fmt.Sscanf(h, "%d", &height); err != nil {
+			return 0, 0, err
+		}
+		_, err = fmt.Sscanf(s, "%d", &seq)
+		return height, seq, err
+	}
 	_, err = fmt.Sscanf(body, "%d", &height)
-	return height, err
+	return height, 0, err
 }
 
-// segmentFileName is the data file name for a height
-func segmentFileName(height uint64) string {
-	return fmt.Sprintf("%s%08d%s", segFilePrefix, height, segDataSuffix)
+// segmentFileName is the data file name for a (height, seq)
+func segmentFileName(height, seq uint64) string {
+	return fmt.Sprintf("%s%08d-%04d%s", segFilePrefix, height, seq, segDataSuffix)
 }
 
 // readManifest loads segments.json
@@ -480,7 +523,7 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 // Replace the manifest atomically.  This is the commit point for
 // sealing, importing, and compaction.
 func (s *SegmentStore) writeManifest() (err error) {
-	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit}
+	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}
@@ -519,6 +562,12 @@ func (s *SegmentStore) writeManifest() (err error) {
 // answer "not found" for keys that are simply not loaded.  Callers
 // reopen with Open, which is cheap and safe on an already-open store.
 var errStoreClosed = errors.New("segment store is closed")
+
+// errNotFound is what a lookup returns for a key the store does not
+// hold.  It is a single value rather than a fresh error per call so
+// that a caller can tell "absent" from "the read failed", which
+// matters wherever absence is what authorises a write.
+var errNotFound = errors.New("not found")
 
 // checkOpen reports whether the store can be operated on.  The caller
 // must hold the Mutex.
@@ -559,7 +608,7 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 			return s.segments[i].value(dbb)
 		}
 	}
-	return nil, errors.New("not found")
+	return nil, errNotFound
 }
 
 // Put
@@ -587,7 +636,6 @@ func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
 			return errors.New("cannot overwrite immutable value")
 		}
 	}
-
 	offset := s.liveFile.EOD + s.liveFile.EOB
 	var recHdr [segRecHdrSize]byte
 	copy(recHdr[:32], key[:])
@@ -622,24 +670,15 @@ func (s *SegmentStore) LiveRecords() uint64 {
 	return s.liveRecords
 }
 
-// nextHeight
-// The height at which a seal or compaction lands above every existing
-// segment.  The caller must hold the Mutex.
-func (s *SegmentStore) nextHeight() uint64 {
-	if newest, ok := s.newestHeight(); ok {
-		return newest + 1
-	}
-	return 0
-}
-
 // SealNext
-// Seal the live tail at the next available height.  Used to bound the
-// live tail when no block boundary has arrived; block boundaries call
-// Seal with the block height instead.
+// Seal the live tail without a block boundary, to bound the tail when
+// it fills mid-block.  The segment is tagged with the block currently
+// being accumulated and takes the next sequence within it, so an
+// auto-seal never consumes a block number (issue #27).
 func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-	return s.seal(s.nextHeight())
+	return s.seal(s.blockHeight, false)
 }
 
 // Seal
@@ -649,25 +688,40 @@ func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
 // When the tail holds no shadowed records -- the usual case for an
 // immutable store -- the file is renamed into place rather than
 // copied, so sealing costs a header write, an index build, and a hash.
+// Sealing at a block boundary also advances the block the live tail
+// accumulates into, so the auto-seals that follow are tagged with the
+// next block rather than the one just closed.
 func (s *SegmentStore) Seal(height uint64) (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-	return s.seal(height)
+	return s.seal(height, true)
 }
 
-// seal is Seal; the caller must hold the Mutex
-func (s *SegmentStore) seal(height uint64) (meta SegmentMeta, err error) {
+// seal is Seal; the caller must hold the Mutex.  blockBoundary marks
+// the seal as closing `height` rather than merely bounding the tail
+// inside it.
+func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta, err error) {
 	if err = s.checkOpen(); err != nil {
 		return meta, err
 	}
-	if len(s.live) == 0 {
-		return meta, nil // Nothing to seal
+	if blockBoundary && s.blockHeight > height {
+		return meta, fmt.Errorf("block %d is already closed; now accumulating block %d", height, s.blockHeight)
 	}
-	if newest, ok := s.newestHeight(); ok && height <= newest {
-		return meta, fmt.Errorf("seal height %d is not above the newest segment height %d", height, newest)
+	seq, err := s.nextKeyAt(height)
+	if err != nil {
+		return meta, err
+	}
+	if len(s.live) == 0 {
+		// Nothing to seal, but a block boundary still closes the block:
+		// the next writes belong to the block after this one
+		if blockBoundary && s.blockHeight <= height {
+			s.blockHeight = height + 1
+			return meta, s.writeManifest()
+		}
+		return meta, nil
 	}
 
-	dataName := segmentFileName(height)
+	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 
 	var sl sealed
@@ -688,12 +742,18 @@ func (s *SegmentStore) seal(height uint64) (meta SegmentMeta, err error) {
 		return meta, err
 	}
 
-	meta = SegmentMeta{Height: height, File: dataName, Count: uint64(len(sl.order)), Hash: sl.hash}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(sl.order)), Hash: sl.hash}
 	seg, err := s.openSegment(meta)
 	if err != nil {
 		return meta, err
 	}
 	s.segments = append(s.segments, seg)
+	if s.blockHeight < height {
+		s.blockHeight = height
+	}
+	if blockBoundary {
+		s.blockHeight = height + 1 // The next writes belong to the next block
+	}
 
 	if err = s.writeManifest(); err != nil { // Commit
 		return meta, err
@@ -707,17 +767,37 @@ func (s *SegmentStore) seal(height uint64) (meta SegmentMeta, err error) {
 	return meta, nil
 }
 
-// newestHeight
-// The height of the newest sealed segment.  ok is false when the store
-// has no sealed segments, so that height 0 (a genesis block) is a
-// usable height rather than a sentinel.
-func (s *SegmentStore) newestHeight() (newest uint64, ok bool) {
+// newestMeta
+// The newest sealed segment by (Height, Seq).  ok is false when the
+// store has no sealed segments, so that height 0 (a genesis block) is
+// a usable height rather than a sentinel.
+func (s *SegmentStore) newestMeta() (newest SegmentMeta, ok bool) {
 	for _, seg := range s.segments {
-		if !ok || seg.meta.Height > newest {
-			newest, ok = seg.meta.Height, true
+		if !ok || seg.meta.after(newest) {
+			newest, ok = seg.meta, true
 		}
 	}
 	return newest, ok
+}
+
+// nextKeyAt
+// The identity a new segment takes when it is sealed into block
+// `height`: the next sequence within that block, or 0 if the block has
+// no segments yet.  Returns an error if the store already holds a
+// segment from a later block, which would break the ordering every
+// other part of the store relies on.
+func (s *SegmentStore) nextKeyAt(height uint64) (seq uint64, err error) {
+	newest, ok := s.newestMeta()
+	if !ok {
+		return 0, nil
+	}
+	if height < newest.Height {
+		return 0, fmt.Errorf("block height %d is below the newest segment's block %d", height, newest.Height)
+	}
+	if height == newest.Height {
+		return newest.Seq + 1, nil
+	}
+	return 0, nil
 }
 
 // sealed
@@ -890,7 +970,7 @@ func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
 func (s *SegmentStore) CompactNext() (meta SegmentMeta, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-	return s.compact(s.nextHeight())
+	return s.compact(s.blockHeight)
 }
 
 // compact is Compact; the caller must hold the Mutex
@@ -901,8 +981,12 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	if len(s.segments) == 0 {
 		return meta, nil
 	}
-	if newest, ok := s.newestHeight(); ok && height <= newest {
-		return meta, fmt.Errorf("compaction height %d is not above the newest segment height %d", height, newest)
+	seq, err := s.nextKeyAt(height)
+	if err != nil {
+		return meta, err
+	}
+	if s.blockHeight < height {
+		s.blockHeight = height
 	}
 
 	// Newest wins: walk segments newest to oldest, keeping the first
@@ -945,7 +1029,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	}
 	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
 
-	dataName := segmentFileName(height)
+	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 	tmpPath := filepath.Join(s.Directory, segCompactName+segTmpSuffix)
 	f, err := os.Create(tmpPath)
@@ -1018,7 +1102,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 		return meta, err
 	}
 
-	meta = SegmentMeta{Height: height, File: dataName, Count: uint64(len(keys)), Hash: ""}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(keys)), Hash: ""}
 	if h != nil {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
@@ -1044,6 +1128,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 		os.Remove(path)
 		os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
 	}
+
 	return meta, nil
 }
 
@@ -1077,18 +1162,19 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	}
 
 	for _, seg := range s.segments {
-		if seg.meta.Height == meta.Height && seg.meta.Hash == meta.Hash {
+		if seg.meta.Height == meta.Height && seg.meta.Seq == meta.Seq && seg.meta.Hash == meta.Hash {
 			return nil // Already have it
 		}
 	}
-	if newest, ok := s.newestHeight(); ok && meta.Height <= newest {
-		return fmt.Errorf("segment height %d is not above the newest segment height %d", meta.Height, newest)
+	if newest, ok := s.newestMeta(); ok && !meta.after(newest) {
+		return fmt.Errorf("segment (block %d, seq %d) is not above the newest segment (block %d, seq %d)",
+			meta.Height, meta.Seq, newest.Height, newest.Seq)
 	}
 	if err = VerifySegmentFile(path, meta.Hash); err != nil {
 		return err
 	}
 
-	dataName := segmentFileName(meta.Height)
+	dataName := segmentFileName(meta.Height, meta.Seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 	tmpPath := dataPath + segTmpSuffix
 	if err = copyFileSynced(path, tmpPath); err != nil {
@@ -1112,6 +1198,9 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	}
 	meta.Count = uint64(seg.count)
 	seg.meta = meta
+	if s.blockHeight < meta.Height {
+		s.blockHeight = meta.Height
+	}
 
 	// An immutable store must not silently shadow a value it already
 	// holds: that is a divergence, not an update.  Checking is cheap
@@ -1174,6 +1263,7 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 func (s *SegmentStore) Close() (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+
 	if s.liveFile != nil && s.liveFile.File != nil {
 		if err = s.liveFile.Close(); err != nil {
 			return err

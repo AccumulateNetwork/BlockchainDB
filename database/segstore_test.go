@@ -535,3 +535,74 @@ func TestSegmentStoreTornTailIsTruncated(t *testing.T) {
 	require.Error(t, err, "the torn record must not resolve")
 	require.NoError(t, s3.Close())
 }
+
+// TestAutoSealDoesNotConsumeBlockHeights
+// Regression test for issue #27.  Auto-seals used to allocate
+// newest+1 -- the same namespace block boundaries use -- so once a
+// shard's live tail had filled more times than the current block
+// number, every SealBlock/ExportBlock failed permanently.
+func TestAutoSealDoesNotConsumeBlockHeights(t *testing.T) {
+	dir := storeDir(t, "autoseal")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+
+	// Eight auto-seals before the first block boundary ever arrives
+	kr := NewFastRandom([]byte{41})
+	for i := 0; i < 8; i++ {
+		for j := 0; j < 5; j++ {
+			require.NoError(t, store.Put(kr.NextHash(), []byte("v")))
+		}
+		_, err = store.SealNext()
+		require.NoError(t, err)
+	}
+	require.Len(t, store.segments, 8)
+	for i, seg := range store.segments {
+		assert.Equal(t, uint64(0), seg.meta.Height, "auto-seal %d must stay in block 0", i)
+		assert.Equal(t, uint64(i), seg.meta.Seq, "auto-seal %d must take the next sequence", i)
+	}
+
+	// The first block boundary must still be sealable
+	require.NoError(t, store.Put(kr.NextHash(), []byte("v")))
+	meta, err := store.Seal(1)
+	require.NoError(t, err, "block 1 must be sealable after auto-seals")
+	assert.Equal(t, uint64(1), meta.Height)
+	assert.Equal(t, uint64(0), meta.Seq, "a new block starts a new sequence")
+
+	// And auto-seals after the boundary belong to the NEXT block, not
+	// the one just closed -- they hold writes that arrived after it
+	require.NoError(t, store.Put(kr.NextHash(), []byte("v")))
+	auto, err := store.SealNext()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), auto.Height, "an auto-seal after block 1 belongs to block 2")
+
+	require.NoError(t, store.Put(kr.NextHash(), []byte("v")))
+	meta, err = store.Seal(2)
+	require.NoError(t, err, "block 2 must be sealable after an auto-seal inside it")
+	assert.Equal(t, uint64(2), meta.Height)
+	assert.Equal(t, uint64(1), meta.Seq)
+	require.NoError(t, store.Close())
+}
+
+// TestAutoSealBlockSurvivesReopen
+// The accumulating block is part of the store's durable state: losing
+// it on reopen would let a post-restart auto-seal land back in a block
+// that was already closed and exported.
+func TestAutoSealBlockSurvivesReopen(t *testing.T) {
+	dir := storeDir(t, "autoseal-reopen")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	kr := NewFastRandom([]byte{42})
+	require.NoError(t, store.Put(kr.NextHash(), []byte("v")))
+	_, err = store.Seal(7)
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	re, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.NoError(t, re.Put(kr.NextHash(), []byte("v")))
+	auto, err := re.SealNext()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(8), auto.Height,
+		"after reopening a store that closed block 7, writes belong to block 8")
+	require.NoError(t, re.Close())
+}
