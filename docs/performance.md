@@ -62,6 +62,22 @@ spend descriptors on avoiding reopens; lower it under a tight
 `ulimit -n`. Files being read are never closed, so the limit is a
 target the pool returns to rather than a ceiling at every instant.
 
+### Finalisation Watermark
+
+`KVShard.MergeFinalized(height)` merges each shard's sealed Perm
+segments below a block height into one.  Sealing produces a segment per
+shard per block, so without this the file count grows with the chain
+and nothing bounds it: measured at 512 shards and 5,000 entries a
+block, ~1,016 files per block, which is ~88M a day at one block per
+second against 240M inodes.  Merging a completed 20-block set took
+17,960 files to 1,024.
+
+Set `height` behind whatever window may still be written to -- healing,
+in Accumulate's case -- because segments at or above it are left alone
+so that block export keeps working.  Run it from your own scheduler,
+concurrently across shards: one set measured 12.2 s serially, against
+20 seconds of chain time.
+
 ### Compaction Ratio
 
 `CompactRatio` (default 0.25) is the share of a mutable layer that must

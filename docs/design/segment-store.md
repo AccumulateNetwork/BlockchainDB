@@ -196,17 +196,57 @@ record from a crash mid-write is dropped.
 5. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
-Not yet done here: a tiered merge of sealed segments, so the segment
-count is bounded on long chains rather than growing with the seal
-cadence, and reading a value with one `ReadAt` on the value bytes
-rather than through the record header.
+Not yet done here: reading a value with one `ReadAt` on the value bytes
+rather than through the record header, and the cross-shard merge that
+produces globally sorted runs (issue #47).
 
-A merge of *permanent* segments is not just a scheduling question: it
-would destroy the block→segment mapping `ExportBlock` depends on, which
-is the same mapping issue #27 established. Either the merge stays below
-the last exported block, or the manifest carries the mapping
-separately. The Dyna layer has no such constraint — no peer receives
-one of its segments.
+### Merging finalized segments
+
+A block boundary seals one segment per shard that took writes, so the
+file count grows with the chain and is bounded by nothing. Measured at
+512 shards, 5,000 entries a block, that is ~1,016 files per block —
+~88M a day at one block per second, against 240M inodes on the
+filesystem this was measured on. Inodes run out in under three days,
+and the failure is `ENOSPC` with terabytes free.
+
+`MergeBelow(height)` merges the sealed segments belonging to blocks
+below a watermark into one. Measured on a completed 20-block set:
+**~8,980 segments to ~512, i.e. 17,960 files to 1,024**.
+
+The watermark is what makes this safe, and it is why merging was
+blocked before (issue #37). Merging permanent segments destroys the
+block→segment mapping `ExportBlock` depends on — the mapping #27
+established. Only segments *below* the watermark are merged, and the
+caller sets it behind the healing window, so a block a peer might
+still ask for by number is never merged away.
+`TestMergeDoesNotDisturbBlockExport` runs the whole export/import round
+trip across a merge.
+
+The merged segment takes the sequence after the newest it replaces.
+That slot is always free and correctly ordered: everything merged is at
+or below `(H, S)`, and the first segment left standing is in a block
+above `H`, because the run is exactly the segments below the watermark.
+
+Crash safety inverts compaction's rule deliberately. A compacted
+generation is written *above* the manifest's newest height, so an
+uncommitted one is adopted — correct, because it holds every live key.
+A merge is written *below* it, so an uncommitted one is deleted by
+`recoverOrphans` — also correct, because it holds only part of the
+store and the originals it would replace are still named by the
+manifest. Either way the crash costs space and nothing else.
+
+Merging happens **within a shard**, never across. That keeps the
+working set small — a shard holds a few hundred entries per set — and
+keeps the merge under the shard's own lock, so shards merge
+independently and in parallel. `KVShard.MergeFinalized` drives it per
+shard and keeps going past a failure, reporting the first error.
+
+It is not a goroutine this package starts. Only the caller knows its
+block rate and how far back healing may still write, which is what
+sets the watermark. Measured cost is a real constraint on that caller:
+one 20-block set took 12.2 s serially across 512 shards, a ~61% duty
+cycle against 20 seconds of chain time, so the driver wants concurrency
+across shards, a watermark free to lag, and rate limiting (issue #47).
 
 ### File descriptors are borrowed, not held
 
