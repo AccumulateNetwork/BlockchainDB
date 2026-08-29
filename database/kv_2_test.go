@@ -229,3 +229,89 @@ func TestPutPermImmutableSentinel(t *testing.T) {
 	require.ErrorIs(t, kvs.PutPerm(key, []byte("different")), ErrImmutable)
 	require.NoError(t, kvs.Close())
 }
+
+// TestCloseFlushesBothLayersWhenOneFails
+// Close is a durability point: it is what flushes and fsyncs the Dyna
+// layer's live tail, which is otherwise buffered 32 KB at a time in
+// process memory.  Returning as soon as the Perm layer failed left
+// that tail unflushed and dropped it -- so a caller that saw an error
+// from Close had one layer durable, the other's newest writes gone,
+// and no way to tell (issue #38).
+//
+// The Perm layer is made to fail by closing the descriptor under its
+// live file, so flushing that file errors while the store still
+// believes it is open.
+func TestCloseFlushesBothLayersWhenOneFails(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+	require.NoError(t, os.MkdirAll(dir, os.ModePerm))
+	dbDir := filepath.Join(dir, "kv2")
+
+	kv, err := NewKV2(dbDir, 1000)
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{71})
+	keys := make([][32]byte, 20)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		_, err = kv.PutDyna(keys[i], []byte(fmt.Sprintf("dyna-%d", i)))
+		require.NoError(t, err)
+	}
+	// Still buffered: nothing has flushed the tail yet
+	require.True(t, kv.DynaKV.liveDirty, "the tail must be unflushed for this to test anything")
+
+	// Break the Perm layer, so KV2.Close hits an error on its first step
+	require.NoError(t, kv.PermKV.liveFile.File.Close())
+	require.Error(t, kv.Close(), "Close must report the Perm layer's failure")
+
+	// ...and the Dyna layer must still have been closed, which is what
+	// made its records durable
+	reopened, err := OpenKV2(dbDir)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Open())
+	for i, key := range keys {
+		v, err := reopened.GetDyna(key)
+		require.NoErrorf(t, err, "dynamic key %d dropped by a Close that gave up early", i)
+		assert.Equal(t, fmt.Sprintf("dyna-%d", i), string(v))
+	}
+	require.NoError(t, reopened.Close())
+}
+
+// TestPutReportsDynamicWriteCount
+// The count Put returns is what a caller uses to decide when to
+// compact, and only the Dyna layer has anything to reclaim -- so every
+// path reports DWrites.  A permanent key rewritten with the value it
+// already has, which is what a replay looks like, used to report the
+// permanent count instead (issue #39).
+func TestPutReportsDynamicWriteCount(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+
+	kv, err := NewKV2(dir, 1000)
+	require.NoError(t, err)
+	defer kv.Close()
+
+	kr := NewFastRandom([]byte{72})
+
+	// Some dynamic writes, so the two counts cannot coincide
+	for i := 0; i < 3; i++ {
+		_, err = kv.PutDyna(kr.NextHash(), []byte("d"))
+		require.NoError(t, err)
+	}
+	// And more permanent ones, so PWrites is the larger number
+	permKeys := make([][32]byte, 10)
+	for i := range permKeys {
+		permKeys[i] = kr.NextHash()
+		_, err = kv.Put(permKeys[i], []byte("p"))
+		require.NoError(t, err)
+	}
+	require.Greater(t, kv.PWrites, kv.DWrites, "the two counts must differ for this to test anything")
+
+	// The replay: same key, same value, already permanent
+	writes, err := kv.Put(permKeys[0], []byte("p"))
+	require.NoError(t, err)
+	assert.Equal(t, kv.DWrites, writes,
+		"an identical permanent rewrite must report the dynamic write count, like every other path")
+}

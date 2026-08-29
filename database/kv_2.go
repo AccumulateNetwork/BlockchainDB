@@ -136,13 +136,24 @@ func (k *KV2) Open() error {
 	return k.DynaKV.Open()
 }
 
+// Close
+// Close both layers, and report the first failure.
+//
+// Both, even when the first one fails.  Close is a durability point --
+// it is what flushes and fsyncs the Dyna layer's live tail, which is
+// buffered 32 KB at a time in process memory -- so returning early
+// left that tail unflushed and dropped it.  A caller told "the close
+// failed" was not told that one layer is durable and the other's
+// newest writes are gone, which is the torn commit across layers that
+// Seal was fixed for in issue #29 (issue #38).
 func (k *KV2) Close() error {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
-	if err := k.PermKV.Close(); err != nil {
-		return err
+	err := k.PermKV.Close()
+	if dynaErr := k.DynaKV.Close(); err == nil {
+		err = dynaErr
 	}
-	return k.DynaKV.Close()
+	return err
 }
 
 // GetDyna
@@ -295,7 +306,13 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		return k.DWrites, k.sealPermIfFull() // PermKV is never compacted; report DWrites
 	}
 	if bytes.Equal(existing, value) { // If no change, ignore;
-		return k.PWrites, nil
+		// DWrites, like every other path here: the count the caller
+		// gets back is what it uses to decide when to compact, and only
+		// the Dyna layer has anything to reclaim.  This branch -- a
+		// permanent key rewritten with the value it already has, which
+		// is what a replay looks like -- used to report the permanent
+		// count instead, a larger and unrelated number (issue #39).
+		return k.DWrites, nil
 	}
 	k.DWrites++
 	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV

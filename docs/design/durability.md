@@ -8,7 +8,12 @@ Tracks issue #5.
 ## The contract
 
 **`KV2.Close()` is a durability point**, as is a `Seal` (and so
-`KVShard.SealBlock` and `ExportBlock`) — **for both layers**. After a
+`KVShard.SealBlock` and `ExportBlock`) — **for both layers**.  Close
+closes both even when the first fails, and `KVShard.Close` closes every
+shard even after one fails, reporting the first error: stopping early
+abandoned the buffered live tail of everything after the failure, which
+is the same torn commit across layers that `Seal` was fixed for
+(issue #38). After a
 process dies (SIGKILL, power loss) at an arbitrary moment:
 
 1. `OpenKV2` succeeds — the database is never left unopenable.
