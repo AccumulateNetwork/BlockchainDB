@@ -15,6 +15,14 @@ v2 makes the segment format the *storage* itself.
     seg-<block>-<seq>.idx     its index: sorted 48-byte key records + a bloom
     segments.json             the manifest: segments, counts, hashes
 
+An index record is `key(32) offset(8) length(8)`. The offset is
+**relative to the segment's body** — its records, after the 24-byte
+header — not to the file. That is what lets a body and its index be
+copied into a larger file byte for byte, with the container recording
+where the body landed and a reader adding that base (see *Block-set
+files*, below). For a segment file on its own the base is the header
+length.
+
 Writes append to the live tail. `Seal(height)` turns the tail into an
 immutable segment; nothing already written is ever moved or rewritten.
 
@@ -197,8 +205,9 @@ record from a crash mid-write is dropped.
    durability, sync, and compaction boundary.
 
 Not yet done here: reading a value with one `ReadAt` on the value bytes
-rather than through the record header, and the cross-shard merge that
-produces globally sorted runs (issue #47).
+rather than through the record header, and merging block sets into
+larger ones — the levelled runs of issue #47 beyond the first two
+stages below.
 
 ### Merging finalized segments
 
@@ -243,10 +252,113 @@ shard and keeps going past a failure, reporting the first error.
 
 It is not a goroutine this package starts. Only the caller knows its
 block rate and how far back healing may still write, which is what
-sets the watermark. Measured cost is a real constraint on that caller:
-one 20-block set took 12.2 s serially across 512 shards, a ~61% duty
-cycle against 20 seconds of chain time, so the driver wants concurrency
-across shards, a watermark free to lag, and rate limiting (issue #47).
+sets the watermark.
+
+The merge is a **copy, not a rewrite**. Perm keys are unique and
+immutable, so there is nothing to reclaim and nothing to resolve: each
+source segment's body is copied in as one sequential read, and its
+index entries are shifted by where that body landed. No value is read
+individually. The per-key work is the index — 48 bytes a key, already
+sorted per source — merged and sorted per shard. (The first version
+read every value back and re-encoded it, which is what compaction has
+to do and a merge does not.)
+
+Measured on the same fixture as before, a 20-block set of 2,000
+entries a block across 512 shards:
+
+| | time |
+|---|---|
+| serial, read-and-rewrite (previous) | 12.2 s |
+| serial, copy (this) | 12.1 s |
+| 16 goroutines, copy | **1.3 s** |
+
+The serial figure barely moves because the merge is **fsync-bound, not
+read-bound**: each shard pays four barriers — data, index, manifest,
+directory — at ~5.5 ms each on this NVMe, which is ~11 s of the 12
+across 512 shards. What the copy buys is the CPU and the read I/O,
+which do not show at this size. What buys the wall time is running
+shards concurrently, as the barriers overlap: 16 goroutines take the
+set to 1.3 s, against 20 seconds of chain time. The driver wants
+that concurrency, a watermark free to lag, and rate limiting (issue
+#47).
+
+### Block-set files
+
+Stage one leaves one segment per shard per set. At 512 shards that is
+still 1,024 files a set — ~4.4M a day at a block a second — so the
+second stage packs the 512 per-shard results for one block set into
+**one file** outside any shard:
+
+    <db>/sets/set-<first>-<last>.bset
+
+    header      magic "BSET", version, shard count, bloom K,
+                first block, last block, key count, bloom bytes,
+                offset where the bodies begin              (64 bytes)
+    directory   per shard: body offset, body length,
+                index offset, key count                    (512 × 32)
+    indexes     every shard's sorted 48-byte key records, contiguous
+    bloom       one filter over every key in the set
+    bodies      every shard's records, in shard order
+
+The head — directory, indexes, bloom — is one contiguous region whose
+size is known from the key counts before anything is written, so it is
+written with one call after the bodies are in place, and can be loaded
+with one read. What a lookup keeps in memory is the directory (16 KB)
+and the bloom (~1.5 bytes a key); the indexes stay on disk.
+
+Keys are sorted **within each shard**, not across the file. A key
+routes to its shard by `ShardIndex` before anything is looked up, so a
+global order would cost a 512-way merge and buy nothing. And because
+index offsets are body-relative, building the set is a byte-for-byte
+concatenation: each shard's merged index is copied in unchanged, its
+body is copied in unchanged, and the directory records where the body
+landed. No index entry is touched.
+
+A lookup that reaches a set costs a bloom probe, one read of the
+shard's index slice (~10 KB at 5,000 entries a block, searched in
+memory; slices over 64 KB are binary-searched on disk), and one read of
+the value. Sets are walked newest to oldest; a key the shard's own
+filter says is absent never reaches them.
+
+`KVShard.PackFinalized(height)` builds it: every shard's segments below
+the watermark — expected to be stage one's single merged segment each,
+though it copes with more — into one set, committed by the rename of
+the file and one fsync of the set directory. Then each shard **drops**
+those segments (`SegmentStore.DropBelow`) without writing a manifest:
+the shard's next seal records the drop, and only then are the files
+deleted. That is deliberate. Recording it immediately would cost two
+barriers per shard — ~5.6 s a set, the same cost issue #32 removed from
+the block boundary — for a fact the next seal records for free. A crash
+in between leaves a shard whose manifest still names segments the set
+also holds; on open it drops them again
+(`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).
+
+Measured, the same 20-block set of 40,000 keys: **~30 ms** for the
+pack, one file of 7.6 MB, and the set's files go from 1,024 after
+stage one to 1. Reading every packed key back took 2.5 µs a key from
+the page cache; an absent key, settled by the shard's filter, 0.45 µs. A lookup of a packed key,
+a rebuilt filter, an import, iteration, and block export are all
+covered in `blockset_test.go` and `TestMergeDoesNotDisturbBlockExport`.
+
+**The shard's key filter covers its packed keys.** Every write asks
+whether its key is new, and the store-level filter is what answers
+"no" without a disk read; that answer is only definitive if the filter
+holds the keys that have left the segments. So the set store is
+attached *inside* each shard's Perm layer rather than beside it: the
+filter adds the cold keys whenever it is rebuilt, `get` consults the
+sets only after the filter has said "maybe" and the segments have
+said no, and a packed key rewritten with a different value is still
+refused (`TestPackedKeysStayImmutable` — which fails against a filter
+rebuilt from the segments alone).
+
+Sets are the finalized record, so a block in one cannot be imported
+again: a shard that has dropped every segment has no newest segment to
+measure an import against, and the set's watermark is the bound.
+
+Memory per set is the directory plus the bloom, so it grows with the
+key count at ~1.5 bytes a key — the same order as the per-segment
+filters it replaces. The next stage of #47, merging sets into larger
+ones, is what bounds the number of sets a lookup walks.
 
 ### File descriptors are borrowed, not held
 

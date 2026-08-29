@@ -29,6 +29,11 @@ import (
 //	seg-<height>.idx    its key index: sorted 48-byte records + a bloom
 //	segments.json       the manifest: the segments, counts, and hashes
 //
+// An index record is key(32) offset(8) length(8), and the offset is
+// relative to the segment's BODY -- its records, after the header --
+// so that a body and its index can be copied into a larger file
+// unchanged (blockset.go); see segment.value.
+//
 // What this buys over the v1 kfile/history/values arrangement it
 // replaced (removed; see docs/design/segment-store.md):
 //
@@ -75,7 +80,14 @@ const (
 	// zero value that degrades safely, but nothing enforced that and
 	// the next field need not be so lucky.  Refusing to open says so
 	// immediately, at the one moment a person can act on it.
-	StoreFormatVersion = 1
+	//
+	// Version 2 added the block-set directory beside the shards
+	// (blockset.go) and made index offsets relative to the segment body
+	// rather than the file.  A build reading version 1 would open a
+	// version 2 database without complaint and answer "not found" for
+	// every key that had been packed into a set, which is exactly the
+	// silent failure the check exists to refuse.
+	StoreFormatVersion = 2
 	segIndexHdrSize    = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
 	segDataHdrSize     = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
 	segRecHdrSize      = 40 // key(32) valueLen(8) precede each value in a .dat
@@ -228,7 +240,15 @@ func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
 	return nil, false, nil
 }
 
-// value reads a value out of the segment's data file
+// value reads a value out of the segment's data file.
+//
+// An index entry's offset is RELATIVE to the segment's body -- the
+// records after the header -- not to the file.  In a segment file the
+// body starts at segDataHdrSize, so that is the base here.  The
+// convention exists for the files that contain many bodies: a block
+// set copies a segment's body and its index in verbatim and records
+// where the body landed, and a reader adds that base instead of this
+// one.  Nothing in an index is rewritten when it is moved.
 func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
 	data, release, err := s.data()
 	if err != nil {
@@ -236,7 +256,7 @@ func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
 	}
 	defer release()
 	value = make([]byte, dbb.Length)
-	if _, err = data.ReadAt(value, int64(dbb.Offset)); err != nil {
+	if _, err = data.ReadAt(value, segDataHdrSize+int64(dbb.Offset)); err != nil {
 		return nil, err
 	}
 	return value, nil
@@ -286,6 +306,30 @@ type SegmentStore struct {
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
 	liveDirty   bool                 // Records written to the tail since the last fsync of it
 	closed      bool                 // Set by Close; cleared by Open
+
+	// cold is where this store's keys go once they leave its segments:
+	// the block-set files a sharded database packs its finalized Perm
+	// segments into (blockset.go).  Nil for a store that has nowhere
+	// else to look, which is every Dyna layer and every store outside a
+	// KVShard.
+	//
+	// It sits inside the store rather than beside it because of the key
+	// filter.  Every lookup -- and so every write, which asks whether
+	// its key is new -- is settled by the filter when it says "absent",
+	// and that answer is only definitive if the filter covers the cold
+	// keys too.  A layer above the store cannot keep that promise; the
+	// store can, by adding the cold keys whenever it rebuilds the filter
+	// and consulting cold only when the filter has already said "maybe".
+	cold coldStore
+
+	// retireOnCommit holds segments dropped from the list -- their keys
+	// now held cold -- whose files the manifest still names.  They are
+	// deleted after the next manifest commit, whatever causes it, so
+	// that dropping a segment costs no barrier of its own: a shard
+	// commits a manifest every block it seals in anyway, and this rides
+	// on that one.  Until then the files stay, and a crash leaves them
+	// named by a manifest that still points at whole segments.
+	retireOnCommit []*segment
 
 	// iterating counts the iterations in flight, and pendingDelete
 	// holds the files a compaction wanted to delete while one was.
@@ -355,7 +399,47 @@ type SegmentStore struct {
 	bloomAt       SegmentMeta
 	bloomSegments uint64
 
+	// keysLackCold says the filter was rebuilt from the segments with no
+	// cold store attached, so the cold keys still have to be added
+	// (attachCold).  A filter loaded from disk was saved complete.
+	keysLackCold bool
+
 	stats StoreStats // Counted under the Mutex, like everything else here
+}
+
+// coldStore
+// Somewhere a store's keys can live once its own segments no longer
+// hold them.  Every method is scoped to the one store it is attached
+// to: a sharded database attaches a view onto its set store that
+// answers for that shard alone.
+type coldStore interface {
+	// lookup finds a key, or reports that it is not held cold
+	lookup(key [32]byte) (value []byte, found bool, err error)
+	// forEachKey visits every key held cold, for rebuilding the filter
+	forEachKey(fn func(key [32]byte)) error
+	// forEach visits every key and its value, for iteration
+	forEach(fn func(key [32]byte, value []byte) error) error
+	// watermark is the highest block held cold, if any is
+	watermark() (last uint64, ok bool)
+}
+
+// attachCold
+// Give the store somewhere to look for keys its segments no longer
+// hold.  If the key filter was rebuilt from the segments alone -- which
+// it is on the first open, before anything could be attached -- the
+// cold keys are added to it now, so that "absent" stays definitive.
+func (s *SegmentStore) attachCold(cold coldStore) (err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	s.cold = cold
+	if s.keys != nil && s.keysLackCold {
+		if err = cold.forEachKey(s.keys.Set); err != nil {
+			s.keys = nil // Never under-report: walk instead
+			return err
+		}
+	}
+	s.keysLackCold = false
+	return nil
 }
 
 // StoreStats
@@ -497,6 +581,7 @@ func (s *SegmentStore) Open() (err error) {
 func (s *SegmentStore) load() (err error) {
 	s.live = make(map[[32]byte]*DBBKey)
 	s.segments = nil
+	s.retireOnCommit = nil // The manifest being read is the truth again
 	s.liveRecords = 0
 
 	m, err := s.readManifest()
@@ -561,6 +646,7 @@ func (s *SegmentStore) loadKeyFilter(m *StoreManifest) (err error) {
 			(ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq))
 	if covered {
 		if s.keys, err = LoadBloomSet(s.Directory); err == nil {
+			s.keysLackCold = false // Saved from a filter that had them
 			return nil
 		}
 		s.keys = nil // Unreadable or truncated; rebuild instead
@@ -592,6 +678,15 @@ func (s *SegmentStore) rebuildKeyFilter() (err error) {
 	for key := range s.live { // The tail is part of what the store holds
 		s.keys.Set(key)
 	}
+	// And so are the keys held cold: a filter without them would answer
+	// "absent" for a key that is right there in a block set
+	if s.cold != nil {
+		if err = s.cold.forEachKey(s.keys.Set); err != nil {
+			s.keys = nil
+			return err
+		}
+	}
+	s.keysLackCold = s.cold == nil
 	return nil
 }
 
@@ -946,7 +1041,18 @@ func (s *SegmentStore) writeManifest() (err error) {
 	if err = os.Rename(tmp, filepath.Join(s.Directory, segManifestName)); err != nil {
 		return err
 	}
-	return syncDir(s.Directory)
+	if err = syncDir(s.Directory); err != nil {
+		return err
+	}
+	// Committed: the manifest no longer names what DropBelow dropped, so
+	// the files can go
+	for _, seg := range s.retireOnCommit {
+		seg.close()
+		s.retire(seg.dataPath)
+		s.retire(seg.indexPath)
+	}
+	s.retireOnCommit = nil
+	return nil
 }
 
 // errStoreClosed is returned by every operation that would read or
@@ -1026,6 +1132,15 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 		}
 		if found {
 			return s.segments[i].value(dbb)
+		}
+	}
+	if s.cold != nil { // Then whatever left the segments for a block set
+		value, found, err := s.cold.lookup(key)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return value, nil
 		}
 	}
 	if s.keys != nil {
@@ -1721,6 +1836,235 @@ func (s *SegmentStore) writeMergedSegment(
 	return meta, seg, nil
 }
 
+// bodySize
+// The length of a segment's records: everything after the header.
+func (s *segment) bodySize() (size int64, err error) {
+	data, release, err := s.data()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	info, err := data.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.Size() < segDataHdrSize {
+		return 0, fmt.Errorf("%s is shorter than its header", s.dataPath)
+	}
+	return info.Size() - segDataHdrSize, nil
+}
+
+// copyBody
+// Copy a segment's records -- its body, without the header -- to out
+// as one sequential read.  size is what bodySize reported, and is
+// checked against what actually arrived.
+func (s *segment) copyBody(out io.Writer, size int64, buf []byte) (err error) {
+	data, release, err := s.data()
+	if err != nil {
+		return err
+	}
+	defer release()
+	n, err := io.CopyBuffer(out, io.NewSectionReader(data, segDataHdrSize, size), buf)
+	if err != nil {
+		return err
+	}
+	if n != size {
+		return fmt.Errorf("%s: copied %d of %d bytes", s.dataPath, n, size)
+	}
+	return nil
+}
+
+// layoutBodies
+// Where each segment's body will land when the bodies are laid end to
+// end to form one body: each body's size, and its offset within the
+// combined body.  The first is at 0; where the combined body itself
+// sits in a file is the file's business.
+func layoutBodies(segs []*segment) (sizes []int64, bases []uint64, total uint64, err error) {
+	sizes = make([]int64, len(segs))
+	bases = make([]uint64, len(segs))
+	for i, seg := range segs {
+		if sizes[i], err = seg.bodySize(); err != nil {
+			return nil, nil, 0, err
+		}
+		bases[i] = total
+		total += uint64(sizes[i])
+	}
+	return sizes, bases, total, nil
+}
+
+// shiftedIndex
+// The index records of several segments as they read once their bodies
+// are laid end to end: each entry's offset moved by where its segment's
+// body landed, one entry per key, sorted.  Returns raw 48-byte records,
+// relative to the combined body, which is the form an index file and a
+// block-set file both store.
+//
+// This is the whole per-key cost of merging: the index is 48 bytes a
+// key and already sorted within each source, so the work is a read of
+// each index, an add per entry, and a sort of a few hundred records.
+// No value is touched.  With ONE source there is not even the add: its
+// index is already relative to its body, and its body is the whole
+// result, so the records are copied verbatim.
+//
+// A key that appears in two sources -- possible in the Perm layer only
+// through an import, which permits an identical value and rejects a
+// differing one -- keeps the NEWEST source's entry.  The sources are
+// taken newest first so that a stable sort leaves that entry first
+// among equals, and the older ones are dropped.
+func shiftedIndex(segs []*segment, bases []uint64) (records []byte, err error) {
+	var total int64
+	for _, seg := range segs {
+		total += seg.count
+	}
+	records = make([]byte, 0, total*DBKeyFullSize)
+	for i := len(segs) - 1; i >= 0; i-- {
+		seg := segs[i]
+		shift := bases[i]
+		start := len(records)
+		records = records[:start+int(seg.count)*DBKeyFullSize]
+		index, release, err := seg.index()
+		if err != nil {
+			return nil, err
+		}
+		_, err = index.ReadAt(records[start:], segIndexHdrSize)
+		release()
+		if err != nil {
+			return nil, err
+		}
+		if shift == 0 {
+			continue // Verbatim: the body sits where the index says
+		}
+		for pos := start; pos < len(records); pos += DBKeyFullSize {
+			off := binary.BigEndian.Uint64(records[pos+32:])
+			binary.BigEndian.PutUint64(records[pos+32:], off+shift)
+		}
+	}
+	if len(segs) == 1 {
+		return records, nil // One source: already sorted and unique
+	}
+	sort.Stable(recordSort(records))
+	w := 0
+	for r := 0; r < len(records); r += DBKeyFullSize {
+		if w > 0 && bytes.Equal(records[w-DBKeyFullSize:w-DBKeyFullSize+32], records[r:r+32]) {
+			continue // An older copy of the key just kept
+		}
+		if w != r {
+			copy(records[w:w+DBKeyFullSize], records[r:r+DBKeyFullSize])
+		}
+		w += DBKeyFullSize
+	}
+	return records[:w], nil
+}
+
+// concatSegments
+// Build one segment from several by COPYING their bodies end to end
+// and shifting their index offsets, rather than reading every value
+// back and re-encoding it.
+//
+// This is the difference between the two reasons to combine segments,
+// and they want different work.  Compaction exists to RECLAIM: the Dyna
+// layer's segments are full of records a later write superseded, so it
+// must decide what survives and rewrite only that.  A merge of the Perm
+// layer exists to reduce the FILE COUNT: its keys are unique and
+// immutable, so there is nothing dead to drop, and re-encoding every
+// record to produce a byte-identical result is pure cost.
+//
+// So the data file is a concatenation.  Each source contributes its
+// body -- everything after its 24-byte header -- as one sequential
+// copy, and an entry that pointed at offset O in source i points at
+// base[i] + O in the result, base[i] being where that body landed
+// within the combined body.  Nothing is read per record; the only
+// per-key work is the index (shiftedIndex).
+//
+// A key that appears in two sources leaves both copies in the data file
+// and one entry in the index, pointing at the newest.  The older copy
+// becomes dead bytes.  That is the trade: a little space in exchange
+// for never touching a value.
+//
+// The caller must hold the Mutex.
+func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta SegmentMeta, merged *segment, err error) {
+	// The index first: it needs only the sizes, and it is where a
+	// damaged source would be found, before anything is written
+	sizes, bases, _, err := layoutBodies(segs)
+	if err != nil {
+		return meta, nil, err
+	}
+	records, err := shiftedIndex(segs, bases)
+	if err != nil {
+		return meta, nil, err
+	}
+
+	dataName := segmentFileName(height, seq)
+	dataPath := filepath.Join(s.Directory, dataName)
+	tmpPath := dataPath + segTmpSuffix
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return meta, nil, err
+	}
+	defer func() {
+		if f != nil {
+			f.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	bw := bufio.NewWriterSize(f, segWriteBuffer)
+	var h hash.Hash
+	var out io.Writer = bw
+	if !s.Mutable { // Immutable segments are transported; a peer verifies this
+		h = sha256.New()
+		out = io.MultiWriter(bw, h)
+	}
+
+	var header [segDataHdrSize]byte
+	binary.BigEndian.PutUint32(header[:], segmentMagic)
+	binary.BigEndian.PutUint32(header[4:], segmentVersion)
+	var physical uint64
+	for _, seg := range segs {
+		physical += uint64(seg.records)
+	}
+	binary.BigEndian.PutUint64(header[16:], physical)
+	if _, err = out.Write(header[:]); err != nil {
+		return meta, nil, err
+	}
+	buf := make([]byte, segWriteBuffer)
+	for i, seg := range segs {
+		if err = seg.copyBody(out, sizes[i], buf); err != nil {
+			return meta, nil, err
+		}
+	}
+	if err = bw.Flush(); err != nil {
+		return meta, nil, err
+	}
+	if err = f.Sync(); err != nil {
+		return meta, nil, err
+	}
+	if err = f.Close(); err != nil {
+		f = nil
+		return meta, nil, err
+	}
+	f = nil
+	if err = os.Rename(tmpPath, dataPath); err != nil {
+		return meta, nil, err
+	}
+	// The manifest commit's directory fsync covers this rename
+
+	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	if err = writeIndexRecords(indexPath, records); err != nil {
+		return meta, nil, err
+	}
+
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(records) / DBKeyFullSize)}
+	if h != nil {
+		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	seg, err := s.openSegment(meta)
+	if err != nil {
+		return meta, nil, err
+	}
+	return meta, seg, nil
+}
+
 // MergeBelow
 // Merge every sealed segment belonging to a block below `height` into
 // one, leaving the rest untouched.  Reports whether it merged anything.
@@ -1780,12 +2124,7 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	last := run[n-1].meta
 	outHeight, outSeq := last.Height, last.Seq+1
 
-	winners, keys, err := s.mergeInputs(run)
-	if err != nil {
-		return meta, false, err
-	}
-
-	meta, seg, err := s.writeMergedSegment(winners, keys, outHeight, outSeq)
+	meta, seg, err := s.concatSegments(run, outHeight, outSeq)
 	if err != nil {
 		return meta, false, err
 	}
@@ -1807,6 +2146,61 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 		s.retire(o.indexPath)
 	}
 	return meta, true, nil
+}
+
+// segmentsBelow
+// The sealed segments belonging to blocks below `height`, oldest
+// first.  Segments are kept in order, so it is a prefix of the list.
+func (s *SegmentStore) segmentsBelow(height uint64) (segs []*segment, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if err = s.checkOpen(); err != nil {
+		return nil, err
+	}
+	n := 0
+	for _, seg := range s.segments {
+		if seg.meta.Height >= height {
+			break
+		}
+		n++
+	}
+	return append([]*segment(nil), s.segments[:n]...), nil
+}
+
+// DropBelow
+// Stop serving the sealed segments belonging to blocks below `height`
+// from this store, because their keys are now held cold.  Reports how
+// many were dropped.
+//
+// No manifest is written.  Dropping is a consequence of a commit that
+// has already happened -- the block set holding these keys is durable
+// before anyone calls this -- so nothing is lost by recording it late,
+// and recording it now would cost two barriers per shard for a fact the
+// shard's next seal records for free.  The files stay until then
+// (retireOnCommit), still named by the manifest and still whole, so a
+// crash in between leaves a store that opens exactly as before and
+// simply drops them again.
+//
+// The caller asserts the keys are held cold; the store cannot check.
+func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if err = s.checkOpen(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, seg := range s.segments {
+		if seg.meta.Height >= height {
+			break
+		}
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	s.retireOnCommit = append(s.retireOnCommit, s.segments[:n]...)
+	s.segments = append([]*segment(nil), s.segments[n:]...)
+	return n, nil
 }
 
 // mergeInput names where a key's surviving value lives
@@ -1970,6 +2364,15 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	if newest, ok := s.newestMeta(); ok && !meta.after(newest) {
 		return fmt.Errorf("segment (block %d, seq %d) is not above the newest segment (block %d, seq %d)",
 			meta.Height, meta.Seq, newest.Height, newest.Seq)
+	}
+	// A block already packed into a set is finalized: the set is what
+	// answers for it, and a store that has dropped every segment has no
+	// newest to be measured against, so the set's watermark is the bound
+	if s.cold != nil {
+		if last, ok := s.cold.watermark(); ok && meta.Height <= last {
+			return fmt.Errorf("segment (block %d, seq %d) is not above the newest block set, which ends at block %d",
+				meta.Height, meta.Seq, last)
+		}
 	}
 	if err = VerifySegmentFile(path, meta.Hash); err != nil {
 		return err
@@ -2181,14 +2584,35 @@ func (r recordSort) Swap(i, j int) {
 // where each one's value sits in the data file.  Sealing and
 // compaction both know that as they write, so neither has to read the
 // segment back to index it.
+//
+// entries carry offsets into the data FILE, which is what every writer
+// has in hand -- the live tail's map, or the position it just wrote a
+// record at.  The index stores them relative to the body instead (see
+// segment.value), so the header's length comes off here, once, rather
+// than in every writer.
 func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DBBKey) (err error) {
 	buff := make([]byte, 0, len(order)*DBKeyFullSize)
-	bloom := NewBloomSizedForKeys(uint64(len(order)), 3)
 	for _, key := range order {
-		buff = append(buff, entries[key].Bytes(key)...)
-		bloom.Set(key)
+		e := entries[key]
+		rel := DBBKey{Offset: e.Offset - segDataHdrSize, Length: e.Length}
+		buff = append(buff, rel.Bytes(key)...)
 	}
 	sort.Sort(recordSort(buff)) // Sorted by key, for binary search
+	return writeIndexRecords(indexPath, buff)
+}
+
+// writeIndexRecords
+// Write a segment's index from its records already sorted, encoded and
+// body-relative: what a merge has in hand, since the sources' indexes
+// are already in this form and combining them never leaves the form.
+func writeIndexRecords(indexPath string, buff []byte) (err error) {
+	count := uint64(len(buff) / DBKeyFullSize)
+	bloom := NewBloomSizedForKeys(count, 3)
+	for pos := 0; pos < len(buff); pos += DBKeyFullSize {
+		var key [32]byte
+		copy(key[:], buff[pos:])
+		bloom.Set(key)
+	}
 
 	tmpPath := indexPath + segTmpSuffix
 	out, err := os.Create(tmpPath)
@@ -2205,7 +2629,7 @@ func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DB
 	var idxHdr [segIndexHdrSize]byte
 	binary.BigEndian.PutUint32(idxHdr[:], segIndexMagic)
 	binary.BigEndian.PutUint32(idxHdr[4:], segIndexVersion)
-	binary.BigEndian.PutUint64(idxHdr[8:], uint64(len(order)))
+	binary.BigEndian.PutUint64(idxHdr[8:], count)
 	binary.BigEndian.PutUint64(idxHdr[16:], bloom.NumBytes)
 	binary.BigEndian.PutUint32(idxHdr[24:], uint32(bloom.K))
 	if _, err = out.Write(idxHdr[:]); err != nil {

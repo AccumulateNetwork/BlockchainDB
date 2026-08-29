@@ -202,10 +202,14 @@ func TestMergeDoesNotDisturbBlockExport(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Now finalise the blocks a peer has already taken
+	// Now finalise the blocks a peer has already taken: both stages, so
+	// blocks 1-4 leave the shards altogether for a block-set file
 	mergedShards, err := nodeA.MergeFinalized(5)
 	require.NoError(t, err)
 	require.Greater(t, mergedShards, 0, "the merge must have done something for this to test anything")
+	_, packed, err := nodeA.PackFinalized(5)
+	require.NoError(t, err)
+	require.True(t, packed, "the pack must have done something for this to test anything")
 
 	// A later block still exports correctly after the merge
 	for i := 0; i < 50; i++ {
