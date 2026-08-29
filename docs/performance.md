@@ -52,6 +52,26 @@ The Perm layer seals on distinct keys; the Dyna layer seals on
 write and a handful of hot keys rewritten every block would hold the
 key count flat while the tail grew without bound.
 
+### Open File Limit
+
+`SetOpenFileLimit(n)` bounds how many segment files the process keeps
+open (default 512). Segments borrow their files from a shared pool for
+the length of a read rather than holding them, so the descriptor count
+tracks this number and not the number of segments sealed. Raise it to
+spend descriptors on avoiding reopens; lower it under a tight
+`ulimit -n`. Files being read are never closed, so the limit is a
+target the pool returns to rather than a ceiling at every instant.
+
+### Compaction Ratio
+
+`CompactRatio` (default 0.25) is the share of a mutable layer that must
+be superseded records before `Compress` does anything. `Compress` on a
+cadence used to rewrite the whole layer every call, so reclaiming a
+fixed amount of garbage grew more expensive as the database grew;
+waiting for a fixed *fraction* makes the amortised cost per overwrite
+constant instead. Raise it to compact less often and hold more
+garbage; lower it for the reverse.
+
 ### Buffer Size
 
 The `BufferSize` constant (default: 32KB) is the buffer `BFile` uses
@@ -124,10 +144,12 @@ go test -load ./database/
 **Possible causes:**
 - Many small segments, because `sealLimit` is too low
 - A compaction that has not run, leaving stale generations to search
+- An open-file limit far below the working set, so every lookup reopens
 
 **Solutions:**
 - Raise `sealLimit` so seals produce fewer, larger segments
 - Run `Compress()` on the Dyna layer
+- Raise `SetOpenFileLimit` if the process can afford the descriptors
 
 ### Issue: Slow open
 

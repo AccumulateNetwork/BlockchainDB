@@ -102,35 +102,64 @@ type StoreManifest struct {
 	Segments    []SegmentMeta `json:"segments"`    // Oldest first
 
 	// BloomValid says the persisted key filter (bloom.dat) covers
-	// exactly the sealed segments listed here, and BloomHeight/BloomSeq
-	// name the newest of them.  Height 0, Seq 0 is a legitimate
-	// segment, so the flag carries the claim rather than the numbers.
-	BloomValid  bool   `json:"bloomValid,omitempty"`
-	BloomHeight uint64 `json:"bloomHeight,omitempty"`
-	BloomSeq    uint64 `json:"bloomSeq,omitempty"`
+	// exactly the sealed segments listed here; BloomHeight/BloomSeq name
+	// the newest of them and BloomSegments counts them.
+	//
+	// The count is not redundant.  A filter saved when the store had no
+	// segments records the zero value for the newest one -- (0, 0) --
+	// and (0, 0) is also the identity of the FIRST segment a store
+	// seals.  The Dyna layer numbers every segment at height 0, so its
+	// first is exactly (0, 0): an empty filter's "covers nothing" was
+	// indistinguishable from "covers segment (0, 0)", and a crash that
+	// left a segment for recoverOrphans to adopt without rewriting the
+	// manifest produced exactly that pair.  The empty filter was then
+	// accepted as covering it, and every key in that segment answered
+	// "not found" -- a false negative, which is silent data loss rather
+	// than the slow lookup a false positive costs.
+	BloomValid    bool   `json:"bloomValid,omitempty"`
+	BloomHeight   uint64 `json:"bloomHeight,omitempty"`
+	BloomSeq      uint64 `json:"bloomSeq,omitempty"`
+	BloomSegments uint64 `json:"bloomSegments,omitempty"`
 }
 
 // segment
-// An open sealed segment
+// A sealed segment.
+//
+// What it keeps in memory is what a lookup needs to decide *whether* to
+// read: the key count and the bloom filter.  The two files are
+// borrowed from the shared pool for the length of a read and given
+// back, so a store holds no descriptors between reads and the process
+// stays under a bound no matter how many segments it has sealed
+// (issue #30).
 type segment struct {
-	meta    SegmentMeta
-	data    *os.File
-	index   *os.File
-	count   int64  // Indexed keys
-	records int64  // Physical records in the data file; > count if any key repeats
-	bloom   *Bloom // Membership filter over this segment's keys
+	meta      SegmentMeta
+	dataPath  string
+	indexPath string
+	count     int64  // Indexed keys
+	records   int64  // Physical records in the data file; > count if any key repeats
+	bloom     *Bloom // Membership filter over this segment's keys
 }
 
-// close releases a segment's file handles
+// close
+// Retire a segment: drop the pool's descriptors for its files.
+//
+// This is not "close what we hold" -- a segment holds nothing between
+// reads -- it is "stop holding these paths open on our behalf", which
+// matters when the caller is about to delete them.  A file being read
+// right now is left to its reader, whose last release closes it.
 func (s *segment) close() {
-	if s.data != nil {
-		s.data.Close()
-		s.data = nil
-	}
-	if s.index != nil {
-		s.index.Close()
-		s.index = nil
-	}
+	segmentFiles.forget(s.dataPath)
+	segmentFiles.forget(s.indexPath)
+}
+
+// data borrows the segment's data file; release when the read is done
+func (s *segment) data() (f *os.File, release func(), err error) {
+	return segmentFiles.acquire(s.dataPath)
+}
+
+// index borrows the segment's index file; release when the read is done
+func (s *segment) index() (f *os.File, release func(), err error) {
+	return segmentFiles.acquire(s.indexPath)
 }
 
 // lookup
@@ -138,13 +167,19 @@ func (s *segment) close() {
 // segment's data file.
 func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
 	if s.bloom != nil && !s.bloom.Test(key) {
-		return nil, false, nil // Definitely not in this segment
+		return nil, false, nil // Definitely not in this segment: no file needed
 	}
+	// One borrow for the whole binary search rather than one per probe
+	index, release, err := s.index()
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
 	var rec [DBKeyFullSize]byte
 	lo, hi := int64(0), s.count-1
 	for lo <= hi { //                        Index records are sorted by key
 		mid := (lo + hi) / 2
-		if _, err = s.index.ReadAt(rec[:], segIndexHdrSize+mid*DBKeyFullSize); err != nil {
+		if _, err = index.ReadAt(rec[:], segIndexHdrSize+mid*DBKeyFullSize); err != nil {
 			return nil, false, err
 		}
 		switch bytes.Compare(key[:], rec[:32]) {
@@ -165,8 +200,13 @@ func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
 
 // value reads a value out of the segment's data file
 func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
+	data, release, err := s.data()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	value = make([]byte, dbb.Length)
-	if _, err = s.data.ReadAt(value, int64(dbb.Offset)); err != nil {
+	if _, err = data.ReadAt(value, int64(dbb.Offset)); err != nil {
 		return nil, err
 	}
 	return value, nil
@@ -200,6 +240,47 @@ type SegmentStore struct {
 	liveDirty   bool                 // Records written to the tail since the last fsync of it
 	closed      bool                 // Set by Close; cleared by Open
 
+	// iterating counts the iterations in flight, and pendingDelete
+	// holds the files a compaction wanted to delete while one was.
+	//
+	// ForEach runs its callback without the store's lock (issue #31),
+	// so a compaction can commit underneath it.  That is fine for what
+	// the iteration reports -- it snapshots the segment list and shows
+	// the store as it was when it started -- but not for the files:
+	// compaction deletes the generation it replaced, and the iterator
+	// is still reading it.  Deferring the unlink until the last
+	// iteration finishes keeps those reads valid.  The files are
+	// already unreachable through the manifest, so a crash in between
+	// costs nothing: recoverOrphans sweeps them on the next open.
+	iterating     int
+	pendingDelete []string
+
+	// shadowed estimates how many records this store holds that a later
+	// write has superseded -- its garbage -- counted since the last
+	// compaction.
+	//
+	// It exists so that "is there anything worth reclaiming?" can be
+	// answered without reading anything.  Compaction itself is the only
+	// exact answer, and it costs a scan of every index plus a copy of
+	// every live value, so asking it that question is the thing being
+	// avoided (issue #31).
+	//
+	// A mutable store appends without checking, on purpose, so the count
+	// comes from a probe of the store's own key filter before the write
+	// is recorded in it: a key already there means this write shadows an
+	// older copy.  The filter's false positives make that an
+	// over-estimate and its lack of false negatives keeps it from ever
+	// being an under-estimate, so the error is on the side of compacting
+	// slightly early.  Nil filter means no estimate, and the caller
+	// falls back to compacting unconditionally.
+	//
+	// It is process state: not persisted, and not reconstructed by
+	// load, so a reopened store believes it holds no garbage until it
+	// accumulates more.  That defers reclamation rather than losing
+	// anything, and it is the trade the threshold makes -- compacting
+	// unconditionally had no such state to lose (issue #40).
+	shadowed uint64
+
 	// keys is a membership filter over everything the store holds --
 	// every sealed segment and the live tail.  It exists to make
 	// proving a key ABSENT cheap.
@@ -223,8 +304,9 @@ type SegmentStore struct {
 	// bloomValid/bloomAt are the coverage claim writeManifest records.
 	// It is a one-shot: only the manifest written immediately after a
 	// save carries it.
-	bloomValid bool
-	bloomAt    SegmentMeta
+	bloomValid    bool
+	bloomAt       SegmentMeta
+	bloomSegments uint64
 
 	stats StoreStats // Counted under the Mutex, like everything else here
 }
@@ -416,9 +498,14 @@ func (s *SegmentStore) load() (err error) {
 // behind the segment list, so each of them rebuilds.
 func (s *SegmentStore) loadKeyFilter(m *StoreManifest) (err error) {
 	newest, ok := s.newestMeta()
-	covered := m.BloomValid &&
-		((ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq) ||
-			(!ok && len(s.segments) == 0)) // An empty filter covers no segments
+	// The count first: it is what separates "covers nothing" from
+	// "covers segment (0, 0)", which the newest-segment identity alone
+	// cannot do.  A manifest written before the count existed reads as
+	// 0, so a store with segments falls through to a rebuild -- slower,
+	// and correct.
+	covered := m.BloomValid && uint64(len(s.segments)) == m.BloomSegments &&
+		(m.BloomSegments == 0 || // An empty filter covers no segments
+			(ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq))
 	if covered {
 		if s.keys, err = LoadBloomSet(s.Directory); err == nil {
 			return nil
@@ -459,6 +546,11 @@ func (s *SegmentStore) rebuildKeyFilter() (err error) {
 // Add every key in a sealed segment to the filter, read from the
 // segment's index: the keys are already there, sorted, 48 bytes apart.
 func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
+	index, release, err := seg.index() // One borrow for the whole scan
+	if err != nil {
+		return err
+	}
+	defer release()
 	const batch = 4096 // Index records per read
 	buff := make([]byte, batch*DBKeyFullSize)
 	for i := int64(0); i < seg.count; {
@@ -467,7 +559,7 @@ func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
 			n = batch
 		}
 		b := buff[:n*DBKeyFullSize]
-		if _, err = seg.index.ReadAt(b, segIndexHdrSize+i*DBKeyFullSize); err != nil {
+		if _, err = index.ReadAt(b, segIndexHdrSize+i*DBKeyFullSize); err != nil {
 			return err
 		}
 		for j := int64(0); j < n; j++ {
@@ -480,33 +572,44 @@ func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
 	return nil
 }
 
-// openSegment opens a sealed segment's data and index files
+// openSegment
+// Adopt a sealed segment: read what a lookup needs to keep in memory
+// -- the record count, the key count, and the bloom filter -- and give
+// the descriptors straight back.  Reads borrow them again as needed,
+// so adopting a segment costs two opens once, not two descriptors
+// forever (issue #30).
 func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
-	seg = &segment{meta: meta}
 	dataPath := filepath.Join(s.Directory, meta.File)
-	if seg.data, err = os.Open(dataPath); err != nil {
+	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	seg = &segment{meta: meta, dataPath: dataPath, indexPath: indexPath}
+
+	data, releaseData, err := seg.data()
+	if err != nil {
 		return nil, err
 	}
 	var dataHdr [segDataHdrSize]byte
-	if _, err = seg.data.ReadAt(dataHdr[:], 0); err != nil {
-		seg.close()
+	if _, err = data.ReadAt(dataHdr[:], 0); err != nil {
+		releaseData()
 		return nil, err
 	}
 	seg.records = int64(binary.BigEndian.Uint64(dataHdr[16:]))
-	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	releaseData()
+
 	if _, err = os.Stat(indexPath); err != nil { // Rebuild a missing index
 		if err = buildIndexFor(dataPath, indexPath); err != nil {
 			seg.close()
 			return nil, err
 		}
 	}
-	if seg.index, err = os.Open(indexPath); err != nil {
+	index, releaseIndex, err := seg.index()
+	if err != nil {
 		seg.close()
 		return nil, err
 	}
+	defer releaseIndex()
 
 	var header [segIndexHdrSize]byte
-	if _, err = seg.index.ReadAt(header[:], 0); err != nil {
+	if _, err = index.ReadAt(header[:], 0); err != nil {
 		seg.close()
 		return nil, err
 	}
@@ -519,7 +622,7 @@ func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 	bloomK := int(binary.BigEndian.Uint32(header[24:]))
 	if bloomBytes > 0 {
 		bitmap := make([]byte, bloomBytes)
-		if _, err = seg.index.ReadAt(bitmap, segIndexHdrSize+seg.count*DBKeyFullSize); err != nil {
+		if _, err = index.ReadAt(bitmap, segIndexHdrSize+seg.count*DBKeyFullSize); err != nil {
 			seg.close()
 			return nil, err
 		}
@@ -712,7 +815,8 @@ func (s *SegmentStore) writeManifest() (err error) {
 	defer func() { s.bloomValid = false }()
 
 	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
-		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq}
+		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq,
+		BloomSegments: s.bloomSegments}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}
@@ -878,6 +982,13 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 	s.liveRecords++
 	s.liveDirty = true
 	if s.keys != nil {
+		// Probe before Set: a key the store already holds means this
+		// record supersedes an older one, which is what compaction has
+		// to reclaim.  Only a mutable store can shadow -- an immutable
+		// one refuses the write instead -- so only it counts.
+		if s.Mutable && s.keys.Test(key) {
+			s.shadowed++
+		}
 		s.keys.Set(key)
 	}
 	return nil
@@ -939,6 +1050,59 @@ func (s *SegmentStore) LiveRecords() uint64 {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	return s.liveRecords
+}
+
+// retire
+// Delete a file a commit has made unreachable, or defer the delete
+// until the iterations reading it have finished.  The caller must hold
+// the Mutex.
+func (s *SegmentStore) retire(path string) {
+	if s.iterating > 0 {
+		s.pendingDelete = append(s.pendingDelete, path)
+		return
+	}
+	os.Remove(path)
+}
+
+// beginIterate
+// Take a snapshot to iterate: the sealed segments as they stand, and
+// the live tail's values copied out.  Holding the segments in a local
+// slice is what makes the iteration a snapshot; holding off deletion
+// is what keeps their files readable.  The caller must hold the Mutex.
+func (s *SegmentStore) beginIterate() (segs []*segment, live map[[32]byte][]byte, err error) {
+	if err = s.checkOpen(); err != nil {
+		return nil, nil, err
+	}
+	// The live tail is not a file the pool can hold open for us -- it is
+	// still being appended to -- so its values are copied out under the
+	// lock rather than read during the iteration
+	live = make(map[[32]byte][]byte, len(s.live))
+	for key, dbb := range s.live {
+		value := make([]byte, dbb.Length)
+		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
+			return nil, nil, err
+		}
+		live[key] = value
+	}
+	segs = append([]*segment(nil), s.segments...)
+	s.iterating++
+	return segs, live, nil
+}
+
+// endIterate
+// Finish an iteration and, if it was the last, delete what a
+// compaction retired while it ran.
+func (s *SegmentStore) endIterate() {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	s.iterating--
+	if s.iterating > 0 {
+		return
+	}
+	for _, path := range s.pendingDelete {
+		os.Remove(path)
+	}
+	s.pendingDelete = nil
 }
 
 // BlockHeight
@@ -1276,6 +1440,50 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
 	return sl, nil
 }
 
+// DefaultCompactRatio
+// The share of a mutable store's records that must be superseded
+// before compacting is worth what it costs.
+//
+// Compaction rewrites the whole layer: every live value is copied.
+// Doing that on a cadence -- every K commits, which is how a node
+// drives it -- costs O(N) each time and O(N × commits/K) over a run,
+// so the price of reclaiming a fixed amount of garbage grows with the
+// database (issue #31).  Waiting until a fixed *fraction* is garbage
+// makes the amortised cost constant instead: a compaction still costs
+// O(N), but roughly N/(1-r) × r overwrites happen before the next one
+// is due, so the cost per overwrite settles at a constant that depends
+// on r and not on N.
+//
+// 0.25 spends at most a third of the layer's space on garbage and
+// compacts about once per quarter-layer of overwrites.
+const DefaultCompactRatio = 0.25
+
+// CompactRatio is the ratio Compress uses.  Raise it to compact less
+// often and hold more garbage; lower it for the reverse.
+var CompactRatio = DefaultCompactRatio
+
+// worthCompacting
+// Whether enough of this store is superseded records to pay for a
+// compaction.  The caller must hold the Mutex.
+//
+// An unmeasurable store -- no key filter, so no estimate -- says yes:
+// compacting when it was not needed costs time, and skipping when it
+// was needed costs unbounded space.
+func (s *SegmentStore) worthCompacting(ratio float64) bool {
+	if !s.Mutable || s.keys == nil {
+		return true
+	}
+	var records uint64
+	for _, seg := range s.segments {
+		records += uint64(seg.records)
+	}
+	records += s.liveRecords
+	if records == 0 {
+		return false
+	}
+	return float64(s.shadowed) >= ratio*float64(records)
+}
+
 // Compact
 // Replace every sealed segment with one new segment holding only the
 // keys that are still live, and commit it by replacing the manifest.
@@ -1325,7 +1533,13 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	for i := len(s.segments) - 1; i >= 0; i-- {
 		seg := s.segments[i]
 		entries := make([]byte, seg.count*DBKeyFullSize)
-		if _, err = seg.index.ReadAt(entries, segIndexHdrSize); err != nil {
+		index, release, err := seg.index()
+		if err != nil {
+			return meta, err
+		}
+		_, err = index.ReadAt(entries, segIndexHdrSize)
+		release()
+		if err != nil {
 			return meta, err
 		}
 		for pos := 0; pos+DBKeyFullSize <= len(entries); pos += DBKeyFullSize {
@@ -1449,10 +1663,9 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	// Committed.  The old files are unreachable; removing them is
 	// cleanup, and anything left behind is swept on the next open.
 	for _, o := range old {
-		path := filepath.Join(s.Directory, o.meta.File)
 		o.close()
-		os.Remove(path)
-		os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
+		s.retire(o.dataPath)
+		s.retire(o.indexPath)
 	}
 
 	// Compaction is the one moment the true key set is already in hand:
@@ -1465,6 +1678,9 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 			s.keys = nil // Correct, just slower: lookups walk again
 		}
 	}
+	// Everything that was superseded has just been dropped; the count
+	// starts again from what the new generation accumulates
+	s.shadowed = 0
 	return meta, nil
 }
 
@@ -1566,6 +1782,11 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 // value in this store.  The caller must hold the Mutex, and seg must
 // not yet be in s.segments.
 func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
+	index, release, err := seg.index() // One borrow for the whole scan
+	if err != nil {
+		return err
+	}
+	defer release()
 	const batch = 4096 // Index records read per pass
 	buff := make([]byte, batch*DBKeyFullSize)
 	for i := int64(0); i < seg.count; i += batch {
@@ -1574,7 +1795,7 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 			n = batch
 		}
 		chunk := buff[:n*DBKeyFullSize]
-		if _, err = seg.index.ReadAt(chunk, segIndexHdrSize+i*DBKeyFullSize); err != nil {
+		if _, err = index.ReadAt(chunk, segIndexHdrSize+i*DBKeyFullSize); err != nil {
 			return err
 		}
 		for pos := 0; pos+DBKeyFullSize <= len(chunk); pos += DBKeyFullSize {
@@ -1612,7 +1833,8 @@ func (s *SegmentStore) Close() (err error) {
 	// reason to fail the close: the next open rebuilds.
 	if !s.closed && s.keys != nil {
 		if err := s.keys.Save(s.Directory); err == nil {
-			s.bloomAt, _ = s.newestMeta() // Zero when there are none, which is what covers none
+			s.bloomAt, _ = s.newestMeta()
+			s.bloomSegments = uint64(len(s.segments)) // What "covers none" needs to say so
 			s.bloomValid = true
 			if err := s.writeManifest(); err != nil {
 				return err

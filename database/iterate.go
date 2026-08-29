@@ -28,24 +28,30 @@ import (
 // Call fn for every key the store holds, with its current value.
 // Iteration stops and returns the error if fn returns one.
 //
-// The order is unspecified.  A store must not be written to while
-// ForEach runs: it holds the store's lock for the duration.
+// The order is unspecified.  What fn sees is a SNAPSHOT: the sealed
+// segments and live tail as they stood when ForEach was called.
+// Writes made while it runs are not reported, and neither are the
+// results of a compaction that commits underneath it.
+//
+// fn is called with no lock held, so it may read and write the store
+// it is iterating.  It used to run under the store's lock for the
+// whole iteration, which made a callback that called Get deadlock and
+// made any callback block every other reader and writer for as long as
+// it ran (issue #31).
 func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err error) {
 	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	if err = s.checkOpen(); err != nil {
+	segs, live, err := s.beginIterate()
+	s.Mutex.Unlock()
+	if err != nil {
 		return err
 	}
+	defer s.endIterate()
 
-	seen := make(map[[32]byte]struct{}, len(s.live))
+	seen := make(map[[32]byte]struct{}, len(live))
 
 	// The live tail first: it is the newest thing in the store, so
 	// anything it holds shadows every sealed copy
-	for key, dbb := range s.live {
-		value := make([]byte, dbb.Length)
-		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return err
-		}
+	for key, value := range live {
 		seen[key] = struct{}{}
 		if err = fn(key, value); err != nil {
 			return err
@@ -54,39 +60,60 @@ func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err e
 
 	const batch = 4096
 	buff := make([]byte, batch*DBKeyFullSize)
-	for i := len(s.segments) - 1; i >= 0; i-- { // Newest segment wins
-		seg := s.segments[i]
-		for at := int64(0); at < seg.count; {
-			n := seg.count - at
-			if n > batch {
-				n = batch
+	for i := len(segs) - 1; i >= 0; i-- { // Newest segment wins
+		if err = forEachInSegment(segs[i], buff, batch, seen, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// forEachInSegment
+// Emit the keys of one sealed segment that no newer segment already
+// covered.  It is a function rather than the body of the loop so that
+// the segment's index file is borrowed for exactly this segment and
+// given back before the next one -- a deferred release inside the loop
+// would hold one descriptor per segment, which is the cost ForEach
+// exists downstream of (issue #30).
+func forEachInSegment(
+	seg *segment, buff []byte, batch int64,
+	seen map[[32]byte]struct{}, fn func(key [32]byte, value []byte) error,
+) error {
+	index, release, err := seg.index()
+	if err != nil {
+		return err
+	}
+	defer release()
+	for at := int64(0); at < seg.count; {
+		n := seg.count - at
+		if n > batch {
+			n = batch
+		}
+		b := buff[:n*DBKeyFullSize]
+		if _, err = index.ReadAt(b, segIndexHdrSize+at*DBKeyFullSize); err != nil {
+			return err
+		}
+		for j := int64(0); j < n; j++ {
+			rec := b[j*DBKeyFullSize:]
+			var key [32]byte
+			copy(key[:], rec[:32])
+			if _, ok := seen[key]; ok {
+				continue // A newer copy was already emitted
 			}
-			b := buff[:n*DBKeyFullSize]
-			if _, err = seg.index.ReadAt(b, segIndexHdrSize+at*DBKeyFullSize); err != nil {
+			seen[key] = struct{}{}
+			dbb := &DBBKey{
+				Offset: binary.BigEndian.Uint64(rec[32:]),
+				Length: binary.BigEndian.Uint64(rec[40:]),
+			}
+			value, err := seg.value(dbb)
+			if err != nil {
 				return err
 			}
-			for j := int64(0); j < n; j++ {
-				rec := b[j*DBKeyFullSize:]
-				var key [32]byte
-				copy(key[:], rec[:32])
-				if _, ok := seen[key]; ok {
-					continue // A newer copy was already emitted
-				}
-				seen[key] = struct{}{}
-				dbb := &DBBKey{
-					Offset: binary.BigEndian.Uint64(rec[32:]),
-					Length: binary.BigEndian.Uint64(rec[40:]),
-				}
-				value, err := seg.value(dbb)
-				if err != nil {
-					return err
-				}
-				if err = fn(key, value); err != nil {
-					return err
-				}
+			if err = fn(key, value); err != nil {
+				return err
 			}
-			at += n
 		}
+		at += n
 	}
 	return nil
 }
@@ -96,10 +123,13 @@ func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err e
 // first, and a key it holds is not emitted again from Perm: a key that
 // moved to Dyna leaves its original behind in Perm, and the Dyna copy
 // is the one Get answers with.
+//
+// The KV2 lock is NOT held: each layer snapshots itself, and fn runs
+// unlocked, so a callback is free to use the database it is walking.
+// Holding it here would have reinstated exactly the deadlock the
+// per-layer fix removed -- fn calling KV2.Get would block on the mutex
+// its own iteration was holding (issue #31).
 func (k *KV2) ForEach(fn func(key [32]byte, value []byte) error) error {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-
 	dyna := make(map[[32]byte]struct{})
 	err := k.DynaKV.ForEach(func(key [32]byte, value []byte) error {
 		dyna[key] = struct{}{}

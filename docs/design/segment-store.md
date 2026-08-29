@@ -196,10 +196,52 @@ record from a crash mid-write is dropped.
 5. Next — wire `ShardWriter.Flush` to `Seal` so a block boundary is one
    durability, sync, and compaction boundary.
 
-Not yet done here: a per-segment key count cap (segments grow with the
-seal cadence; a size-triggered seal or a tiered merge keeps the
-segment count bounded on long chains), and reading a value with one
-`ReadAt` on the value bytes rather than through the record header.
+Not yet done here: a tiered merge of sealed segments, so the segment
+count is bounded on long chains rather than growing with the seal
+cadence, and reading a value with one `ReadAt` on the value bytes
+rather than through the record header.
+
+A merge of *permanent* segments is not just a scheduling question: it
+would destroy the block→segment mapping `ExportBlock` depends on, which
+is the same mapping issue #27 established. Either the merge stays below
+the last exported block, or the manifest carries the mapping
+separately. The Dyna layer has no such constraint — no peer receives
+one of its segments.
+
+### File descriptors are borrowed, not held
+
+A segment used to keep its data and index files open for the life of
+the process, and nothing closed or merged them: a node sealing per
+block leaked two descriptors per block, and one test process here was
+measured holding 14,935 (issue #30).
+
+A segment now keeps only what a lookup needs in order to decide
+*whether* to read — the key count and the bloom filter — and borrows
+its files from a process-wide pool for the length of a read.
+`SetOpenFileLimit` bounds the pool; the default is 512, an order of
+magnitude under the 1024 that is still a common `ulimit -n`, leaving
+room for the live tails and the host application. So the descriptor
+count tracks the limit rather than the segment count
+(`TestSegmentFDsStayBounded`).
+
+Borrowing is reference counted, and that buys the second half: a file
+with a live borrow is never closed, and on Unix an open descriptor
+keeps reading after the path is unlinked. A reader can therefore hold
+a segment open across a compaction that retires and deletes it, which
+is what lets iteration run without the store's lock.
+
+### Iteration takes a snapshot and holds no lock
+
+`ForEach` used to hold the store's mutex for the whole iteration, so a
+callback that called `Get` deadlocked and any callback blocked every
+other reader and writer for as long as it ran (issue #31).
+
+It now copies the live tail's values and the segment list under the
+lock, releases it, and calls back with nothing held. What the callback
+sees is the store as it stood when iteration began. A compaction is
+free to commit underneath it; the files it retires are unlinked when
+the last iteration finishes rather than immediately, so the reads stay
+valid (`TestForEachSurvivesConcurrentCompaction`).
 
 Sealing is also still where the Perm layer's time goes — about 60% of
 it at a 25,000-key block, of which the largest remaining piece is the

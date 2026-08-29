@@ -194,8 +194,39 @@ Two flags change what runs:
   They are skipped by default so `go test ./...` stays a suite someone
   can wait for; the skip line names the flag.
 - `-short` skips the measurement tests (`TestSyncCost`,
-  `TestDynaCost`), which are correctness-neutral and exist to report
-  numbers.
+  `TestDynaCost`, `TestMultiCoreScaling`), which are
+  correctness-neutral and exist to report numbers.
+
+## What CI runs
+
+Split by cost, so that a mistake a compiler catches reports in a
+minute rather than behind the suite.
+
+**On every push and pull request** (`.github/workflows/ci.yml`):
+
+| job | what | why |
+|---|---|---|
+| `build` | `go build`, `go vet`, `gofmt -l` | seconds; catches the unused import, the shadowed error, the unformatted file |
+| `test` | `go test -short ./...` | every correctness test; the measurement tests prove nothing on a shared runner |
+| `race` | `-race` over the concurrency tests | the sharded write path, the file pool, iteration alongside compaction |
+
+**Nightly** (`.github/workflows/nightly.yml`): the full suite with
+timings, the full suite under `-race`, and the crash-recovery tests
+repeated 25 times.
+
+That last job earns its place. The durability tests kill a child
+process at a random moment, so each run samples a different window and
+a single run proves little. Issue #35 — an empty key filter accepted
+as covering segment `(0,0)`, so `Get` reported keys absent that were
+sitting on disk — failed **twice in fifty-five runs**. A pre-merge run
+sees green and merges it. Repetition is what finds that class of bug,
+and repetition is too slow to gate a push.
+
+The suite is slow enough (~27 minutes, ~20 with `-short`) that this
+split is a necessity rather than a preference. Most of that time is
+fsync: a block boundary seals all 512 shards, and a shard with no
+writes still pays two fsyncs for a manifest it did not change. That is
+issues #32 and #33; if they are fixed, the gate can be simpler.
 
 ## Conclusion
 

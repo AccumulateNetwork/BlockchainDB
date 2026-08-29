@@ -327,6 +327,26 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 func (k *KV2) Compress() error {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
+
+	// Do nothing unless there is enough garbage to be worth a rewrite
+	// of the layer.  A caller drives this on a cadence -- every K
+	// commits -- and the cadence says when to *consider* compacting,
+	// not that a compaction is due: obeying it literally cost O(N) per
+	// call and O(N × commits/K) over a run, so reclaiming a fixed
+	// amount of garbage got more expensive the larger the database grew
+	// (issue #31).
+	//
+	// The seal is inside the check for the same reason.  Sealing first
+	// and then compacting is what made compaction unable to opt out:
+	// the seal had already added a second segment, so the
+	// single-generation early-out never applied.
+	k.DynaKV.Mutex.Lock()
+	worth := k.DynaKV.worthCompacting(CompactRatio)
+	k.DynaKV.Mutex.Unlock()
+	if !worth {
+		return nil
+	}
+
 	if _, err := k.DynaKV.SealNext(); err != nil { // Everything to reclaim must be sealed
 		return err
 	}

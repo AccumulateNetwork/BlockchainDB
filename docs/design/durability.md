@@ -126,11 +126,29 @@ of which lost keys that a completed `Close` had made durable:
    left its bytes on disk, so the next append landed after them and
    the following open mis-parsed everything written since.
 
-Each has a regression test in `segstore_test.go`
+4. **An empty key filter accepted as covering segment (0,0).** Not a
+   durability defect — the data was durable and intact — but reached
+   only through one. `loadKeyFilter` judged a saved filter still valid
+   by comparing the newest segment's `(Height, Seq)` to what the
+   manifest recorded, and a filter saved with *no* segments records the
+   zero value, `(0,0)`. That is also the identity of the first segment
+   a store seals, and the Dyna layer numbers every segment at height 0.
+   So when a crash left a sealed segment for `recoverOrphans` to adopt
+   without a manifest rewrite, the empty filter matched it, was loaded,
+   and answered "definitely absent" for all 40 of its keys: `Get`
+   returned not-found for records sitting on disk. The manifest now
+   records how many segments the filter covered, which is what "covers
+   nothing" needs to say out loud (issue #35).
+
+   `TestCrashRecoverySeal` found it, intermittently — twice in 55 runs.
+   `TestKeyFilterEmptyDoesNotCoverSegmentZero` builds the same state
+   deterministically.
+
+The first three have a regression test in `segstore_test.go`
 (`TestSegmentStoreLiveTailAfterInterruptedSeal`,
 `TestSegmentStoreClosedRejectsOperations`,
-`TestSegmentStoreTornTailIsTruncated`); all three fail against the
-unfixed code.
+`TestSegmentStoreTornTailIsTruncated`) and the fourth one in
+`keyfilter_test.go`; all four fail against the unfixed code.
 
 ## Known gaps (accepted, documented)
 

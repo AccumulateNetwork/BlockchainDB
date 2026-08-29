@@ -1,6 +1,8 @@
 package blockchainDB
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -278,4 +280,68 @@ func TestStoreStatsCountWhatHappened(t *testing.T) {
 	require.Equal(t, s.FilterMisled, s.FilterWalked-uint64(5),
 		"the only walks that found something were the 4 duplicates and the conflict")
 	require.NoError(t, store.Close())
+}
+
+// TestKeyFilterEmptyDoesNotCoverSegmentZero
+// A saved filter that covered NO segments must not be mistaken for one
+// covering the first segment a store seals.
+//
+// Both record (0, 0) as the newest segment they cover -- the empty one
+// because that is the zero value, the other because (0, 0) is a real
+// identity, and the Dyna layer numbers every segment at height 0 so its
+// first segment is exactly that.  A crash that leaves a sealed segment
+// for recoverOrphans to adopt without rewriting the manifest produces
+// the pair: the manifest still claims a valid filter covering "the
+// newest segment (0,0)", and the segment now present is (0,0).
+//
+// Accepting the empty filter there is silent data loss, not a slow
+// lookup: the filter answers "definitely absent" for every key in the
+// segment, and Get returns not-found without ever opening it.  Found
+// intermittently by TestCrashRecoverySeal.
+func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
+	dir := storeDir(t, "bloom0")
+
+	// A store closed with no segments: bloom.dat covers nothing, and the
+	// manifest says so with (0, 0) because that is the zero value
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	saved, err := os.ReadFile(filepath.Join(dir, segManifestName))
+	require.NoError(t, err)
+	var m StoreManifest
+	require.NoError(t, json.Unmarshal(saved, &m))
+	require.True(t, m.BloomValid, "the close must have left a coverage claim to test")
+	require.Empty(t, m.Segments)
+
+	// Fill a tail and seal it, which produces segment (0, 0)
+	store, err = OpenSegmentStore(dir)
+	require.NoError(t, err)
+	kr := NewFastRandom([]byte{61})
+	keys := make([][32]byte, 40)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, store.Put(keys[i], []byte(fmt.Sprintf("v%d", i))))
+	}
+	_, err = store.SealNext()
+	require.NoError(t, err)
+	require.Len(t, store.segments, 1)
+	require.Equal(t, uint64(0), store.segments[0].meta.Height)
+	require.Equal(t, uint64(0), store.segments[0].meta.Seq, "the case only arises for segment (0,0)")
+
+	// Now put the manifest back as it was before the seal: this is a
+	// crash after the segment file reached disk but before the manifest
+	// commit, which is the window recoverOrphans exists for
+	require.NoError(t, os.WriteFile(filepath.Join(dir, segManifestName), saved, 0644))
+
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.Len(t, reopened.segments, 1, "the orphan segment must have been adopted")
+
+	for i, key := range keys {
+		v, err := reopened.Get(key)
+		require.NoErrorf(t, err, "key %d reported absent by the filter but held by segment (0,0)", i)
+		require.Equal(t, fmt.Sprintf("v%d", i), string(v))
+	}
+	require.NoError(t, reopened.Close())
 }

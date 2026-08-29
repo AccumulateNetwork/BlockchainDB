@@ -259,10 +259,69 @@ func runCrashRounds(t *testing.T, mode string) {
 			key := kr.NextHash()
 			value := vr.RandBuff(10, 50)
 			got, err := kv.Get(key)
-			require.NoErrorf(t, err, "round %d: durable key %d lost (durable=%d)", round, i, durable)
+			if err != nil {
+				t.Fatalf("round %d: durable key %d lost (durable=%d): %v\n%s",
+					round, i, durable, err, crashDiagnose(kv, dir, i, key))
+			}
 			require.Equalf(t, value, got, "round %d: durable key %d corrupt", round, i)
 		}
 		require.NoError(t, kv.Close())
 		t.Logf("round %d: killed with %d durable keys; all verified", round, durable)
 	}
+}
+
+// crashDiagnose
+// Describe where a key that should have been durable actually is, so
+// that an intermittent failure says something more useful than "not
+// found".  Which layer holds it, what each layer's tail and segments
+// look like, and what is on disk.
+func crashDiagnose(kv *KV2, dir string, i int, key [32]byte) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n--- diagnosis for key %d (%x), %s layer ---\n",
+		i, key[:8], map[bool]string{true: "Perm", false: "Dyna"}[i%2 == 0])
+
+	for _, l := range []struct {
+		name  string
+		store *SegmentStore
+	}{{"Perm", kv.PermKV}, {"Dyna", kv.DynaKV}} {
+		s := l.store
+		s.Mutex.Lock()
+		_, inLive := s.live[key]
+		inFilter := s.keys == nil || s.keys.Test(key)
+		fmt.Fprintf(&b, "%s: %d segments, live keys %d, records %d, blockHeight %d, filter=%v inLive=%v filterSays=%v\n",
+			l.name, len(s.segments), len(s.live), s.liveRecords, s.blockHeight,
+			s.keys != nil, inLive, inFilter)
+		for _, seg := range s.segments {
+			dbb, found, err := seg.lookup(key)
+			mark := ""
+			if found {
+				mark = fmt.Sprintf("  <-- HOLDS IT at offset %d", dbb.Offset)
+			}
+			if err != nil {
+				mark = fmt.Sprintf("  <-- lookup error: %v", err)
+			}
+			fmt.Fprintf(&b, "   seg (%d,%d) count=%d records=%d file=%s%s\n",
+				seg.meta.Height, seg.meta.Seq, seg.count, seg.records, seg.meta.File, mark)
+		}
+		s.Mutex.Unlock()
+	}
+
+	for _, sub := range []string{PermDirName, DynaDirName} {
+		entries, err := os.ReadDir(filepath.Join(dir, sub))
+		if err != nil {
+			fmt.Fprintf(&b, "%s dir: %v\n", sub, err)
+			continue
+		}
+		fmt.Fprintf(&b, "%s dir:", sub)
+		for _, e := range entries {
+			info, _ := e.Info()
+			size := int64(-1)
+			if info != nil {
+				size = info.Size()
+			}
+			fmt.Fprintf(&b, " %s(%d)", e.Name(), size)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
