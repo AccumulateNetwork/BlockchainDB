@@ -29,6 +29,7 @@ import (
 //	seg-<height>.dat    a sealed, immutable segment (transport format)
 //	seg-<height>.idx    its key index: sorted 48-byte records + a bloom
 //	segments.json       the manifest: the segments, counts, and hashes
+//	filters.dat         the live key filters, saved on close (keyfilter.go)
 //
 // An index record is key(32) offset(8) length(8), and the offset is
 // relative to the segment's BODY -- its records, after the header --
@@ -88,7 +89,14 @@ const (
 	// version 2 database without complaint and answer "not found" for
 	// every key that had been packed into a set, which is exactly the
 	// silent failure the check exists to refuse.
-	StoreFormatVersion = 2
+	//
+	// Version 3 replaced the whole-history key filter (bloom.dat and its
+	// newest-segment coverage claim) with the rolling window of
+	// keyfilter.go: filters.dat, a block-range claim, the roll period
+	// FilterBlocks, and a Span on each merged segment saying how far
+	// back it reaches.  A version-2 build would take a merged segment
+	// for a single block and let a filter claim keys it never held.
+	StoreFormatVersion = 3
 	segIndexHdrSize    = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
 	segDataHdrSize     = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
 	segRecHdrSize      = 40 // key(32) valueLen(8) precede each value in a .dat
@@ -109,6 +117,16 @@ type SegmentMeta struct {
 	File   string `json:"file"`   // Data file name within the store directory
 	Count  uint64 `json:"count"`  // Number of keys indexed
 	Hash   string `json:"hash"`   // SHA-256 of the data file, hex
+
+	// Span is how many blocks below Height the segment also holds: 0
+	// for a sealed block, more for a merge of several.  The key filter
+	// covers a block range, and a segment is inside that range only if
+	// its oldest block is (SegmentMeta.first); a merged segment
+	// recorded as its newest block alone would be claimed by a filter
+	// that never saw its older keys.  Zero is the common value and the
+	// safe one to omit: a segment that reaches back to block 0 from
+	// block 39 has Span 39, not first 0, so nothing is ambiguous.
+	Span uint64 `json:"span,omitempty"`
 }
 
 // after reports whether a is a strictly later segment than b
@@ -127,10 +145,11 @@ type StoreManifest struct {
 	// first so that it is readable at the head of the file.
 	Version uint32 `json:"version"`
 
-	Mutable     bool          `json:"mutable"`
-	SealLimit   uint64        `json:"sealLimit"`   // 0: unset, caller decides
-	BlockHeight uint64        `json:"blockHeight"` // Block currently being accumulated
-	Segments    []SegmentMeta `json:"segments"`    // Oldest first
+	Mutable      bool          `json:"mutable"`
+	SealLimit    uint64        `json:"sealLimit"`    // 0: unset, caller decides
+	FilterBlocks uint64        `json:"filterBlocks"` // Roll period of the key filter; never 0
+	BlockHeight  uint64        `json:"blockHeight"`  // Block currently being accumulated
+	Segments     []SegmentMeta `json:"segments"`     // Oldest first
 
 	// Shadowed carries the store's estimate of how many of its records
 	// a later write has superseded -- its garbage -- across a restart.
@@ -144,25 +163,18 @@ type StoreManifest struct {
 	// pointless one.
 	Shadowed uint64 `json:"shadowed,omitempty"`
 
-	// BloomValid says the persisted key filter (bloom.dat) covers
-	// exactly the sealed segments listed here; BloomHeight/BloomSeq name
-	// the newest of them and BloomSegments counts them.
-	//
-	// The count is not redundant.  A filter saved when the store had no
-	// segments records the zero value for the newest one -- (0, 0) --
-	// and (0, 0) is also the identity of the FIRST segment a store
-	// seals.  The Dyna layer numbers every segment at height 0, so its
-	// first is exactly (0, 0): an empty filter's "covers nothing" was
-	// indistinguishable from "covers segment (0, 0)", and a crash that
-	// left a segment for recoverOrphans to adopt without rewriting the
-	// manifest produced exactly that pair.  The empty filter was then
-	// accepted as covering it, and every key in that segment answered
-	// "not found" -- a false negative, which is silent data loss rather
-	// than the slow lookup a false positive costs.
-	BloomValid    bool   `json:"bloomValid,omitempty"`
-	BloomHeight   uint64 `json:"bloomHeight,omitempty"`
-	BloomSeq      uint64 `json:"bloomSeq,omitempty"`
-	BloomSegments uint64 `json:"bloomSegments,omitempty"`
+	// FilterValid says the persisted key filters (filters.dat) cover
+	// the store exactly as this manifest lists it, and the other three
+	// fields are that claim: the window's start block, the newest
+	// segment inside the window, and how many segments the window
+	// covers.  See filterClaim for why each is needed.  The claim is
+	// one-shot: only the manifest written straight after a save carries
+	// it, and any later commit clears it.
+	FilterValid    bool   `json:"filterValid,omitempty"`
+	FilterStart    uint64 `json:"filterStart,omitempty"`
+	FilterHeight   uint64 `json:"filterHeight,omitempty"`
+	FilterSeq      uint64 `json:"filterSeq,omitempty"`
+	FilterSegments uint64 `json:"filterSegments,omitempty"`
 }
 
 // segment
@@ -291,6 +303,11 @@ type SegmentStore struct {
 	// to a default, discarding the only parameter its constructor takes.
 	SealLimit uint64
 
+	// FilterBlocks is the key filter's roll period N (keyfilter.go): a
+	// fresh filter every N blocks, each covering 2N.  Persisted, like
+	// SealLimit, and never 0.
+	FilterBlocks uint64
+
 	// blockHeight is the block whose writes the live tail is
 	// accumulating.  A block boundary seals at its own height and then
 	// advances this, so auto-seals in between are tagged with the block
@@ -327,13 +344,12 @@ type SegmentStore struct {
 	// else to look, which is every Dyna layer and every store outside a
 	// KVShard.
 	//
-	// It sits inside the store rather than beside it because of the key
-	// filter.  Every lookup -- and so every write, which asks whether
-	// its key is new -- is settled by the filter when it says "absent",
-	// and that answer is only definitive if the filter covers the cold
-	// keys too.  A layer above the store cannot keep that promise; the
-	// store can, by adding the cold keys whenever it rebuilds the filter
-	// and consulting cold only when the filter has already said "maybe".
+	// It sits inside the store so that Get is one call: a key that has
+	// left the segments is still the store's key, and a caller reading
+	// history should not have to know where the store keeps it.  The
+	// key filters do not cover the cold keys -- that is what bounds them
+	// (keyfilter.go) -- so a key they rule out is looked for cold by Get,
+	// and by nothing else: see lookup.
 	cold coldStore
 
 	// retireOnCommit holds segments dropped from the list -- their keys
@@ -386,37 +402,44 @@ type SegmentStore struct {
 	// compaction rather than forcing a pointless one.
 	shadowed uint64
 
-	// keys is a membership filter over everything the store holds --
-	// every sealed segment and the live tail.  It exists to make
-	// proving a key ABSENT cheap.
+	// filters are the live key filters, oldest first: one or two
+	// membership sets over the keys of the last N to 2N blocks and the
+	// live tail (keyfilter.go).  They exist to make proving a key ABSENT
+	// from the window cheap.
 	//
-	// Without it, "not here" costs a bloom probe against every sealed
+	// Without them, "not here" costs a bloom probe against every sealed
 	// segment plus a binary search per false positive, so the answer
 	// gets steadily more expensive as the store seals: a store that has
 	// sealed 2,600 times pays 2,600 probes for it.  That is the
 	// question a write asks -- a new key is absent by definition -- so
-	// the write path decayed with the segment count.  One probe per
-	// BloomSet layer replaces it, and the layer count grows with the
-	// logarithm of the key count rather than with the seal count.
+	// the write path decayed with the segment count.  A probe of the
+	// live pair replaces it for every segment inside the window; the
+	// segments below the window and the packed sets each carry a filter
+	// of their own and are probed only when the window cannot answer.
 	//
 	// A false positive costs no more than the walk it replaced, so a
 	// stale filter is slow, never wrong.  A false NEGATIVE would be
 	// silent data loss -- "not found" for a key that is right there --
-	// so the filter is used only where its coverage is proven, and nil
-	// (falling back to the walk) wherever it is not: see loadKeyFilter.
-	keys *BloomSet
+	// so the filters are used only where their coverage is proven, and
+	// nil (falling back to the walk) wherever it is not.
+	filters []*keyFilter
 
-	// bloomValid/bloomAt are the coverage claim writeManifest records.
-	// It is a one-shot: only the manifest written immediately after a
+	// filterValid and filterSaved are the coverage claim writeManifest
+	// records.  One-shot: only the manifest written immediately after a
 	// save carries it.
-	bloomValid    bool
-	bloomAt       SegmentMeta
-	bloomSegments uint64
+	filterValid bool
+	filterSaved filterClaim
 
-	// keysLackCold says the filter was rebuilt from the segments with no
-	// cold store attached, so the cold keys still have to be added
-	// (attachCold).  A filter loaded from disk was saved complete.
-	keysLackCold bool
+	// filtersLackCold says a filter was built before the cold store was
+	// attached, so the cold keys its window reaches still have to be
+	// added (attachCold).  Filters loaded from disk were saved complete.
+	filtersLackCold bool
+
+	// spanKeys is the most keys a completed filter span has taken, which
+	// is what a filter that is starting is sized for (rollKeyFilters).
+	// Not persisted: a reopened store sizes its first filters from what
+	// they hold and learns the rest at its first roll.
+	spanKeys uint64
 
 	stats storeCounters // Atomic: the read path holds only a shared lock
 }
@@ -429,8 +452,10 @@ type SegmentStore struct {
 type coldStore interface {
 	// lookup finds a key, or reports that it is not held cold
 	lookup(key [32]byte) (value []byte, found bool, err error)
-	// forEachKey visits every key held cold, for rebuilding the filter
-	forEachKey(fn func(key [32]byte)) error
+	// forEachKeySince visits every key held cold from block `start` on
+	// -- at set granularity, so a set straddling `start` is visited
+	// whole -- for rebuilding a filter that begins there
+	forEachKeySince(start uint64, fn func(key [32]byte)) error
 	// forEach visits every key and its value, for iteration
 	forEach(fn func(key [32]byte, value []byte) error) error
 	// watermark is the highest block held cold, if any is
@@ -439,20 +464,24 @@ type coldStore interface {
 
 // attachCold
 // Give the store somewhere to look for keys its segments no longer
-// hold.  If the key filter was rebuilt from the segments alone -- which
-// it is on the first open, before anything could be attached -- the
-// cold keys are added to it now, so that "absent" stays definitive.
+// hold.  If the key filters were built from the segments alone -- which
+// they are on the first open, before anything could be attached -- the
+// cold keys inside each filter's window are added now, so that a key
+// written inside the window and already packed is still refused a
+// rewrite.
 func (s *SegmentStore) attachCold(cold coldStore) (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	s.cold = cold
-	if s.keys != nil && s.keysLackCold {
-		if err = cold.forEachKey(s.keys.Set); err != nil {
-			s.keys = nil // Never under-report: walk instead
-			return err
+	if s.filtersLackCold {
+		for _, f := range s.filters {
+			if err = cold.forEachKeySince(f.start, f.keys.Set); err != nil {
+				s.filters = nil // Never under-report: walk instead
+				return err
+			}
 		}
 	}
-	s.keysLackCold = false
+	s.filtersLackCold = false
 	return nil
 }
 
@@ -478,9 +507,9 @@ type StoreStats struct {
 	PutConflict  uint64 // Key was present with a different value
 
 	LookupTotal  uint64 // Lookups that reached the sealed segments logic
-	FilterAbsent uint64 // Settled by the filter alone: no segment touched
-	FilterWalked uint64 // Filter said "maybe" (or was absent): segments walked
-	FilterMisled uint64 // Walked on the filter's say-so and found nothing
+	FilterAbsent uint64 // Filters ruled the window out: no segment inside it touched
+	FilterWalked uint64 // Filters said "maybe" (or were absent): the window walked
+	FilterMisled uint64 // Walked the window on the filters' say-so and found nothing
 	LiveHit      uint64 // Answered from the live tail, before any filter
 }
 
@@ -518,9 +547,11 @@ func NewSegmentStore(directory string, mutable bool) (store *SegmentStore, err e
 	if err = os.MkdirAll(directory, os.ModePerm); err != nil {
 		return nil, err
 	}
-	store = &SegmentStore{Directory: directory, Mutable: mutable}
+	store = &SegmentStore{Directory: directory, Mutable: mutable, FilterBlocks: DefaultFilterBlocks}
 	store.live = make(map[[32]byte]*DBBKey)
-	store.keys = store.newKeyFilter(0)
+	if err = store.rebuildKeyFilters(); err != nil {
+		return nil, err
+	}
 	if err = store.newLiveFile(); err != nil {
 		return nil, err
 	}
@@ -570,13 +601,15 @@ func (s *SegmentStore) SetSealLimit(limit uint64) (err error) {
 		return err
 	}
 	s.SealLimit = limit
-	// Resize the key filter's first layer to the scale the caller just
-	// declared, while it is still empty and resizing is free.  A store
-	// is created before its limit is known, so without this every store
-	// starts at the same size regardless of what it is for -- and a
-	// 512-shard database creates 1,024 of them.
-	if s.keys != nil && s.keys.Count() == 0 {
-		s.keys = s.newKeyFilter(0)
+	// Resize the key filters' first layers to the scale the caller just
+	// declared, while they are still empty and resizing is free.  A
+	// store is created before its limit is known, so without this every
+	// store starts at the same size regardless of what it is for -- and
+	// a 512-shard database creates 1,024 of them.
+	if s.filters != nil && s.filterCount() == 0 {
+		if err = s.rebuildKeyFilters(); err != nil {
+			return err
+		}
 	}
 	return s.writeManifest()
 }
@@ -628,6 +661,10 @@ func (s *SegmentStore) load() (err error) {
 	}
 	s.Mutable = m.Mutable
 	s.SealLimit = m.SealLimit
+	if err = checkFilterBlocks(m.FilterBlocks); err != nil {
+		return fmt.Errorf("%s: manifest: %w", s.Directory, err)
+	}
+	s.FilterBlocks = m.FilterBlocks
 	s.blockHeight = m.BlockHeight
 	s.shadowed = m.Shadowed
 
@@ -639,13 +676,14 @@ func (s *SegmentStore) load() (err error) {
 		s.segments = append(s.segments, seg)
 	}
 
-	if err = s.recoverOrphans(); err != nil {
+	adopted, err := s.recoverOrphans()
+	if err != nil {
 		return err
 	}
 	// After recoverOrphans, because an adopted segment changes what the
-	// filter has to cover; before openLive, which adds the live keys as
-	// it replays them.
-	if err = s.loadKeyFilter(m); err != nil {
+	// filters have to cover; before openLive, which adds the live keys
+	// as it replays them.
+	if err = s.loadKeyFilters(m, adopted); err != nil {
 		return err
 	}
 	if err = s.openLive(); err != nil {
@@ -655,78 +693,10 @@ func (s *SegmentStore) load() (err error) {
 	return nil
 }
 
-// loadKeyFilter
-// Restore the store-level key filter: load the persisted one when the
-// manifest proves it covers exactly the sealed segments now open, and
-// rebuild it from those segments' own indexes otherwise.
-//
-// Coverage is proven rather than assumed because the two failure modes
-// are not symmetric.  A filter holding keys the store no longer has
-// costs a wasted walk.  A filter MISSING a key the store does hold
-// turns a Get into a wrong answer -- "not found" for a key sitting in
-// a segment -- and nothing downstream would catch it.  A crash, an
-// interrupted save, and a seal after the last save all leave the file
-// behind the segment list, so each of them rebuilds.
-func (s *SegmentStore) loadKeyFilter(m *StoreManifest) (err error) {
-	newest, ok := s.newestMeta()
-	// The count first: it is what separates "covers nothing" from
-	// "covers segment (0, 0)", which the newest-segment identity alone
-	// cannot do.  A manifest written before the count existed reads as
-	// 0, so a store with segments falls through to a rebuild -- slower,
-	// and correct.
-	covered := m.BloomValid && uint64(len(s.segments)) == m.BloomSegments &&
-		(m.BloomSegments == 0 || // An empty filter covers no segments
-			(ok && newest.Height == m.BloomHeight && newest.Seq == m.BloomSeq))
-	if covered {
-		if s.keys, err = LoadBloomSet(s.Directory); err == nil {
-			s.keysLackCold = false // Saved from a filter that had them
-			return nil
-		}
-		s.keys = nil // Unreadable or truncated; rebuild instead
-	}
-	return s.rebuildKeyFilter()
-}
-
-// rebuildKeyFilter
-// Build the key filter from what the store actually holds.  Layer 0 is
-// sized for the current key count, so a store reopened at 30 million
-// keys starts with one layer covering all of them rather than growing
-// a stack of layers to reach them.
-//
-// A rebuild that fails leaves the filter nil, which is the safe
-// direction: lookups fall back to walking the segments, which is what
-// they did before the filter existed.
-func (s *SegmentStore) rebuildKeyFilter() (err error) {
-	var total uint64
-	for _, seg := range s.segments {
-		total += uint64(seg.count)
-	}
-	s.keys = s.newKeyFilter(total)
-	for _, seg := range s.segments {
-		if err = s.addSegmentKeys(seg); err != nil {
-			s.keys = nil
-			return err
-		}
-	}
-	for key := range s.live { // The tail is part of what the store holds
-		s.keys.Set(key)
-	}
-	// And so are the keys held cold: a filter without them would answer
-	// "absent" for a key that is right there in a block set
-	if s.cold != nil {
-		if err = s.cold.forEachKey(s.keys.Set); err != nil {
-			s.keys = nil
-			return err
-		}
-	}
-	s.keysLackCold = s.cold == nil
-	return nil
-}
-
 // addSegmentKeys
-// Add every key in a sealed segment to the filter, read from the
+// Add every key in a sealed segment to a filter, read from the
 // segment's index: the keys are already there, sorted, 48 bytes apart.
-func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
+func (s *SegmentStore) addSegmentKeys(keys *BloomSet, seg *segment) (err error) {
 	index, release, err := seg.index() // One borrow for the whole scan
 	if err != nil {
 		return err
@@ -746,7 +716,7 @@ func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
 		for j := int64(0); j < n; j++ {
 			var key [32]byte
 			copy(key[:], b[j*DBKeyFullSize:])
-			s.keys.Set(key)
+			keys.Set(key)
 		}
 		i += n
 	}
@@ -899,9 +869,7 @@ func (s *SegmentStore) openLive() (err error) {
 		}
 		s.live[key] = &DBBKey{Offset: valueOffset, Length: length}
 		s.liveRecords++
-		if s.keys != nil {
-			s.keys.Set(key)
-		}
+		s.filterSet(key)
 		offset = valueOffset + length
 	}
 
@@ -934,11 +902,11 @@ func (s *SegmentStore) openLive() (err error) {
 // seal (or compaction) that reached disk but not the manifest, and is
 // complete by construction -- it was fsynced before being renamed into
 // place.  A data file at or below that height was superseded by a
-// committed compaction.
-func (s *SegmentStore) recoverOrphans() (err error) {
+// committed compaction.  Reports how many segments were adopted.
+func (s *SegmentStore) recoverOrphans() (adopted int, err error) {
 	entries, err := os.ReadDir(s.Directory)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	known := make(map[string]bool)
@@ -947,7 +915,7 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 	}
 	newest, haveSegments := s.newestMeta()
 
-	var adopted []SegmentMeta
+	var orphans []SegmentMeta
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasSuffix(name, segTmpSuffix) { // Never complete
@@ -970,25 +938,25 @@ func (s *SegmentStore) recoverOrphans() (err error) {
 		}
 		hash, count, err := s.identify(path)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		adopted = append(adopted, SegmentMeta{Height: height, Seq: seq, File: name, Count: count, Hash: hash})
+		orphans = append(orphans, SegmentMeta{Height: height, Seq: seq, File: name, Count: count, Hash: hash})
 	}
-	if len(adopted) == 0 {
-		return nil
+	if len(orphans) == 0 {
+		return 0, nil
 	}
 
-	sort.Slice(adopted, func(i, j int) bool { return adopted[j].after(adopted[i]) })
-	for _, meta := range adopted {
+	sort.Slice(orphans, func(i, j int) bool { return orphans[j].after(orphans[i]) })
+	for _, meta := range orphans {
 		seg, err := s.openSegment(meta)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		meta.Count = uint64(seg.count) // Indexed keys, not physical records
 		seg.meta = meta
 		s.segments = append(s.segments, seg)
 	}
-	return s.writeManifest()
+	return len(orphans), s.writeManifest()
 }
 
 // heightFromName parses seg-<height>.dat
@@ -1046,15 +1014,19 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 // them were this directory, fsynced three times over (issue #33).
 func (s *SegmentStore) writeManifest() (err error) {
 	// The coverage claim is true only of the manifest written directly
-	// after the filter was saved.  Everything else that writes a
+	// after the filters were saved.  Everything else that writes a
 	// manifest -- a seal, a compaction, an import -- has changed the
 	// segment set, so clearing it here means no path can forget to.
-	defer func() { s.bloomValid = false }()
+	defer func() { s.filterValid = false }()
 
 	m := StoreManifest{Version: StoreFormatVersion,
-		Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
-		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq,
-		BloomSegments: s.bloomSegments, Shadowed: s.shadowed}
+		Mutable: s.Mutable, SealLimit: s.SealLimit, FilterBlocks: s.FilterBlocks,
+		BlockHeight: s.blockHeight, Shadowed: s.shadowed}
+	if s.filterValid {
+		m.FilterValid = true
+		m.FilterStart, m.FilterHeight = s.filterSaved.Start, s.filterSaved.Height
+		m.FilterSeq, m.FilterSegments = s.filterSaved.Seq, s.filterSaved.Segments
+	}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}
@@ -1135,8 +1107,8 @@ func (s *SegmentStore) checkOpen() error {
 }
 
 // Get
-// Return the value for a key.  Checks the live tail, then the sealed
-// segments newest to oldest.
+// Return the value for a key, wherever the store holds it: the live
+// tail, the sealed segments newest to oldest, then the packed sets.
 func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 	s.Mutex.RLock()
 	defer s.Mutex.RUnlock()
@@ -1145,6 +1117,32 @@ func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 
 // get is Get; the caller must hold the Mutex
 func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
+	return s.lookup(key, true)
+}
+
+// lookup
+// Find a key.  The caller must hold the Mutex.
+//
+// One probe of the live filters settles the window: a "no" is
+// definitive for every segment whose blocks all lie inside it, and
+// that is the part of the walk that grows with the seal count.  What
+// the filters do not speak for is the history below the window -- the
+// segments a merge has stretched back past it, and the packed sets --
+// each of which carries a filter of its own, and `deep` says whether
+// to go there when the window says no.
+//
+// Get does.  A caller asking for a key is owed the answer wherever the
+// store keeps it, and a key that old is looked for in every set, one
+// bloom probe each.  A WRITE does not: immutability is a windowed
+// guarantee (issue #44).  The check exists for replay safety, which is
+// recent by nature, and a Perm key is the hash of its value, so "same
+// key, different value" beyond the window would be a hash collision.
+// Stopping at the window is what keeps a write's cost independent of
+// how much history the store holds.  A filter hit -- a key that is in
+// the window, or a false positive -- is followed wherever it leads,
+// so that a key written in the last N to 2N blocks is refused whether
+// it now sits in a segment, a merged segment, or a set.
+func (s *SegmentStore) lookup(key [32]byte, deep bool) (value []byte, err error) {
 	if err = s.checkOpen(); err != nil {
 		return nil, err
 	}
@@ -1157,15 +1155,19 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 		s.stats.liveHit.Add(1)
 		return value, nil
 	}
-	// One probe settles the common case.  The filter covers every key
-	// in the store, so a "no" here is definitive and the walk below --
-	// which is what grows with the seal count -- is skipped entirely.
-	if s.keys != nil && !s.keys.Test(key) {
+	inWindow := s.filterTest(key)
+	if inWindow {
+		s.stats.filterWalked.Add(1)
+	} else {
 		s.stats.filterAbsent.Add(1)
-		return nil, errNotFound
+		if !deep {
+			return nil, errNotFound
+		}
 	}
-	s.stats.filterWalked.Add(1)
 	for i := len(s.segments) - 1; i >= 0; i-- { // Newest segment wins
+		if !inWindow && s.covered(s.segments[i]) {
+			continue
+		}
 		dbb, found, err := s.segments[i].lookup(key)
 		if err != nil {
 			return nil, err
@@ -1183,8 +1185,8 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 			return value, nil
 		}
 	}
-	if s.keys != nil {
-		s.stats.filterMisled.Add(1) // The walk was the filter's fault
+	if inWindow && s.filters != nil {
+		s.stats.filterMisled.Add(1) // The walk was the filters' fault
 	}
 	return nil, errNotFound
 }
@@ -1194,7 +1196,9 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 //
 // In an immutable store, rewriting a key with the same value is a
 // no-op (this is what makes replay and re-import idempotent) and
-// rewriting it with a different value is an error.
+// rewriting it with a different value is an error.  The check reaches
+// back over the key filters' window, N to 2N blocks, and no further:
+// see lookup.
 func (s *SegmentStore) Put(key [32]byte, value []byte) (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
@@ -1208,7 +1212,7 @@ func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
 	}
 	s.stats.putTotal.Add(1)
 	if !s.Mutable {
-		if existing, err := s.get(key); err == nil {
+		if existing, err := s.lookup(key, false); err == nil {
 			if bytes.Equal(existing, value) {
 				s.stats.putDuplicate.Add(1)
 				return nil // Same value: no-op
@@ -1239,15 +1243,17 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 	s.live[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
 	s.liveRecords++
 	s.liveDirty = true
-	if s.keys != nil {
+	if s.filters != nil {
 		// Probe before Set: a key the store already holds means this
 		// record supersedes an older one, which is what compaction has
 		// to reclaim.  Only a mutable store can shadow -- an immutable
-		// one refuses the write instead -- so only it counts.
-		if s.Mutable && s.keys.Test(key) {
+		// one refuses the write instead -- so only it counts.  The
+		// window is the whole store for a mutable layer, whose block
+		// never advances, so the estimate is not windowed in practice.
+		if s.Mutable && s.filterTest(key) {
 			s.shadowed++
 		}
-		s.keys.Set(key)
+		s.filterSet(key)
 	}
 	return nil
 }
@@ -1265,7 +1271,8 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 // another writer could reach through.
 //
 // A read that fails is not proof of absence, so only errNotFound
-// authorises the write; anything else is returned.
+// authorises the write; anything else is returned.  "Absent" means
+// absent from the window the key filters cover, as it does for Put.
 func (s *SegmentStore) PutIfAbsent(key [32]byte, value []byte) (existing []byte, existed bool, err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
@@ -1273,7 +1280,7 @@ func (s *SegmentStore) PutIfAbsent(key [32]byte, value []byte) (existing []byte,
 		return nil, false, err
 	}
 	s.stats.putTotal.Add(1)
-	switch existing, err = s.get(key); {
+	switch existing, err = s.lookup(key, false); {
 	case err == nil:
 		// Split the two ways a key can already be here, because they
 		// mean opposite things: an identical rewrite is a write this
@@ -1385,9 +1392,7 @@ func (s *SegmentStore) BlockHeight() uint64 {
 func (s *SegmentStore) AdvanceBlock(height uint64) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-	if s.blockHeight < height {
-		s.blockHeight = height
-	}
+	s.advanceBlock(height)
 }
 
 // Sync
@@ -1479,7 +1484,7 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		// Nothing to seal, but a block boundary still closes the block:
 		// the next writes belong to the block after this one
 		if blockBoundary && s.blockHeight <= height {
-			s.blockHeight = height + 1
+			s.advanceBlock(height + 1)
 			if s.ExternalBlockRecord {
 				return meta, nil // Recorded once for the whole shard set
 			}
@@ -1515,11 +1520,12 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		return meta, err
 	}
 	s.segments = append(s.segments, seg)
-	if s.blockHeight < height {
-		s.blockHeight = height
-	}
+	// The tail's keys are in every live filter already, and the segment
+	// they now sit in is inside the window by construction, so the
+	// filters cover it; advancing the block is what may roll them
+	s.advanceBlock(height)
 	if blockBoundary {
-		s.blockHeight = height + 1 // The next writes belong to the next block
+		s.advanceBlock(height + 1) // The next writes belong to the next block
 	}
 
 	if err = s.writeManifest(); err != nil { // Commit
@@ -1745,7 +1751,7 @@ var CompactRatio = DefaultCompactRatio
 // compacting when it was not needed costs time, and skipping when it
 // was needed costs unbounded space.
 func (s *SegmentStore) worthCompacting(ratio float64) bool {
-	if !s.Mutable || s.keys == nil {
+	if !s.Mutable || s.filters == nil {
 		return true
 	}
 	var records uint64
@@ -2168,6 +2174,12 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	if err != nil {
 		return meta, false, err
 	}
+	// The merged segment reaches back to the oldest block in the run.
+	// The key filters cover a block range, and this is what tells them
+	// the segment is not one block: a filter that started after the
+	// run's first block never saw its oldest keys and must not claim it.
+	meta.Span = outHeight - run[0].meta.first()
+	seg.meta = meta
 
 	// Commit: the manifest names the merged segment in place of the run
 	old := s.segments
@@ -2306,9 +2318,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	if err != nil {
 		return meta, err
 	}
-	if s.blockHeight < height {
-		s.blockHeight = height
-	}
+	s.advanceBlock(height)
 
 	// A single generation holding one record per key has nothing to
 	// reclaim: rewriting it would copy every value to produce the same
@@ -2333,6 +2343,10 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	if err != nil {
 		return meta, err
 	}
+	// The new generation holds every key of every old one, so it reaches
+	// back as far as the oldest of them
+	meta.Span = height - s.segments[0].meta.first()
+	seg.meta = meta
 
 	// Commit: the manifest now names only the new generation
 	old := s.segments
@@ -2353,12 +2367,12 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 
 	// Compaction is the one moment the true key set is already in hand:
 	// what survived is exactly the new generation plus the live tail.
-	// Keeping the old filter would only cost lookups -- it can name
+	// Keeping the old filters would only cost lookups -- they can name
 	// keys that are gone but never miss one that stayed -- but a
 	// rebuild here is free of that drift and bounds the layer count.
-	if s.keys != nil {
-		if err := s.rebuildKeyFilter(); err != nil {
-			s.keys = nil // Correct, just slower: lookups walk again
+	if s.filters != nil {
+		if err := s.rebuildKeyFilters(); err != nil {
+			s.filters = nil // Correct, just slower: lookups walk again
 		}
 	}
 	// Everything that was superseded has just been dropped; the count
@@ -2394,6 +2408,9 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 
 	if err = s.checkOpen(); err != nil {
 		return err
+	}
+	if meta.Span > meta.Height {
+		return fmt.Errorf("segment (block %d, seq %d) claims to reach %d blocks back", meta.Height, meta.Seq, meta.Span)
 	}
 
 	for _, seg := range s.segments {
@@ -2483,14 +2500,16 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	}
 	// The manifest commit at the end of the import covers both renames
 	seg.dataPath, seg.indexPath = dataPath, indexPath
-	if s.blockHeight < meta.Height {
-		s.blockHeight = meta.Height
-	}
+	s.advanceBlock(meta.Height)
 
 	s.segments = append(s.segments, seg)
-	if s.keys != nil {
-		if err = s.addSegmentKeys(seg); err != nil {
-			s.keys = nil // The filter must never under-report; drop it
+	// Into every live filter, whether or not the segment's block is in
+	// its range: a filter holding a key it need not is slower, never
+	// wrong, and the segment is the newest thing in the store
+	for _, f := range s.filters {
+		if err = s.addSegmentKeys(f.keys, seg); err != nil {
+			s.filters = nil // The filters must never under-report; drop them
+			break
 		}
 	}
 	return s.writeManifest() // Commit
@@ -2498,8 +2517,11 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 
 // checkNoConflicts
 // Verify that no key in an incoming segment already has a different
-// value in this store.  The caller must hold the Mutex, and seg must
-// not yet be in s.segments.
+// value in this store, within the window the key filters cover: the
+// same N-to-2N-block guarantee a write gets, for the same reason (see
+// lookup).  A peer's segment is always the newest thing in the store,
+// so what it could diverge from is recent by construction.  The
+// caller must hold the Mutex, and seg must not yet be in s.segments.
 func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 	index, release, err := seg.index() // One borrow for the whole scan
 	if err != nil {
@@ -2522,7 +2544,7 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 			if err != nil {
 				return err
 			}
-			existing, err := s.get(key) // Bloom-gated; no disk I/O unless a filter hits
+			existing, err := s.lookup(key, false) // Filter-gated; no disk I/O unless a filter hits
 			if err != nil {
 				continue // Not held locally: the common case
 			}
@@ -2545,16 +2567,15 @@ func (s *SegmentStore) Close() (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
-	// Persist the key filter, then record in the manifest that it is
-	// current -- in that order, so a crash between the two leaves a
-	// manifest saying "rebuild" rather than one pointing at a filter
-	// that has fallen behind the segments.  A save that fails is not a
+	// Persist the key filters, then record in the manifest that they
+	// are current -- in that order, so a crash between the two leaves a
+	// manifest saying "rebuild" rather than one pointing at filters that
+	// have fallen behind the segments.  A save that fails is not a
 	// reason to fail the close: the next open rebuilds.
-	if !s.closed && s.keys != nil {
-		if err := s.keys.Save(s.Directory); err == nil {
-			s.bloomAt, _ = s.newestMeta()
-			s.bloomSegments = uint64(len(s.segments)) // What "covers none" needs to say so
-			s.bloomValid = true
+	if !s.closed && s.filters != nil {
+		if claim, err := s.saveKeyFilters(); err == nil {
+			s.filterSaved = claim
+			s.filterValid = true
 			if err := s.writeManifest(); err != nil {
 				return err
 			}

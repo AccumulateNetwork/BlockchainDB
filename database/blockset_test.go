@@ -231,11 +231,12 @@ func TestPackFinalizedSurvivesACrashBeforeTheShardsCommit(t *testing.T) {
 
 // TestPackedKeysStayImmutable
 // The Perm layer refuses a different value for a key it holds.  That
-// check is answered by the shard's key filter first, so once the keys
-// have left the shard's segments for a set, the filter must still cover
-// them -- including when it is rebuilt from scratch on open, from
-// segments that no longer hold them, which is the case this test
-// exists for.
+// check is answered by the shard's key filters first, and they do not
+// cover the keys that have left the segments for a set, so a write the
+// filters cannot place must go on to the sets before it is allowed --
+// including on a store whose filters were rebuilt from scratch on
+// open, from segments that no longer hold the key, which is the case
+// this test exists for.
 func TestPackedKeysStayImmutable(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 186, 4, 60)
@@ -249,10 +250,10 @@ func TestPackedKeysStayImmutable(t *testing.T) {
 	// Close commits every shard's manifest, so the packed segments are
 	// gone from the shards, and saves every filter.  Deleting the saved
 	// filters forces each shard to rebuild on open from what it holds --
-	// which, without the set store, is not the packed keys.
+	// which is not the packed keys: only the set store has those.
 	require.NoError(t, kvs.Close())
 	for i := range kvs.Shards {
-		saved := filepath.Join(kvs.ShardDir(i), PermDirName, bloomFilename)
+		saved := filepath.Join(kvs.ShardDir(i), PermDirName, filtersFilename)
 		if err := os.Remove(saved); err != nil {
 			require.True(t, errors.Is(err, os.ErrNotExist), "%v", err)
 		}

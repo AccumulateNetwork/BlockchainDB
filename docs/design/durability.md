@@ -95,6 +95,7 @@ state survives until the new state is durable:
 | live file with no header | `seal` creates the new `live.dat` and leaves its 24-byte header in the `BFile` buffer, so a crash before the first flush leaves the file at 0 bytes; open rewrites the header rather than trusting it to be there |
 | the block a shard is in | recorded once for the whole shard set (`block.json`, one fsync), not once per shard.  A shard with no writes advances in memory and commits nothing.  On open the set tells every shard the block it is in, which is what a shard needs it for: `SealNext` tags an auto-sealed segment with its block height, so a shard that came back believing it was in an older block would label segments with a block they do not belong to and `ExportBlock`, which selects by block, would never export them.  A missing file reads as 0 and constrains nothing, so an existing database opens unchanged (issue #32) |
 | merge of finalized segments | the merged segment is written, fsynced and renamed before the manifest names it, at an identity *below* the manifest's newest, so an uncommitted one is deleted by `recoverOrphans` while the originals it would replace are still named (issue #47) |
+| key filters | saved to `filters.dat` (tmp file, fsync, rename, directory fsync) at close, and the manifest written straight after carries the claim of what they cover: the window's start, the newest segment in it, and the count of segments covered.  Every other manifest commit clears the claim, and on open any doubt -- an adopted orphan, a dropped segment, a different window -- rebuilds from the segments inside the window (issue #44) |
 | block-set file | written to `sets/set-….bset.tmp`, fsynced, renamed, and the set directory fsynced: the rename is the commit.  A `.tmp` left by a crash is deleted on open.  Only after that commit do the shards drop the segments the set holds -- **without a manifest of their own**.  The shard's next manifest commit (its next seal, or its close) is what stops naming them, and the files are deleted only after it.  A crash in between leaves every shard's manifest naming whole, intact segments that the set also holds; on open the shard set drops them again (`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).  Nothing is ever in only one place until the second place is durable |
 | one barrier per operation | a seal renames up to three files into the same directory -- the sealed data file, its index, then the manifest -- and fsyncs that directory once, at the manifest commit. One directory fsync commits every name change made in it, and the renames are issued in order, so the manifest can never become durable ahead of the data file it names. Each file's own fsync is still taken before its rename: that is what makes a published name always point at durable contents. Six barriers a seal became four, measured 36 ms to 24.6 ms (issue #33) |
 | operations on a closed store | `Close` drops the sealed segment list but keeps the live map, so reads and writes refuse with `errStoreClosed` rather than running against half a store |
@@ -137,17 +138,20 @@ of which lost keys that a completed `Close` had made durable:
 
 4. **An empty key filter accepted as covering segment (0,0).** Not a
    durability defect — the data was durable and intact — but reached
-   only through one. `loadKeyFilter` judged a saved filter still valid
-   by comparing the newest segment's `(Height, Seq)` to what the
-   manifest recorded, and a filter saved with *no* segments records the
-   zero value, `(0,0)`. That is also the identity of the first segment
-   a store seals, and the Dyna layer numbers every segment at height 0.
+   only through one. The saved filter was judged still valid by
+   comparing the newest segment's `(Height, Seq)` to what the manifest
+   recorded, and a filter saved with *no* segments records the zero
+   value, `(0,0)`. That is also the identity of the first segment a
+   store seals, and the Dyna layer numbers every segment at height 0.
    So when a crash left a sealed segment for `recoverOrphans` to adopt
    without a manifest rewrite, the empty filter matched it, was loaded,
    and answered "definitely absent" for all 40 of its keys: `Get`
    returned not-found for records sitting on disk. The manifest now
-   records how many segments the filter covered, which is what "covers
-   nothing" needs to say out loud (issue #35).
+   records how many segments the filter covers, which is what "covers
+   nothing" needs to say out loud (issue #35). The filter has since
+   become a rolling window (issue #44) whose claim is a block range
+   plus that count plus the newest segment (`filterClaim`); a segment
+   adopted on open also rebuilds unconditionally.
 
    `TestCrashRecoverySeal` found it, intermittently — twice in 55 runs.
    `TestKeyFilterEmptyDoesNotCoverSegmentZero` builds the same state

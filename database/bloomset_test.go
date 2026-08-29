@@ -1,8 +1,7 @@
 package blockchainDB
 
 import (
-	"os"
-	"path/filepath"
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,13 +41,8 @@ func TestBloomSetGrowth(t *testing.T) {
 }
 
 // TestBloomSetSaveLoad
-// A saved BloomSet must load back with identical behavior
+// A streamed BloomSet must read back with identical behavior
 func TestBloomSetSaveLoad(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), t.Name())
-	os.RemoveAll(dir)
-	require.NoError(t, os.MkdirAll(dir, os.ModePerm))
-	defer os.RemoveAll(dir)
-
 	bs := NewBloomSet(1, 3)
 	fr := NewFastRandom([]byte{72})
 	keys := make([][32]byte, 10_000)
@@ -56,9 +50,10 @@ func TestBloomSetSaveLoad(t *testing.T) {
 		keys[i] = fr.NextHash()
 		bs.Set(keys[i])
 	}
-	require.NoError(t, bs.Save(dir))
+	var buf bytes.Buffer
+	require.NoError(t, bs.write(&buf))
 
-	loaded, err := LoadBloomSet(dir)
+	loaded, err := readBloomSet(&buf)
 	require.NoError(t, err)
 	assert.Equal(t, len(bs.Layers), len(loaded.Layers), "layer count differs")
 	assert.Equal(t, bs.Count(), loaded.Count(), "count differs")

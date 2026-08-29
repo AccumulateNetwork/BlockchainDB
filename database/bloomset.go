@@ -4,15 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 )
 
-const (
-	bloomFilename    = "bloom.dat"     // Persisted BloomSet
-	bloomTmpFilename = "bloom_tmp.dat" // Tmp file for atomic replace
-	bloomMagic       = 0x424C4D31      // "BLM1"
-)
+const bloomMagic = 0x424C4D31 // "BLM1": heads a streamed BloomSet
 
 // DefaultBloomCapacity was the key capacity a fresh v1 Bloom filter
 // was sized for.  Nothing sizes a filter with it now -- segments size
@@ -36,7 +30,7 @@ const DefaultBloomCapacity uint64 = 100_000
 // instead of adding ~1% per layer.
 //
 // Frozen layers are immutable, which makes the set cheap to persist:
-// see Save/LoadBloomSet.
+// see write/readBloomSet.
 type BloomSet struct {
 	Layers []*Bloom
 }
@@ -83,27 +77,16 @@ func (b *BloomSet) Test(key [32]byte) bool {
 	return false
 }
 
-// Save
-// Persist the BloomSet to directory/bloom.dat via a tmp file and an
-// atomic rename.  Layers are written verbatim; loading is a read, not
-// a rebuild.
-func (b *BloomSet) Save(directory string) (err error) {
-	tmpPath := filepath.Join(directory, bloomTmpFilename)
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if f != nil {
-			f.Close()
-			os.Remove(tmpPath)
-		}
-	}()
-
+// write
+// Stream the BloomSet: a layer count, then each layer's parameters
+// and bitmap verbatim.  Frozen layers are immutable, which is what
+// makes this cheap -- loading is a read, not a rebuild.  The store
+// writes its live filters this way (keyfilter.go).
+func (b *BloomSet) write(w io.Writer) (err error) {
 	var header [8]byte
 	binary.BigEndian.PutUint32(header[:], bloomMagic)
 	binary.BigEndian.PutUint32(header[4:], uint32(len(b.Layers)))
-	if _, err = f.Write(header[:]); err != nil {
+	if _, err = w.Write(header[:]); err != nil {
 		return err
 	}
 	var lh [28]byte
@@ -112,52 +95,34 @@ func (b *BloomSet) Save(directory string) (err error) {
 		binary.BigEndian.PutUint64(lh[4:], l.NumBytes)
 		binary.BigEndian.PutUint64(lh[12:], l.Capacity)
 		binary.BigEndian.PutUint64(lh[20:], l.Count)
-		if _, err = f.Write(lh[:]); err != nil {
+		if _, err = w.Write(lh[:]); err != nil {
 			return err
 		}
-		if _, err = f.Write(l.Map); err != nil {
+		if _, err = w.Write(l.Map); err != nil {
 			return err
 		}
 	}
-	if err = f.Sync(); err != nil {
-		return err
-	}
-	if err = f.Close(); err != nil {
-		f = nil
-		return err
-	}
-	f = nil
-	if err = os.Rename(tmpPath, filepath.Join(directory, bloomFilename)); err != nil {
-		return err
-	}
-	return syncDir(directory)
+	return nil
 }
 
-// LoadBloomSet
-// Load a persisted BloomSet from directory/bloom.dat
-func LoadBloomSet(directory string) (b *BloomSet, err error) {
-	f, err := os.Open(filepath.Join(directory, bloomFilename))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
+// readBloomSet reads back what write streamed
+func readBloomSet(r io.Reader) (b *BloomSet, err error) {
 	var header [8]byte
-	if _, err = io.ReadFull(f, header[:]); err != nil {
+	if _, err = io.ReadFull(r, header[:]); err != nil {
 		return nil, err
 	}
 	if binary.BigEndian.Uint32(header[:]) != bloomMagic {
-		return nil, fmt.Errorf("bloom.dat has the wrong magic number")
+		return nil, fmt.Errorf("bloom set has the wrong magic number")
 	}
 	layerCnt := binary.BigEndian.Uint32(header[4:])
 	if layerCnt == 0 || layerCnt > 64 {
-		return nil, fmt.Errorf("bloom.dat has an invalid layer count %d", layerCnt)
+		return nil, fmt.Errorf("bloom set has an invalid layer count %d", layerCnt)
 	}
 
 	b = new(BloomSet)
 	var lh [28]byte
 	for i := uint32(0); i < layerCnt; i++ {
-		if _, err = io.ReadFull(f, lh[:]); err != nil {
+		if _, err = io.ReadFull(r, lh[:]); err != nil {
 			return nil, err
 		}
 		l := new(Bloom)
@@ -166,11 +131,11 @@ func LoadBloomSet(directory string) (b *BloomSet, err error) {
 		l.Capacity = binary.BigEndian.Uint64(lh[12:])
 		l.Count = binary.BigEndian.Uint64(lh[20:])
 		if l.K < 1 || l.NumBytes < minBloomBytes || l.NumBytes > 1<<32 {
-			return nil, fmt.Errorf("bloom.dat layer %d is invalid", i)
+			return nil, fmt.Errorf("bloom set layer %d is invalid", i)
 		}
 		l.SizeOfMap = float64(l.NumBytes) / (1024 * 1024)
 		l.Map = make([]byte, l.NumBytes)
-		if _, err = io.ReadFull(f, l.Map); err != nil {
+		if _, err = io.ReadFull(r, l.Map); err != nil {
 			return nil, err
 		}
 		b.Layers = append(b.Layers, l)

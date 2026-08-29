@@ -14,6 +14,7 @@ v2 makes the segment format the *storage* itself.
     seg-<block>-<seq>.dat     a sealed, immutable segment (the transport format)
     seg-<block>-<seq>.idx     its index: sorted 48-byte key records + a bloom
     segments.json             the manifest: segments, counts, hashes
+    filters.dat               the live key filters, saved on close
 
 An index record is `key(32) offset(8) length(8)`. The offset is
 **relative to the segment's body** — its records, after the 24-byte
@@ -42,7 +43,9 @@ they actually belong to. Re-closing a block that is already closed is
 rejected.
 Lookups check the tail, then segments newest to oldest — each segment's
 bloom filter (sized from its own key count) keeps that to about one
-binary search.
+binary search, and a pair of store-level filters over the last N to 2N
+blocks settles most of the walk before it starts (*The key filter rolls
+over a window of blocks*, below).
 
 An immutable store rejects a conflicting value and treats an identical
 rewrite as a no-op; a mutable store lets newer segments shadow older
@@ -340,16 +343,19 @@ the page cache; an absent key, settled by the shard's filter, 0.45 µs. A lookup
 a rebuilt filter, an import, iteration, and block export are all
 covered in `blockset_test.go` and `TestMergeDoesNotDisturbBlockExport`.
 
-**The shard's key filter covers its packed keys.** Every write asks
-whether its key is new, and the store-level filter is what answers
-"no" without a disk read; that answer is only definitive if the filter
-holds the keys that have left the segments. So the set store is
-attached *inside* each shard's Perm layer rather than beside it: the
-filter adds the cold keys whenever it is rebuilt, `get` consults the
-sets only after the filter has said "maybe" and the segments have
-said no, and a packed key rewritten with a different value is still
-refused (`TestPackedKeysStayImmutable` — which fails against a filter
-rebuilt from the segments alone).
+**The set store is attached inside each shard's Perm layer**, so that
+`Get` is one call: a key that has left the segments is still the
+shard's key, and a reader should not have to know where the shard
+keeps it. The rolling key filters do not cover the packed keys — that
+is what bounds them — with one exception: a set packed from blocks
+still inside the window. Those keys were written inside the window, so
+the immutability guarantee below covers them, and a filter rebuilt on
+open from the segments alone would have lost them. A rebuild therefore
+also adds every set that reaches the window's start block
+(`coldStore.forEachKeySince`), bounded by the sets that overlap the
+window rather than by the store. `TestPackedKeysStayImmutable` rewrites
+a packed key after a rebuild and fails against a rebuild that skips
+the sets.
 
 Sets are the finalized record, so a block in one cannot be imported
 again: a shard that has dropped every segment has no newest segment to
@@ -359,6 +365,141 @@ Memory per set is the directory plus the bloom, so it grows with the
 key count at ~1.5 bytes a key — the same order as the per-segment
 filters it replaces. The next stage of #47, merging sets into larger
 ones, is what bounds the number of sets a lookup walks.
+
+### The key filter rolls over a window of blocks
+
+A store-level filter exists to prove a key *absent* without touching a
+segment. That is the question every immutable write asks — a new key
+is absent by definition — and before the filter existed the answer
+cost a bloom probe per sealed segment, so writes decayed with the seal
+count (measured: throughput fell to 1.4% of its opening rate over two
+hours). The first filter covered every key the store had ever held,
+and that was its cost (issue #44). Measured on a store built to 1M
+keys, sealing every 5,000:
+
+| | per-segment blooms | store-level filter | total | bytes/key |
+|---|---|---|---|---|
+| whole-history filter, 1M keys | 1.5 MB | 7.45 MB (4 layers) | 8.95 MB | 8.95 |
+
+85% of it was the store-level filter, and it grew with every key ever
+written — a billion permanent entries would be ~10 GB of RAM.
+Rebuilding it on open scanned every segment the store had ever sealed.
+
+A running node does not reach far back in history, so the filter does
+not need to. **Filters cover 2N blocks and a fresh one starts every N**,
+so two are live at once and every write goes into both:
+
+    blocks:   0 ────── N ────── 2N ────── 3N ────── 4N
+    filter A  [───────────────)                          dropped at 2N
+    filter B          [───────────────)                  dropped at 3N
+    filter C                   [───────────────)         dropped at 4N
+
+At block t the live pair reaches back N blocks just after a roll and 2N
+just before the next, so what is resident is the keys of the last N to
+2N blocks and never more. A filter that completes its span is dropped:
+the block sets its blocks were packed into carry a filter of their own,
+so writing it out would duplicate one. N is `FilterBlocks`, persisted
+in each layer's manifest, `DefaultFilterBlocks` (1,000) unless
+`SetFilterBlocks` says otherwise, and refused below `MinFilterBlocks`
+(20) — the floor healing sets, since healing writes reach back several
+blocks. A manifest without it is refused rather than defaulted.
+
+Measured on the same fixture (1M keys, 200 blocks of 5,000; and 2,000
+blocks of 500):
+
+| fixture | store-level filters | of which resident at steady state | total filter bytes | bytes/key | crash reopen (rebuild) | puts/s |
+|---|---|---|---|---|---|---|
+| main, 200 blocks | 7.45 MB (4 layers) | grows without bound | 8.95 MB | 8.95 | 33 ms, every segment | 1,130,000 |
+| **N=20, 200 blocks** | **615 KB** (two filters) | flat from block 60 on | 2.12 MB | **2.12** | **10 ms**, 40 blocks | 1,175,000 |
+| N=100, 200 blocks | 4.2 MB, 0.9 MB once right-sized | two filters over 200 blocks | 5.7 MB | 5.71 | 31 ms, 200 blocks | 1,142,000 |
+| main, 2,000 blocks | 7.45 MB | grows without bound | 15.6 MB | 15.64 | 96 ms, every segment | 531,000 |
+| **N=20, 2,000 blocks** | **300 KB** | flat | 8.5 MB | 8.49 | **24 ms**, 40 blocks | 958,000 |
+
+The 2,000-block rows are dominated by the per-segment filters — 4 KB
+apiece at the 500-key floor, 8.2 MB in all — which is the cost merging
+and packing exist to remove; the store-level share goes from 7.45 MB
+to 300 KB. The put rates were taken with another suite on the disk and
+are noisy to ±20%; the write path does two filter probes and two
+insertions where it did one of each, and no cost shows.
+
+The N=100 row shows the sizing settling: the first filter starts at
+the seal limit's size and grows by layers as its 2N blocks fill,
+which is the 4.2 MB; the next one is sized for what a full span took
+and is 0.9 MB for the same coverage, and that is the steady state.
+
+What the window costs is a `Get` for a key the store does not hold
+anywhere: it used to be settled in memory (430 ns) and now walks what
+the window does not cover — every segment below it in this fixture,
+which packs nothing — at 4.7 µs (N=100) to 17.6 µs (N=20, 2,000
+segments). In a sharded database those segments are merged and packed
+and the cost is one bloom probe per set instead, below.
+
+**What a filter covers is a block range**, and that is the whole of
+its claim: filter S holds every key of every segment whose blocks all
+lie at or above S, plus the live tail. A segment is not always one
+block — a merge folds a run of blocks into one, and
+`SegmentMeta.Span` records how far back it reaches — and a segment
+reaching below S is simply not covered, so a lookup the filters cannot
+settle walks it. Without the span a merged segment sitting at height
+49 and reaching back to block 1 would be claimed by a filter that
+started at block 40, and a key from block 10 would answer "not found"
+(`TestKeyFilterCoversAMergedSegmentByItsOldestBlock`, which fails
+exactly that way against a merge that records no span).
+
+Every change to the block the tail is in — a block-boundary seal, an
+import, a compaction, and `AdvanceBlock` on a shard that learns the
+set has moved on — rolls the filters. A filter rolling in is built
+from whatever already lies at or above its start: usually nothing,
+because the roll is a block boundary and the tail was just sealed
+below it, but a shard reopened after a quiet spell can jump many
+rolls at once, and the tail it replayed is about to be sealed into
+the block it now sits in (`TestKeyFilterFollowsABlockJump`). The
+filter that starts is sized for the most keys any completed span has
+taken, recorded at each roll — the hook issue #54 wants for sizing
+from a recent history of spans.
+
+**Immutability is a windowed guarantee.** A permanent key written in
+the last N to 2N blocks cannot be overwritten, wherever it now sits —
+a segment, a merged segment, a packed set — because the filters hold
+it and a hit is followed to the end. A key older than the window is
+*not consulted* on write: a rewrite of it appends a record, and a
+read returns the newest. That is the repository owner's decision, on
+two grounds: the check exists for replay safety, which is recent by
+nature, and a Perm key is the hash of its value, so "same key,
+different value" beyond the window would be a hash collision.
+Searching back into cold data is API support — `Get` does it, one
+bloom probe per set — and the consensus write path never needs it.
+`TestImmutabilityIsWindowed` pins both halves.
+
+The alternative was measured before it was declined: consulting every
+set's bloom on the write path costs 19–48 ns per set (cache-bound at
+scale), so 45 µs per write at 1,000 sets and 208 µs at the 4,320 sets
+a day of 20-block sets produces, against a write that costs about a
+microsecond. That is also what a `Get` for a key the store does not
+hold costs now, and merging sets into larger ones (issue #47) is what
+bounds it.
+
+`ImportSegmentFile`'s divergence detection (`checkNoConflicts`) rests
+on the same lookup and gives the same guarantee: a peer's segment is
+refused if it holds a different value for a key written inside the
+window, and adopted if the key it disagrees with is older. A peer's
+segment is always the newest thing in the store, so what it could
+diverge from is recent by construction.
+
+The persisted filters carry a claim the manifest records only in the
+commit written straight after the save: the window's start, the newest
+segment inside it, and how many segments the window covers
+(`filterClaim`). Any of the three moving — a segment adopted by
+`recoverOrphans`, a drop for a set without a manifest, a reopen at a
+block that wants a different window — rebuilds instead, and a rebuild
+reads only the segments inside the window (and the sets that reach
+it), not the store. The count is what separates "covers nothing" from
+"covers segment (0, 0)", the ambiguity of issue #35; it is kept, and
+`TestKeyFilterEmptyDoesNotCoverSegmentZero` still exercises it.
+
+The Dyna layer runs on the same code with its block never advancing,
+so it has one filter, over everything, rebuilt and right-sized at each
+compaction — the same reach it had, and the same bound.
 
 ### File descriptors are borrowed, not held
 
@@ -460,9 +601,11 @@ no longer authenticates its own header.
 Adopting a segment file skips the per-key immutability check that
 re-inserting records performed, so an immutable store verifies the
 incoming keys against what it already holds before committing the
-adoption. That check is bloom-gated: a syncing node's incoming keys
-are almost all new, so the existing segments' filters reject them from
-memory and only a filter hit costs a real lookup. Measured cost is
-within noise of an unchecked import (724K keys/s into a node holding
-600K keys), and a conflicting value fails the import instead of being
-silently shadowed.
+adoption. That check is filter-gated: a syncing node's incoming keys
+are almost all new, so the rolling key filters reject them from memory
+and only a filter hit costs a real lookup. Measured cost is within
+noise of an unchecked import (724K keys/s into a node holding 600K
+keys), and a conflicting value fails the import instead of being
+silently shadowed. The check reaches over the filters' window, N to 2N
+blocks, and no further — the same guarantee a write gets, for the same
+reasons (*The key filter rolls over a window of blocks*).

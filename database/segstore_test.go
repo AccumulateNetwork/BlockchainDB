@@ -317,7 +317,7 @@ func TestSegmentStoreRecovery(t *testing.T) {
 	m, err := (&SegmentStore{Directory: dir}).readManifest()
 	require.NoError(t, err)
 	require.Len(t, m.Segments, 1)
-	empty := &SegmentStore{Directory: dir, Mutable: m.Mutable}
+	empty := &SegmentStore{Directory: dir, Mutable: m.Mutable, FilterBlocks: m.FilterBlocks}
 	require.NoError(t, empty.writeManifest()) // A manifest naming no segments
 	indexName := strings.TrimSuffix(m.Segments[0].File, segDataSuffix) + segIndexSuffix
 	require.NoError(t, os.Remove(filepath.Join(dir, indexName)))

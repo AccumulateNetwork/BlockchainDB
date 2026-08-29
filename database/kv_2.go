@@ -104,6 +104,22 @@ func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
 	return kv2, nil
 }
 
+// SetFilterBlocks
+// Set the roll period of the Perm layer's key filter -- the window,
+// N to 2N blocks, over which a permanent key cannot be overwritten
+// (keyfilter.go) -- and record it in the layer's manifest.  Meant for
+// the moment a database is created, since it rebuilds the layer's
+// filters and commits a manifest.  Below MinFilterBlocks is refused.
+//
+// Only the Perm layer.  The Dyna layer's block never advances, so its
+// filter never rolls whatever the period, and its reach is bounded by
+// compaction instead.
+func (k *KV2) SetFilterBlocks(n uint64) (err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
+	return k.PermKV.SetFilterBlocks(n)
+}
+
 func OpenKV2(directory string) (kv2 *KV2, err error) {
 	kv2 = new(KV2)
 	kv2.Directory = directory

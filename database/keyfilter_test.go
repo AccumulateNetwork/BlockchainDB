@@ -109,8 +109,8 @@ func TestKeyFilterRebuildsFromADamagedFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Close()) // Saves bloom.dat and claims coverage
 
-	path := filepath.Join(dir, bloomFilename)
-	require.FileExists(t, path, "Close must persist the filter")
+	path := filepath.Join(dir, filtersFilename)
+	require.FileExists(t, path, "Close must persist the filters")
 	require.NoError(t, os.WriteFile(path, []byte("not a bloom filter"), 0644))
 
 	store, err = OpenSegmentStore(dir)
@@ -297,7 +297,9 @@ func TestStoreStatsCountWhatHappened(t *testing.T) {
 // Accepting the empty filter there is silent data loss, not a slow
 // lookup: the filter answers "definitely absent" for every key in the
 // segment, and Get returns not-found without ever opening it.  Found
-// intermittently by TestCrashRecoverySeal.
+// intermittently by TestCrashRecoverySeal (issue #35).  The claim is
+// now a block range with a segment count (filterClaim), and this is
+// the case the count exists for.
 func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
 	dir := storeDir(t, "bloom0")
 
@@ -311,7 +313,7 @@ func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
 	require.NoError(t, err)
 	var m StoreManifest
 	require.NoError(t, json.Unmarshal(saved, &m))
-	require.True(t, m.BloomValid, "the close must have left a coverage claim to test")
+	require.True(t, m.FilterValid, "the close must have left a coverage claim to test")
 	require.Empty(t, m.Segments)
 
 	// Fill a tail and seal it, which produces segment (0, 0)
@@ -343,5 +345,269 @@ func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
 		require.NoErrorf(t, err, "key %d reported absent by the filter but held by segment (0,0)", i)
 		require.Equal(t, fmt.Sprintf("v%d", i), string(v))
 	}
+	require.NoError(t, reopened.Close())
+}
+
+// The rolling window (issue #44).  A filter covers 2N blocks and a
+// fresh one starts every N, so what is resident is the keys of the last
+// N to 2N blocks and no more; what a write is checked against is the
+// same window; and what a read can reach is everything.
+
+// rollingStore is an immutable store rolling every MinFilterBlocks
+// blocks, with `blocks` sealed blocks of `perBlock` keys each, so that
+// the window has rolled several times.  Returns the keys by block.
+func rollingStore(t *testing.T, dir string, seed byte, blocks, perBlock int) (store *SegmentStore, keys [][][32]byte) {
+	t.Helper()
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+	kr := NewFastRandom([]byte{seed})
+	keys = make([][][32]byte, blocks+1) // keys[h] were written in block h
+	for h := 1; h <= blocks; h++ {
+		for i := 0; i < perBlock; i++ {
+			key := kr.NextHash()
+			require.NoError(t, store.Put(key, []byte(fmt.Sprintf("b%d-%d", h, i))))
+			keys[h] = append(keys[h], key)
+		}
+		_, err = store.Seal(uint64(h))
+		require.NoError(t, err)
+	}
+	return store, keys
+}
+
+// filterBytes is what the live filters hold in memory
+func filterBytes(s *SegmentStore) (n uint64) {
+	for _, f := range s.filters {
+		for _, l := range f.keys.Layers {
+			n += l.NumBytes
+		}
+	}
+	return n
+}
+
+// TestKeyFilterRollsWithTheBlock
+// Two filters at most, starting where the schedule says, holding the
+// keys of the last N to 2N blocks; and every key ever written is still
+// readable, whether the window covers it or not.
+func TestKeyFilterRollsWithTheBlock(t *testing.T) {
+	dir := storeDir(t, "roll")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+	const n = MinFilterBlocks
+
+	kr := NewFastRandom([]byte{62})
+	var all [][32]byte
+	var sizes []uint64
+	for h := uint64(1); h <= 5*n; h++ {
+		for i := 0; i < 10; i++ {
+			key := kr.NextHash()
+			require.NoError(t, store.Put(key, []byte("v")))
+			all = append(all, key)
+		}
+		_, err = store.Seal(h)
+		require.NoError(t, err)
+
+		// The schedule: the filter that began at the last multiple of N
+		// and the one before it, and no other
+		want := filterStarts(h+1, n)
+		require.Equal(t, want, filterStartsOf(store), "after sealing block %d", h)
+		require.LessOrEqual(t, len(store.filters), 2)
+		if h%n == 0 {
+			sizes = append(sizes, filterBytes(store))
+		}
+	}
+	// Bounded: the filters at the fifth roll are no bigger than at the
+	// second, because each holds the keys of at most 2N blocks
+	require.Equal(t, sizes[1], sizes[len(sizes)-1],
+		"filter memory must not grow with the chain: %v", sizes)
+
+	// Everything is still readable, in the window or below it
+	for i, key := range all {
+		_, err := store.Get(key)
+		require.NoErrorf(t, err, "key %d went missing (block %d)", i, i/10+1)
+	}
+	// And a key below the window is settled by the filters first: the
+	// walk it costs is of the segments the filters do not cover
+	before := store.Stats()
+	_, err = store.Get(all[0])
+	require.NoError(t, err)
+	after := store.Stats()
+	require.Equal(t, before.FilterAbsent+1, after.FilterAbsent,
+		"a key below the window is outside what the filters cover")
+	require.NoError(t, store.Close())
+}
+
+func filterStartsOf(s *SegmentStore) (starts []uint64) {
+	for _, f := range s.filters {
+		starts = append(starts, f.start)
+	}
+	return starts
+}
+
+// TestKeyFilterCoversAMergedSegmentByItsOldestBlock
+// A merged segment reaches back over every block in its run, and the
+// filters must not claim it unless they saw its oldest keys.
+//
+// After sealing 60 blocks with N=20 the filters cover blocks 40 on.
+// Merging the blocks below 50 makes one segment at height 49 reaching
+// back to block 1.  A filter that judged the segment by its height
+// alone would call it covered, answer "absent" for a key from block
+// 10, and skip the one segment that holds it: a false negative, with
+// nothing downstream to catch it.  Without SegmentMeta.Span this fails
+// with "key from block 1 went missing after the merge".
+func TestKeyFilterCoversAMergedSegmentByItsOldestBlock(t *testing.T) {
+	dir := storeDir(t, "span")
+	store, keys := rollingStore(t, dir, 63, 60, 5)
+	require.Equal(t, []uint64{40, 60}, filterStartsOf(store))
+
+	_, merged, err := store.MergeBelow(50)
+	require.NoError(t, err)
+	require.True(t, merged)
+	require.Equal(t, uint64(49), store.segments[0].meta.Height)
+	require.Equal(t, uint64(1), store.segments[0].meta.first(), "the merged segment reaches back to block 1")
+
+	find := func(s *SegmentStore, when string) {
+		t.Helper()
+		for h := 1; h < len(keys); h++ {
+			for _, key := range keys[h] {
+				_, err := s.Get(key)
+				require.NoErrorf(t, err, "key from block %d went missing %s", h, when)
+			}
+		}
+	}
+	find(store, "after the merge")
+
+	// The span is in the manifest, so a reopen -- with the filters
+	// loaded, and again with them rebuilt -- keeps the same answer
+	require.NoError(t, store.Close())
+	store, err = OpenSegmentStore(dir)
+	require.NoError(t, err)
+	find(store, "after a clean reopen")
+	require.NoError(t, os.Remove(filepath.Join(dir, filtersFilename)))
+	store, err = OpenSegmentStore(dir)
+	require.NoError(t, err)
+	find(store, "after a reopen that rebuilt the filters")
+	require.NoError(t, store.Close())
+}
+
+// TestImmutabilityIsWindowed
+// What the immutability check promises, exactly: a key written in the
+// last N to 2N blocks cannot be overwritten, wherever it now sits; a
+// key older than that is not consulted.  The same for a segment a peer
+// sends (checkNoConflicts).
+func TestImmutabilityIsWindowed(t *testing.T) {
+	dir := storeDir(t, "window")
+	store, keys := rollingStore(t, dir, 64, 60, 5)
+	require.Equal(t, []uint64{40, 60}, filterStartsOf(store), "the window begins at block 40")
+
+	// In the window, in a sealed block: refused
+	inWindow := keys[45][0]
+	require.ErrorIs(t, store.Put(inWindow, []byte("other")), ErrImmutable)
+	require.NoError(t, store.Put(inWindow, []byte("b45-0")), "an identical rewrite is a no-op")
+	_, existed, err := store.PutIfAbsent(inWindow, []byte("other"))
+	require.NoError(t, err)
+	require.True(t, existed)
+
+	// In the window, but in a segment that a merge has stretched back
+	// below it: still refused, because the filters hold the key and a
+	// hit is followed wherever it leads
+	_, merged, err := store.MergeBelow(50)
+	require.NoError(t, err)
+	require.True(t, merged)
+	require.ErrorIs(t, store.Put(inWindow, []byte("other")), ErrImmutable)
+
+	// Below the window: not consulted.  The write is accepted, and the
+	// newest record is what a read returns
+	old := keys[10][0]
+	require.NoError(t, store.Put(old, []byte("rewritten")),
+		"a key older than the window is not checked")
+	got, err := store.Get(old)
+	require.NoError(t, err)
+	require.Equal(t, []byte("rewritten"), got)
+	require.NoError(t, store.Close())
+
+	// A peer's segment holding a different value for a key: refused
+	// when the key is in the window, adopted when it is older
+	peerDir := storeDir(t, "peer")
+	peer, err := NewSegmentStore(peerDir, false)
+	require.NoError(t, err)
+	require.NoError(t, peer.SetFilterBlocks(MinFilterBlocks))
+	require.NoError(t, peer.Put(keys[10][1], []byte("diverged")))
+	require.NoError(t, peer.Put(NewFastRandom([]byte{65}).NextHash(), []byte("new")))
+	oldOnly, err := peer.Seal(61)
+	require.NoError(t, err)
+	require.NoError(t, peer.Put(keys[45][1], []byte("diverged")))
+	inWindowToo, err := peer.Seal(62)
+	require.NoError(t, err)
+	_, paths := peer.SegmentPaths()
+
+	store, err = OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.NoError(t, store.ImportSegmentFile(paths[0], oldOnly),
+		"a conflict older than the window is not detected")
+	err = store.ImportSegmentFile(paths[1], inWindowToo)
+	require.Error(t, err, "a conflict inside the window is")
+	require.Contains(t, err.Error(), "conflicts")
+	require.NoError(t, store.Close())
+	require.NoError(t, peer.Close())
+}
+
+// TestKeyFilterFollowsABlockJump
+// A shard reopened after a quiet spell learns the block the set has
+// reached, which can be many rolls past the block its own manifest
+// recorded.  The filters must roll to match, and the tail's keys must
+// be in the filters that result: the tail is sealed into the block the
+// store is now in, and a rolled-in filter that lacked it would let a
+// key written inside the window be rewritten.
+func TestKeyFilterFollowsABlockJump(t *testing.T) {
+	dir := storeDir(t, "jump")
+	store, keys := rollingStore(t, dir, 66, 5, 5)
+	kr := NewFastRandom([]byte{67})
+	tail := kr.NextHash()
+	require.NoError(t, store.Put(tail, []byte("in the tail")))
+	require.NoError(t, store.Close())
+
+	store, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{0}, filterStartsOf(store), "block 6 is in the first span")
+	store.AdvanceBlock(100) // What adoptBlockHeight does
+	require.Equal(t, []uint64{80, 100}, filterStartsOf(store))
+
+	_, err = store.Seal(100)
+	require.NoError(t, err)
+	require.ErrorIs(t, store.Put(tail, []byte("rewritten")), ErrImmutable,
+		"the tail's key was sealed into block 100, inside the window")
+	for h := 1; h < len(keys); h++ {
+		for _, key := range keys[h] {
+			_, err := store.Get(key)
+			require.NoErrorf(t, err, "key from block %d went missing after the jump", h)
+		}
+	}
+	require.NoError(t, store.Close())
+}
+
+// TestFilterBlocksIsValidatedAndPersisted
+// The roll period is the reach of the immutability check, so a store
+// carries it, refuses one it cannot honour, and refuses to open on a
+// manifest that lost it (TestManifestVersionIsWrittenAndChecked).
+func TestFilterBlocksIsValidatedAndPersisted(t *testing.T) {
+	dir := storeDir(t, "fb")
+	kv2, err := NewKV2(dir, 100)
+	require.NoError(t, err)
+	require.Equal(t, uint64(DefaultFilterBlocks), kv2.PermKV.FilterBlocks)
+
+	err = kv2.SetFilterBlocks(MinFilterBlocks - 1)
+	require.Error(t, err, "a window shorter than healing must be refused")
+	require.Contains(t, err.Error(), "minimum")
+	require.Equal(t, uint64(DefaultFilterBlocks), kv2.PermKV.FilterBlocks, "a refused value must not stick")
+
+	require.NoError(t, kv2.SetFilterBlocks(MinFilterBlocks+5))
+	require.NoError(t, kv2.Close())
+
+	reopened, err := OpenKV2(dir)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Open())
+	require.Equal(t, uint64(MinFilterBlocks+5), reopened.PermKV.FilterBlocks, "the period must survive a reopen")
 	require.NoError(t, reopened.Close())
 }

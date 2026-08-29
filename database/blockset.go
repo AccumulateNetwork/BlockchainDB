@@ -541,9 +541,14 @@ func (c shardSets) lookup(key [32]byte) (value []byte, found bool, err error) {
 	return nil, false, nil
 }
 
-// forEachKey visits every key the shard holds in any set
-func (c shardSets) forEachKey(fn func(key [32]byte)) (err error) {
+// forEachKeySince visits every key the shard holds in a set that
+// reaches block `start`.  Sets are in block order, so those are a
+// suffix of the list.
+func (c shardSets) forEachKeySince(start uint64, fn func(key [32]byte)) (err error) {
 	for _, set := range c.store.snapshot() {
+		if set.meta.Last < start {
+			continue
+		}
 		err = set.forEachKey(c.shard, func(key [32]byte, _ *DBBKey) error {
 			fn(key)
 			return nil

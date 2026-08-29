@@ -133,6 +133,27 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 	return kvs, nil
 }
 
+// SetFilterBlocks
+// Set the key filter's roll period on every shard: the window, N to 2N
+// blocks, over which a permanent key cannot be overwritten
+// (keyfilter.go).  A creation-time call -- it commits a manifest per
+// shard, two barriers each -- and a period below MinFilterBlocks is
+// refused before any shard is touched.
+func (k *KVShard) SetFilterBlocks(n uint64) (err error) {
+	if err = checkFilterBlocks(n); err != nil {
+		return err
+	}
+	for i, shard := range k.Shards {
+		if err = shard.Open(); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
+		if err = shard.SetFilterBlocks(n); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // PutDyna
 // Find the right shard, and put the key/value in the DynaKV in the shard
 func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
