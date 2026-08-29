@@ -349,9 +349,7 @@ func degWriteCSV(t *testing.T, path string, samples []degSample) {
 
 // degSegCount is the number of sealed segments in a layer
 func degSegCount(s *SegmentStore) int {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return len(s.segments)
+	return len(s.sealedSegments())
 }
 
 // degDirSize totals a directory tree, since a KV2 has a directory per layer

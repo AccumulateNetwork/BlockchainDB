@@ -28,8 +28,21 @@ import (
 //	live.dat            records accepted since the last seal
 //	seg-<height>.dat    a sealed, immutable segment (transport format)
 //	seg-<height>.idx    its key index: sorted 48-byte records + a bloom
-//	segments.json       the manifest: the segments, counts, and hashes
+//	segments.json       the active manifest: the store's settings and
+//	                    the sealed segments of the newest 2N blocks
+//	history.json        the history manifest: every older segment
 //	filters.dat         the live key filters, saved on close (keyfilter.go)
+//
+// A store is two tiers with two locks (issue #57).  The ACTIVE tier is
+// the live tail and the sealed segments of the last N to 2N blocks --
+// the window the key filters cover -- and it is what a commit writes
+// and a consensus-path read hits; Mutex is its lock.  HISTORY is every
+// sealed segment below that window, plus the packed sets; History is
+// its lock, and merging, compacting and packing it are its business.
+// A segment moves from active to history when the window rolls past
+// it (handoffBelowWindow), which is the only moment both locks are
+// held together.  See the field comments on SegmentStore for the
+// rules, and docs/design/segment-store.md for why.
 //
 // An index record is key(32) offset(8) length(8), and the offset is
 // relative to the segment's BODY -- its records, after the header --
@@ -58,6 +71,7 @@ import (
 
 const (
 	segManifestName = "segments.json"
+	segHistoryName  = "history.json"
 	segLiveName     = "live.dat"
 	segFilePrefix   = "seg-"
 	segDataSuffix   = ".dat"
@@ -96,7 +110,16 @@ const (
 	// FilterBlocks, and a Span on each merged segment saying how far
 	// back it reaches.  A version-2 build would take a merged segment
 	// for a single block and let a filter claim keys it never held.
-	StoreFormatVersion = 3
+	//
+	// Version 4 split the manifest in two (issue #57): segments.json
+	// names the active tier and history.json names history, so that a
+	// commit and a merge each write their own and neither waits for the
+	// other.  The union of the two is the store; a segment may be named
+	// by both while its handoff is being recorded.  Shadowed is gone
+	// from the manifest with the whole-layer compaction it drove.  A
+	// version-3 build would read segments.json alone and silently lose
+	// every segment history.json names.
+	StoreFormatVersion = 4
 	segIndexHdrSize    = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
 	segDataHdrSize     = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
 	segRecHdrSize      = 40 // key(32) valueLen(8) precede each value in a .dat
@@ -138,8 +161,18 @@ func (a SegmentMeta) after(b SegmentMeta) bool {
 }
 
 // StoreManifest
-// The authoritative list of a store's sealed segments.  Replacing it
-// is the commit point for both sealing and compaction.
+// The active manifest: the store's settings and the sealed segments of
+// the active tier.  Replacing it is the commit point for sealing and
+// importing.
+//
+// Segments is the active tier, oldest first, PLUS any segment the
+// window has rolled into history that history.json has not yet
+// recorded (SegmentStore.pendingHistory).  The rule that makes the two
+// manifests one store is that every sealed segment is named by at
+// least one of them at every moment: a handoff records nothing, so the
+// segment stays here until a history commit names it there, and only
+// a later active commit drops it from here.  A segment named by both
+// is simply the same segment.
 type StoreManifest struct {
 	// Version is the on-disk format; see StoreFormatVersion.  It is
 	// first so that it is readable at the head of the file.
@@ -150,18 +183,6 @@ type StoreManifest struct {
 	FilterBlocks uint64        `json:"filterBlocks"` // Roll period of the key filter; never 0
 	BlockHeight  uint64        `json:"blockHeight"`  // Block currently being accumulated
 	Segments     []SegmentMeta `json:"segments"`     // Oldest first
-
-	// Shadowed carries the store's estimate of how many of its records
-	// a later write has superseded -- its garbage -- across a restart.
-	//
-	// Without it a reopened store believed it held none, whatever it
-	// actually held, and deferred reclaiming until it had accumulated a
-	// threshold fraction of the whole layer again in fresh overwrites
-	// (issue #40).  It is written whenever the manifest is, so a crash
-	// costs the writes since the last seal, import, or compaction: an
-	// under-estimate, which defers compaction rather than forcing a
-	// pointless one.
-	Shadowed uint64 `json:"shadowed,omitempty"`
 
 	// FilterValid says the persisted key filters (filters.dat) cover
 	// the store exactly as this manifest lists it, and the other three
@@ -175,6 +196,17 @@ type StoreManifest struct {
 	FilterHeight   uint64 `json:"filterHeight,omitempty"`
 	FilterSeq      uint64 `json:"filterSeq,omitempty"`
 	FilterSegments uint64 `json:"filterSegments,omitempty"`
+}
+
+// HistoryManifest
+// The history manifest: the sealed segments below the active window,
+// oldest first.  Replacing it is the commit point for a merge, a
+// history compaction, and the retirement of packed segments.  It
+// carries no settings -- those are the active manifest's -- so that a
+// history commit needs nothing from the active tier.
+type HistoryManifest struct {
+	Version  uint32        `json:"version"`
+	Segments []SegmentMeta `json:"segments"` // Oldest first
 }
 
 // segment
@@ -279,20 +311,72 @@ func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
 // A key/value store built from sealed segments and a live tail.
 // Methods are safe for concurrent use.
 type SegmentStore struct {
-	// Mutex guards the store.  Writers -- anything that appends to the
-	// live tail, seals, compacts, merges, imports, or closes -- take it
-	// exclusively.  Readers take it SHARED: a sealed segment is
-	// immutable and the pool hands out descriptors for pread, so
-	// lookups against sealed data need no lock at all; the shared lock
-	// exists only to keep the live map and the segment list stable
-	// while a reader is looking at them.
+	// Mutex guards the ACTIVE tier: the live tail, the key filters, the
+	// block height, and the sealed segments inside the window.  It is
+	// the protocol's lock -- what Put, PutIfAbsent, Seal, Sync and the
+	// first half of Get take -- and nothing it protects grows with the
+	// chain, so nothing held under it takes longer as history does.
+	// Writers take it exclusively; readers take it SHARED, because a
+	// sealed segment is immutable and the pool hands out descriptors
+	// for pread, so the shared lock exists only to keep the live map
+	// and the segment list stable while a reader looks (issue #50).
+	//
+	// History is never taken while Mutex is held on the protocol path.
+	// The two meet in exactly two places, both under Mutex first:
+	// handoffBelowWindow, which moves the segments the window has
+	// rolled past into history and holds History for the length of an
+	// append, and Close/Open, which are not the protocol path.  A
+	// history operation never takes Mutex.
 	//
 	// It was an exclusive mutex for reads too, and that serialised
 	// every read in the process on one lock whose hold time grew with
 	// the segment walk.  Measured on an 8-node Accumulate network at
 	// 500 tx/s: the busiest node ran at ~110% CPU -- one core, seven
 	// idle -- while block time climbed from 3.0 s to 5.2 s (issue #50).
-	Mutex     sync.RWMutex
+	Mutex sync.RWMutex
+
+	// History guards the HISTORY tier: the sealed segments below the
+	// window.  A merge, a history compaction, or a pack copies those
+	// segments with NO lock -- they are immutable -- and takes History
+	// exclusively only to swap the list and commit history.json; a
+	// reader of history takes it shared for the length of its walk.
+	//
+	// It exists because one lock covered both tiers, and a merge or a
+	// compaction held it for the whole copy: measured on an 8-node
+	// Accumulate network at 500 tx/s, every node stopped producing
+	// blocks for 12 s at block 400 and 23-32 s at block 1,040 -- ~2.3 s
+	// per GB of the dynamic layer, growing without bound -- because a
+	// lock on history was held against the protocol (issue #57).
+	History sync.RWMutex
+
+	// maint serialises history maintenance -- MergeBelow,
+	// CompactHistory, DropBelow -- for the whole of an operation, copy
+	// and swap.  Only maintainers take it; the protocol path never
+	// does, so it can be held for as long as a copy takes.  Order:
+	// maint, then History.  Never Mutex after either.
+	maint sync.Mutex
+
+	// handoffMu is a leaf lock over pendingHistory and
+	// retireAfterActiveCommit, the two lists the tiers hand each other.
+	// Held for the length of a slice append, under either tier lock,
+	// never around anything that blocks.
+	handoffMu sync.Mutex
+
+	// retireMu is a leaf lock over iterating and pendingDelete, so that
+	// either tier can retire a file and either can hold one open.
+	retireMu sync.Mutex
+
+	// unlinkMu guards the queue of files waiting to be deleted, which a
+	// goroutine drains with no store lock held (unlinkLater): a
+	// compaction can retire thousands of files, and deleting them under
+	// either tier's lock was a pause proportional to history -- 236 ms
+	// on a Seal after a 3,579-segment compaction.  unlinking says the
+	// goroutine is running, and unlinkDone is signalled when it stops.
+	unlinkMu    sync.Mutex
+	unlinkQueue []string
+	unlinking   bool
+	unlinkDone  *sync.Cond
+
 	Directory string
 	Mutable   bool // Mutable: newer segments shadow older; immutable: conflicts error
 
@@ -331,12 +415,60 @@ type SegmentStore struct {
 	// selects by block -- would then never export those records.
 	ExternalBlockRecord bool
 
-	segments    []*segment           // Sealed segments, oldest first
+	// active is the sealed segments inside the window, oldest first:
+	// every one has first() >= tierStart(), and the key filters cover
+	// all of them.  Under Mutex.
+	active []*segment
+
+	// history is the sealed segments below the window, oldest first:
+	// every one has first() < tierStart().  Under History.  A segment
+	// is in exactly one of the two lists; ordered by (Height, Seq),
+	// history precedes active, because the window only ever moves up.
+	history []*segment
+
+	// historyNewest is the identity of history's newest segment as the
+	// active tier last saw it, kept under Mutex so that a seal needing
+	// the store's newest identity (nextKeyAt) never takes History.  It
+	// can lag: a merge replaces history's newest with one sequence
+	// higher, under History alone.  That is safe, because the identity
+	// is only compared against heights at or above the window, and
+	// everything in history is below it.
+	historyNewest SegmentMeta
+	historyAny    bool
+
+	// handoffs is the segments the window has rolled into history whose
+	// files the active manifest on disk may still name.  An entry is
+	// added at the handoff; `recorded` is set by the history commit
+	// that names the segment (or what it was merged into); and the
+	// active commit after that drops the entry, because it is the first
+	// active manifest that does not name the segment.  Until an entry
+	// is gone, a history operation that retires the segment's files
+	// hands them to retireAfterActiveCommit instead of deleting them.
+	// Under handoffMu.
+	handoffs []handoff
+
+	// retireAfterActiveCommit is the files history made unreachable
+	// that the active manifest on disk may still name.  They are
+	// deleted after the next active commit, which is the first manifest
+	// that no longer names them.  Under handoffMu.
+	retireAfterActiveCommit []string
+
+	// epoch counts handoffs.  A write that had to consult history
+	// without the active lock checks it before writing, and starts
+	// over if the window rolled in between.  Under Mutex.
+	epoch uint64
+
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
 	liveDirty   bool                 // Records written to the tail since the last fsync of it
-	closed      bool                 // Set by Close; cleared by Open
+
+	// closed is set by Close and cleared by Open, under BOTH tier
+	// locks, so that a check under either is enough.  Atomic so that
+	// Open on an open store can say so without taking either: every
+	// KVShard operation calls Open first, maintenance included, and a
+	// merge must not queue behind a commit to learn its store is open.
+	closed atomic.Bool
 
 	// cold is where this store's keys go once they leave its segments:
 	// the block-set files a sharded database packs its finalized Perm
@@ -349,58 +481,25 @@ type SegmentStore struct {
 	// history should not have to know where the store keeps it.  The
 	// key filters do not cover the cold keys -- that is what bounds them
 	// (keyfilter.go) -- so a key they rule out is looked for cold by Get,
-	// and by nothing else: see lookup.
+	// and by nothing else: see lookupHistory.
 	cold coldStore
 
-	// retireOnCommit holds segments dropped from the list -- their keys
-	// now held cold -- whose files the manifest still names.  They are
-	// deleted after the next manifest commit, whatever causes it, so
-	// that dropping a segment costs no barrier of its own: a shard
-	// commits a manifest every block it seals in anyway, and this rides
-	// on that one.  Until then the files stay, and a crash leaves them
-	// named by a manifest that still points at whole segments.
-	retireOnCommit []*segment
-
-	// iterating counts the iterations in flight, and pendingDelete
-	// holds the files a compaction wanted to delete while one was.
+	// iterating counts the iterations and pinned snapshots in flight,
+	// and pendingDelete holds the files a commit wanted to delete while
+	// one was.
 	//
-	// ForEach runs its callback without the store's lock (issue #31),
-	// so a compaction can commit underneath it.  That is fine for what
-	// the iteration reports -- it snapshots the segment list and shows
-	// the store as it was when it started -- but not for the files:
-	// compaction deletes the generation it replaced, and the iterator
-	// is still reading it.  Deferring the unlink until the last
-	// iteration finishes keeps those reads valid.  The files are
-	// already unreachable through the manifest, so a crash in between
+	// ForEach runs its callback without any store lock (issue #31), so
+	// a merge or a compaction can commit underneath it.  That is fine
+	// for what the iteration reports -- it snapshots the segment lists
+	// and shows the store as it was when it started -- but not for the
+	// files: the commit deletes the segments it replaced, and the
+	// iterator is still reading them.  Deferring the unlink until the
+	// last iteration finishes keeps those reads valid.  The files are
+	// already unreachable through the manifests, so a crash in between
 	// costs nothing: recoverOrphans sweeps them on the next open.
+	// Under retireMu.
 	iterating     int
 	pendingDelete []string
-
-	// shadowed estimates how many records this store holds that a later
-	// write has superseded -- its garbage -- counted since the last
-	// compaction.
-	//
-	// It exists so that "is there anything worth reclaiming?" can be
-	// answered without reading anything.  Compaction itself is the only
-	// exact answer, and it costs a scan of every index plus a copy of
-	// every live value, so asking it that question is the thing being
-	// avoided (issue #31).
-	//
-	// A mutable store appends without checking, on purpose, so the count
-	// comes from a probe of the store's own key filter before the write
-	// is recorded in it: a key already there means this write shadows an
-	// older copy.  The filter's false positives make that an
-	// over-estimate and its lack of false negatives keeps it from ever
-	// being an under-estimate, so the error is on the side of compacting
-	// slightly early.  Nil filter means no estimate, and the caller
-	// falls back to compacting unconditionally.
-	//
-	// It survives a restart: the manifest carries it, so a reopened
-	// store resumes its estimate rather than believing it holds no
-	// garbage at all (issue #40).  What a crash costs is the writes
-	// since the last manifest -- an under-estimate, which defers a
-	// compaction rather than forcing a pointless one.
-	shadowed uint64
 
 	// filters are the live key filters, oldest first: one or two
 	// membership sets over the keys of the last N to 2N blocks and the
@@ -472,7 +571,9 @@ type coldStore interface {
 func (s *SegmentStore) attachCold(cold coldStore) (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+	s.History.Lock() // cold is read under either lock; set it under both
 	s.cold = cold
+	s.History.Unlock()
 	if s.filtersLackCold {
 		for _, f := range s.filters {
 			if err = cold.forEachKeySince(f.start, f.keys.Set); err != nil {
@@ -555,6 +656,9 @@ func NewSegmentStore(directory string, mutable bool) (store *SegmentStore, err e
 	if err = store.newLiveFile(); err != nil {
 		return nil, err
 	}
+	if err = store.writeHistoryManifest(); err != nil {
+		return nil, err
+	}
 	if err = store.writeManifest(); err != nil {
 		return nil, err
 	}
@@ -633,21 +737,37 @@ func (s *SegmentStore) newKeyFilter(expected uint64) *BloomSet {
 // Reopen a closed store.  Cheap and safe to call on an open store,
 // which callers on the hot path rely on.
 func (s *SegmentStore) Open() (err error) {
+	if !s.closed.Load() {
+		return nil // No lock: see closed
+	}
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-	if !s.closed {
+	if !s.closed.Load() {
 		return nil
 	}
+	s.History.Lock()
+	defer s.History.Unlock()
 	return s.load()
 }
 
 // load
-// Read the store off disk.  The caller must hold the Mutex (or hold
-// the only reference, as the constructors do).
+// Read the store off disk.  The caller must hold both tier locks (or
+// hold the only reference, as the constructors do).
+//
+// The two manifests are read and their union taken -- a segment named
+// by both is one segment -- and each segment is then placed in the
+// tier its oldest block puts it in, for the block the store is in.
+// Tier membership is derived, never recorded: a segment's tier is a
+// function of its block range and the window, so a crash between a
+// handoff and either commit changes nothing about where a segment
+// belongs.  Whichever manifest is found not to match its tier is
+// rewritten, so that the store leaves open with each manifest naming
+// its own tier and nothing pending between them.
 func (s *SegmentStore) load() (err error) {
 	s.live = make(map[[32]byte]*DBBKey)
-	s.segments = nil
-	s.retireOnCommit = nil // The manifest being read is the truth again
+	s.active, s.history = nil, nil
+	s.historyNewest, s.historyAny = SegmentMeta{}, false
+	s.handoffs, s.retireAfterActiveCommit = nil, nil // The manifests being read are the truth again
 	s.liveRecords = 0
 
 	m, err := s.readManifest()
@@ -659,6 +779,15 @@ func (s *SegmentStore) load() (err error) {
 			"%s is on-disk format version %d; this build reads version %d",
 			s.Directory, m.Version, StoreFormatVersion)
 	}
+	hm, err := s.readHistoryManifest()
+	if err != nil {
+		return err
+	}
+	if hm.Version != StoreFormatVersion {
+		return fmt.Errorf(
+			"%s is on-disk format version %d; this build reads version %d",
+			filepath.Join(s.Directory, segHistoryName), hm.Version, StoreFormatVersion)
+	}
 	s.Mutable = m.Mutable
 	s.SealLimit = m.SealLimit
 	if err = checkFilterBlocks(m.FilterBlocks); err != nil {
@@ -666,20 +795,52 @@ func (s *SegmentStore) load() (err error) {
 	}
 	s.FilterBlocks = m.FilterBlocks
 	s.blockHeight = m.BlockHeight
-	s.shadowed = m.Shadowed
 
-	for _, meta := range m.Segments {
+	// The union, in (Height, Seq) order, which is the order both tiers
+	// keep and the order the lists had before any restart
+	var all []*segment
+	seen := make(map[string]bool)
+	for _, meta := range append(append([]SegmentMeta(nil), hm.Segments...), m.Segments...) {
+		if seen[meta.File] {
+			continue
+		}
+		seen[meta.File] = true
 		seg, err := s.openSegment(meta)
 		if err != nil {
 			return err
 		}
-		s.segments = append(s.segments, seg)
+		all = append(all, seg)
 	}
+	sort.SliceStable(all, func(i, j int) bool { return all[j].meta.after(all[i].meta) })
 
-	adopted, err := s.recoverOrphans()
+	all, adopted, err := s.recoverOrphans(all)
 	if err != nil {
 		return err
 	}
+	// The block the tail is in is at least the block of the newest
+	// segment.  The manifest can say less: the Dyna layer's block
+	// advances in memory with every KV2.Seal and is persisted only by
+	// its own seals, so a segment it sealed and a crash left for
+	// recoverOrphans to adopt can sit many blocks above the block the
+	// manifest recorded -- and a store that then auto-sealed at the
+	// recorded block would refuse, "block height 5 is below the newest
+	// segment's block 68".  It also keeps the tiers consistent: a
+	// segment is never newer than the window it is placed by.
+	if n := len(all); n > 0 && all[n-1].meta.Height > s.blockHeight {
+		s.blockHeight = all[n-1].meta.Height
+	}
+	start := s.tierStart()
+	for _, seg := range all {
+		if seg.meta.first() < start {
+			s.history = append(s.history, seg)
+		} else {
+			s.active = append(s.active, seg)
+		}
+	}
+	if n := len(s.history); n > 0 {
+		s.historyNewest, s.historyAny = s.history[n-1].meta, true
+	}
+
 	// After recoverOrphans, because an adopted segment changes what the
 	// filters have to cover; before openLive, which adds the live keys
 	// as it replays them.
@@ -689,8 +850,124 @@ func (s *SegmentStore) load() (err error) {
 	if err = s.openLive(); err != nil {
 		return err
 	}
-	s.closed = false
+	s.closed.Store(false)
+
+	// Reconcile the tiers with what the manifests name, writing as
+	// little as possible: a store opens 1,024 of these at a time.  A
+	// history segment the active manifest still names is a handoff in
+	// flight, recorded or not according to whether history.json names
+	// it, and the commits that follow finish it as they would have.  A
+	// segment named by NEITHER -- an adopted orphan -- or an active
+	// segment only history.json names -- one the window at the block
+	// this store recorded has not yet passed, though a later history
+	// commit would drop it -- needs its own tier's manifest to name it
+	// before anything else is committed.
+	inActive, inHistory := make(map[string]bool), make(map[string]bool)
+	for _, meta := range m.Segments {
+		inActive[meta.File] = true
+	}
+	for _, meta := range hm.Segments {
+		inHistory[meta.File] = true
+	}
+	writeHistory, writeActive := false, false
+	for _, seg := range s.history {
+		switch {
+		case inActive[seg.meta.File]:
+			s.handoffs = append(s.handoffs, handoff{seg: seg, recorded: inHistory[seg.meta.File]})
+		case !inHistory[seg.meta.File]:
+			writeHistory = true
+		}
+	}
+	for _, seg := range s.active {
+		if !inActive[seg.meta.File] {
+			writeActive = true
+		}
+	}
+	if writeHistory {
+		if err = s.writeHistoryManifest(); err != nil {
+			return err
+		}
+	}
+	if writeActive {
+		if err = s.writeManifest(); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// tierStart is the block that divides the tiers: a segment whose
+// oldest block is at or above it is active, and one below it is
+// history.  It is the start of the oldest key filter the schedule
+// calls for at the block the tail is in -- the same line the filters'
+// coverage claim is drawn at (keyfilter.go) -- and a pure function of
+// the block height, so it only ever moves up.  The caller must hold
+// the Mutex.
+func (s *SegmentStore) tierStart() uint64 {
+	return filterStarts(s.blockHeight, s.FilterBlocks)[0]
+}
+
+// handoffBelowWindow
+// Move the active segments the window has rolled past into history.
+// Called from advanceBlock, under the Mutex, whenever the block moves;
+// it is the one place the protocol path takes History, and it holds
+// it for an append.
+//
+// Nothing is written.  The segments stay named by the active manifest
+// until a history commit names them (pendingHistory), so a crash at
+// any point leaves them named by at least one manifest.
+func (s *SegmentStore) handoffBelowWindow() {
+	start := s.tierStart()
+	n := 0
+	for _, seg := range s.active {
+		if seg.meta.first() >= start {
+			break // Ordered: the rest are inside the window too
+		}
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	moved := s.active[:n]
+	s.active = append([]*segment(nil), s.active[n:]...)
+	s.epoch++
+
+	s.History.Lock()
+	s.history = append(s.history, moved...)
+	s.historyNewest, s.historyAny = moved[n-1].meta, true
+	s.handoffMu.Lock()
+	for _, seg := range moved {
+		s.handoffs = append(s.handoffs, handoff{seg: seg})
+	}
+	s.handoffMu.Unlock()
+	s.History.Unlock()
+}
+
+// handoff is one segment in transit between the manifests; see
+// SegmentStore.handoffs
+type handoff struct {
+	seg      *segment
+	recorded bool // history.json names it (or its replacement)
+}
+
+// releaseFromHistory
+// Retire a segment's files on history's behalf: now, if no manifest
+// on disk can still name them, and after the next active commit if
+// the active manifest might.  The caller must hold History and must
+// already have committed a history manifest that does not name the
+// segment.
+func (s *SegmentStore) releaseFromHistory(seg *segment) {
+	seg.close()
+	s.handoffMu.Lock()
+	defer s.handoffMu.Unlock()
+	for i, h := range s.handoffs {
+		if h.seg == seg {
+			s.handoffs = append(s.handoffs[:i], s.handoffs[i+1:]...)
+			s.retireAfterActiveCommit = append(s.retireAfterActiveCommit, seg.dataPath, seg.indexPath)
+			return
+		}
+	}
+	s.unlinkLater(seg.dataPath, seg.indexPath)
 }
 
 // addSegmentKeys
@@ -898,22 +1175,28 @@ func (s *SegmentStore) openLive() (err error) {
 // Adopt a sealed segment whose manifest update did not complete, and
 // delete leftovers a completed compaction made unreachable.
 //
-// The rule is the manifest's newest height: a data file above it is a
-// seal (or compaction) that reached disk but not the manifest, and is
-// complete by construction -- it was fsynced before being renamed into
-// place.  A data file at or below that height was superseded by a
-// committed compaction.  Reports how many segments were adopted.
-func (s *SegmentStore) recoverOrphans() (adopted int, err error) {
+// The rule is the manifests' newest height: a data file above it is a
+// seal (or a compaction of a store whose every segment was history)
+// that reached disk but not the manifest, and is complete by
+// construction -- it was fsynced before being renamed into place.  A
+// data file at or below that height was superseded by a committed
+// merge or compaction.  Takes and returns the store's segments, both
+// tiers in (Height, Seq) order, and reports how many were adopted.
+func (s *SegmentStore) recoverOrphans(all []*segment) (segs []*segment, adopted int, err error) {
 	entries, err := os.ReadDir(s.Directory)
 	if err != nil {
-		return 0, err
+		return all, 0, err
 	}
 
 	known := make(map[string]bool)
-	for _, seg := range s.segments {
+	for _, seg := range all {
 		known[seg.meta.File] = true
 	}
-	newest, haveSegments := s.newestMeta()
+	var newest SegmentMeta
+	haveSegments := len(all) > 0
+	if haveSegments {
+		newest = all[len(all)-1].meta
+	}
 
 	var orphans []SegmentMeta
 	for _, e := range entries {
@@ -938,25 +1221,26 @@ func (s *SegmentStore) recoverOrphans() (adopted int, err error) {
 		}
 		hash, count, err := s.identify(path)
 		if err != nil {
-			return 0, err
+			return all, 0, err
 		}
 		orphans = append(orphans, SegmentMeta{Height: height, Seq: seq, File: name, Count: count, Hash: hash})
 	}
 	if len(orphans) == 0 {
-		return 0, nil
+		return all, 0, nil
 	}
 
 	sort.Slice(orphans, func(i, j int) bool { return orphans[j].after(orphans[i]) })
 	for _, meta := range orphans {
 		seg, err := s.openSegment(meta)
 		if err != nil {
-			return 0, err
+			return all, 0, err
 		}
 		meta.Count = uint64(seg.count) // Indexed keys, not physical records
 		seg.meta = meta
-		s.segments = append(s.segments, seg)
+		all = append(all, seg) // Above the newest, so this keeps the order
 	}
-	return len(orphans), s.writeManifest()
+	// The manifests are rewritten by load once the tiers are placed
+	return all, len(orphans), nil
 }
 
 // heightFromName parses seg-<height>.dat
@@ -994,12 +1278,25 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 	return m, nil
 }
 
+// readHistoryManifest loads history.json
+func (s *SegmentStore) readHistoryManifest() (m *HistoryManifest, err error) {
+	data, err := os.ReadFile(filepath.Join(s.Directory, segHistoryName))
+	if err != nil {
+		return nil, err
+	}
+	m = new(HistoryManifest)
+	if err = json.Unmarshal(data, m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // writeManifest
-// Replace the manifest atomically.  This is the commit point for
-// sealing, importing, and compaction -- and the single durability
-// barrier for the whole operation.
+// Replace the active manifest atomically.  This is the commit point
+// for sealing and importing -- and the single durability barrier for
+// the whole operation.  The caller must hold the Mutex.
 //
-// The directory fsync at the end is the only one any of those paths
+// The directory fsync at the end is the only one either of those paths
 // performs.  Each of them renames files into this directory before
 // calling here -- the sealed data file, its index, then the manifest
 // itself -- and one fsync of a directory commits every name change
@@ -1012,29 +1309,106 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 // published, so a name that survives a crash never points at a file
 // that does not.  A seal was paying six barriers for that; three of
 // them were this directory, fsynced three times over (issue #33).
+//
+// What it names is the active tier plus the handoffs no history commit
+// has recorded yet; what it takes with it is the handoffs one has, and
+// the files history left for this commit to delete.  Both are read
+// before the manifest is built, so a handoff or a retirement that
+// arrives while the file is being written waits for the next commit.
 func (s *SegmentStore) writeManifest() (err error) {
 	// The coverage claim is true only of the manifest written directly
 	// after the filters were saved.  Everything else that writes a
-	// manifest -- a seal, a compaction, an import -- has changed the
-	// segment set, so clearing it here means no path can forget to.
+	// manifest -- a seal, an import -- has changed the segment set, so
+	// clearing it here means no path can forget to.
 	defer func() { s.filterValid = false }()
+
+	s.handoffMu.Lock()
+	var unrecorded, recorded []*segment
+	for _, h := range s.handoffs {
+		if h.recorded {
+			recorded = append(recorded, h.seg)
+		} else {
+			unrecorded = append(unrecorded, h.seg)
+		}
+	}
+	retire := append([]string(nil), s.retireAfterActiveCommit...)
+	s.handoffMu.Unlock()
 
 	m := StoreManifest{Version: StoreFormatVersion,
 		Mutable: s.Mutable, SealLimit: s.SealLimit, FilterBlocks: s.FilterBlocks,
-		BlockHeight: s.blockHeight, Shadowed: s.shadowed}
+		BlockHeight: s.blockHeight}
 	if s.filterValid {
 		m.FilterValid = true
 		m.FilterStart, m.FilterHeight = s.filterSaved.Start, s.filterSaved.Height
 		m.FilterSeq, m.FilterSegments = s.filterSaved.Seq, s.filterSaved.Segments
 	}
-	for _, seg := range s.segments {
+	for _, seg := range unrecorded { // Older than anything active
 		m.Segments = append(m.Segments, seg.meta)
 	}
-	data, err := json.MarshalIndent(&m, "", "  ")
+	for _, seg := range s.active {
+		m.Segments = append(m.Segments, seg.meta)
+	}
+	if err = commitJSON(s.Directory, segManifestName, &m); err != nil {
+		return err
+	}
+
+	// Committed.  The handoffs history has recorded are named by neither
+	// this manifest nor any later one, and the files history left for
+	// this commit are named by nothing.
+	s.handoffMu.Lock()
+	kept := s.handoffs[:0]
+	for _, h := range s.handoffs {
+		done := false
+		for _, seg := range recorded {
+			if h.seg == seg {
+				done = true
+			}
+		}
+		if !done {
+			kept = append(kept, h)
+		}
+	}
+	s.handoffs = kept
+	s.retireAfterActiveCommit = s.retireAfterActiveCommit[len(retire):]
+	s.handoffMu.Unlock()
+	s.unlinkLater(retire...)
+	return nil
+}
+
+// writeHistoryManifest
+// Replace the history manifest atomically: the commit point for a
+// merge, a history compaction, and the retirement of packed segments.
+// The caller must hold History exclusively (or the only reference).
+//
+// It names history as it stands, which includes every segment handed
+// off so far -- a handoff appends under History, so none can be in
+// flight -- and so every handoff is recorded by this commit: the next
+// active commit may stop naming them.
+func (s *SegmentStore) writeHistoryManifest() (err error) {
+	m := HistoryManifest{Version: StoreFormatVersion}
+	for _, seg := range s.history {
+		m.Segments = append(m.Segments, seg.meta)
+	}
+	if err = commitJSON(s.Directory, segHistoryName, &m); err != nil {
+		return err
+	}
+	s.handoffMu.Lock()
+	for i := range s.handoffs {
+		s.handoffs[i].recorded = true
+	}
+	s.handoffMu.Unlock()
+	return nil
+}
+
+// commitJSON writes a manifest to a tmp file, fsyncs it, renames it
+// over the name, and fsyncs the directory: the one barrier that makes
+// every rename issued before it durable too (see writeManifest)
+func commitJSON(directory, name string, m any) (err error) {
+	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(s.Directory, segManifestName+segTmpSuffix)
+	tmp := filepath.Join(directory, name+segTmpSuffix)
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
@@ -1050,21 +1424,10 @@ func (s *SegmentStore) writeManifest() (err error) {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(tmp, filepath.Join(s.Directory, segManifestName)); err != nil {
+	if err = os.Rename(tmp, filepath.Join(directory, name)); err != nil {
 		return err
 	}
-	if err = syncDir(s.Directory); err != nil {
-		return err
-	}
-	// Committed: the manifest no longer names what DropBelow dropped, so
-	// the files can go
-	for _, seg := range s.retireOnCommit {
-		seg.close()
-		s.retire(seg.dataPath)
-		s.retire(seg.indexPath)
-	}
-	s.retireOnCommit = nil
-	return nil
+	return syncDir(directory)
 }
 
 // errStoreClosed is returned by every operation that would read or
@@ -1100,7 +1463,7 @@ var ErrImmutable = errors.New("cannot overwrite immutable value")
 // checkOpen reports whether the store can be operated on.  The caller
 // must hold the Mutex.
 func (s *SegmentStore) checkOpen() error {
-	if s.closed {
+	if s.closed.Load() {
 		return errStoreClosed
 	}
 	return nil
@@ -1108,72 +1471,102 @@ func (s *SegmentStore) checkOpen() error {
 
 // Get
 // Return the value for a key, wherever the store holds it: the live
-// tail, the sealed segments newest to oldest, then the packed sets.
+// tail, the active segments newest to oldest, then history newest to
+// oldest, then the packed sets.
+//
+// Two locks, never together.  The active tier is read under Mutex,
+// shared, and released before history is read under History, shared.
+// A segment that moves between the two in the gap is looked at twice
+// at worst, and a merge that commits in the gap is seen either as its
+// inputs or as its output: both hold the same keys.
 func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 	s.Mutex.RLock()
-	defer s.Mutex.RUnlock()
-	return s.get(key)
+	value, inWindow, found, err := s.lookupActive(key)
+	s.Mutex.RUnlock()
+	if err != nil || found {
+		return value, err
+	}
+	return s.lookupHistory(key, inWindow)
 }
 
-// get is Get; the caller must hold the Mutex
-func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
-	return s.lookup(key, true)
-}
-
-// lookup
-// Find a key.  The caller must hold the Mutex.
+// lookupActive
+// Find a key in the active tier: the live tail, then the sealed
+// segments inside the window, newest first.  The caller must hold the
+// Mutex.  inWindow reports what the key filters said, which decides
+// whether history has to be consulted for a key not found here.
 //
 // One probe of the live filters settles the window: a "no" is
-// definitive for every segment whose blocks all lie inside it, and
-// that is the part of the walk that grows with the seal count.  What
-// the filters do not speak for is the history below the window -- the
-// segments a merge has stretched back past it, and the packed sets --
-// each of which carries a filter of its own, and `deep` says whether
-// to go there when the window says no.
-//
-// Get does.  A caller asking for a key is owed the answer wherever the
-// store keeps it, and a key that old is looked for in every set, one
-// bloom probe each.  A WRITE does not: immutability is a windowed
-// guarantee (issue #44).  The check exists for replay safety, which is
-// recent by nature, and a Perm key is the hash of its value, so "same
-// key, different value" beyond the window would be a hash collision.
-// Stopping at the window is what keeps a write's cost independent of
-// how much history the store holds.  A filter hit -- a key that is in
-// the window, or a false positive -- is followed wherever it leads,
-// so that a key written in the last N to 2N blocks is refused whether
-// it now sits in a segment, a merged segment, or a set.
-func (s *SegmentStore) lookup(key [32]byte, deep bool) (value []byte, err error) {
+// definitive for every active segment -- every one of them lies
+// inside the window, that being what makes it active -- and that is
+// the part of the walk that grows with the seal count.  What the
+// filters do not speak for is the history below the window and the
+// packed sets, each of which carries a filter of its own.
+func (s *SegmentStore) lookupActive(key [32]byte) (value []byte, inWindow, found bool, err error) {
+	return s.findActive(key, true)
+}
+
+// findActive is lookupActive, counting what happened in the stats
+// only when `count` says so: a write that had to consult history looks
+// at the active tier twice, and that is one lookup.
+func (s *SegmentStore) findActive(key [32]byte, count bool) (value []byte, inWindow, found bool, err error) {
 	if err = s.checkOpen(); err != nil {
-		return nil, err
+		return nil, false, false, err
 	}
-	s.stats.lookupTotal.Add(1)
+	if count {
+		s.stats.lookupTotal.Add(1)
+	}
 	if dbb, ok := s.live[key]; ok {
 		value = make([]byte, dbb.Length)
 		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return nil, err
+			return nil, false, false, err
 		}
-		s.stats.liveHit.Add(1)
-		return value, nil
+		if count {
+			s.stats.liveHit.Add(1)
+		}
+		return value, true, true, nil
 	}
-	inWindow := s.filterTest(key)
-	if inWindow {
+	inWindow = s.filterTest(key)
+	if !inWindow {
+		if count {
+			s.stats.filterAbsent.Add(1)
+		}
+		return nil, false, false, nil
+	}
+	if count {
 		s.stats.filterWalked.Add(1)
-	} else {
-		s.stats.filterAbsent.Add(1)
-		if !deep {
-			return nil, errNotFound
+	}
+	for i := len(s.active) - 1; i >= 0; i-- { // Newest segment wins
+		dbb, found, err := s.active[i].lookup(key)
+		if err != nil {
+			return nil, true, false, err
+		}
+		if found {
+			value, err = s.active[i].value(dbb)
+			return value, true, true, err
 		}
 	}
-	for i := len(s.segments) - 1; i >= 0; i-- { // Newest segment wins
-		if !inWindow && s.covered(s.segments[i]) {
-			continue
-		}
-		dbb, found, err := s.segments[i].lookup(key)
+	return nil, true, false, nil
+}
+
+// lookupHistory
+// Find a key below the window: the history segments newest first, then
+// the packed sets.  Takes History shared for the length of the walk,
+// which is what lets a merge retire the segments it replaced the
+// moment its swap is done.  inWindow is what the filters said, for
+// the misled counter.
+func (s *SegmentStore) lookupHistory(key [32]byte, inWindow bool) (value []byte, err error) {
+	s.History.RLock()
+	defer s.History.RUnlock()
+	if err = s.checkOpen(); err != nil {
+		return nil, err
+	}
+	for i := len(s.history) - 1; i >= 0; i-- { // Newest segment wins
+		dbb, found, err := s.history[i].lookup(key)
 		if err != nil {
 			return nil, err
 		}
 		if found {
-			return s.segments[i].value(dbb)
+			return s.history[i].value(dbb)
 		}
 	}
 	if s.cold != nil { // Then whatever left the segments for a block set
@@ -1198,31 +1591,99 @@ func (s *SegmentStore) lookup(key [32]byte, deep bool) (value []byte, err error)
 // no-op (this is what makes replay and re-import idempotent) and
 // rewriting it with a different value is an error.  The check reaches
 // back over the key filters' window, N to 2N blocks, and no further:
-// see lookup.
+// immutability is a windowed guarantee (issue #44).  The check exists
+// for replay safety, which is recent by nature, and a Perm key is the
+// hash of its value, so "same key, different value" beyond the window
+// would be a hash collision.  Stopping at the window is what keeps a
+// write's cost independent of how much history the store holds.  A
+// filter hit -- a key that is in the window, or a false positive -- is
+// followed wherever it leads, so that a key written in the last N to
+// 2N blocks is refused whether it now sits in an active segment, a
+// merged segment in history, or a set.
 func (s *SegmentStore) Put(key [32]byte, value []byte) (err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.put(key, value)
-}
-
-// put is Put; the caller must hold the Mutex
-func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
-	if err = s.checkOpen(); err != nil {
+	existing, existed, err := s.putUnlessPresent(key, value, s.Mutable)
+	if err != nil || !existed {
 		return err
 	}
-	s.stats.putTotal.Add(1)
-	if !s.Mutable {
-		if existing, err := s.lookup(key, false); err == nil {
-			if bytes.Equal(existing, value) {
-				s.stats.putDuplicate.Add(1)
-				return nil // Same value: no-op
-			}
-			s.stats.putConflict.Add(1)
-			return ErrImmutable
-		}
+	if bytes.Equal(existing, value) {
+		s.stats.putDuplicate.Add(1)
+		return nil // Same value: no-op
 	}
-	s.stats.putNew.Add(1)
-	return s.writeRecord(key, value)
+	s.stats.putConflict.Add(1)
+	return ErrImmutable
+}
+
+// putUnlessPresent
+// Append a record unless the key is already held, and report what was
+// found.  `blind` skips the check altogether, which is what a mutable
+// store's Put wants: it appends and lets the newest record win.
+//
+// The check takes the Mutex, and only the Mutex, in the common cases:
+// a key the filters rule out of the window is written at once, and a
+// key found in the active tier is answered at once.  A filter hit
+// that the active tier cannot settle -- the key is in history, or the
+// hit was a false positive -- is followed into history WITHOUT the
+// Mutex, so that the protocol path never holds the two locks together
+// and never waits on a history swap while holding the store: the
+// Mutex is released, history is read under its own lock, and the
+// Mutex is taken again for the write.  If the window rolled in
+// between (epoch), the whole check starts over, because a segment the
+// active walk saw may now be one the history walk missed.
+func (s *SegmentStore) putUnlessPresent(key [32]byte, value []byte, blind bool) (existing []byte, existed bool, err error) {
+	s.stats.putTotal.Add(1)
+	if blind {
+		s.Mutex.Lock()
+		defer s.Mutex.Unlock()
+		if err = s.checkOpen(); err != nil {
+			return nil, false, err
+		}
+		s.stats.putNew.Add(1)
+		return nil, false, s.writeRecord(key, value)
+	}
+	for {
+		s.Mutex.Lock()
+		existing, inWindow, found, err := s.lookupActive(key)
+		if err != nil {
+			s.Mutex.Unlock()
+			return nil, false, err
+		}
+		if found {
+			s.Mutex.Unlock()
+			return existing, true, nil
+		}
+		if !inWindow {
+			s.stats.putNew.Add(1)
+			err = s.writeRecord(key, value)
+			s.Mutex.Unlock()
+			return nil, false, err
+		}
+		epoch := s.epoch
+		s.Mutex.Unlock()
+
+		existing, err = s.lookupHistory(key, true)
+		if err == nil {
+			return existing, true, nil
+		}
+		if !errors.Is(err, errNotFound) {
+			return nil, false, err
+		}
+
+		s.Mutex.Lock()
+		if s.epoch != epoch {
+			s.Mutex.Unlock()
+			continue // The window rolled while history was being read
+		}
+		// The key could have arrived in the tail meanwhile; the active
+		// tier is the only place it can have gone, and it is still the
+		// same tier this loop looked at -- and already counted
+		existing, _, found, err = s.findActive(key, false)
+		if err == nil && !found {
+			s.stats.putNew.Add(1)
+			err = s.writeRecord(key, value)
+		}
+		s.Mutex.Unlock()
+		return existing, found, err
+	}
 }
 
 // writeRecord
@@ -1243,18 +1704,7 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 	s.live[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
 	s.liveRecords++
 	s.liveDirty = true
-	if s.filters != nil {
-		// Probe before Set: a key the store already holds means this
-		// record supersedes an older one, which is what compaction has
-		// to reclaim.  Only a mutable store can shadow -- an immutable
-		// one refuses the write instead -- so only it counts.  The
-		// window is the whole store for a mutable layer, whose block
-		// never advances, so the estimate is not windowed in practice.
-		if s.Mutable && s.filterTest(key) {
-			s.shadowed++
-		}
-		s.filterSet(key)
-	}
+	s.filterSet(key)
 	return nil
 }
 
@@ -1274,28 +1724,19 @@ func (s *SegmentStore) writeRecord(key [32]byte, value []byte) (err error) {
 // authorises the write; anything else is returned.  "Absent" means
 // absent from the window the key filters cover, as it does for Put.
 func (s *SegmentStore) PutIfAbsent(key [32]byte, value []byte) (existing []byte, existed bool, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	if err = s.checkOpen(); err != nil {
+	existing, existed, err = s.putUnlessPresent(key, value, false)
+	if err != nil || !existed {
 		return nil, false, err
 	}
-	s.stats.putTotal.Add(1)
-	switch existing, err = s.lookup(key, false); {
-	case err == nil:
-		// Split the two ways a key can already be here, because they
-		// mean opposite things: an identical rewrite is a write this
-		// check avoided, a differing one is a write it caught.
-		if bytes.Equal(existing, value) {
-			s.stats.putDuplicate.Add(1)
-		} else {
-			s.stats.putConflict.Add(1)
-		}
-		return existing, true, nil
-	case !errors.Is(err, errNotFound):
-		return nil, false, err
+	// Split the two ways a key can already be here, because they mean
+	// opposite things: an identical rewrite is a write this check
+	// avoided, a differing one is a write it caught.
+	if bytes.Equal(existing, value) {
+		s.stats.putDuplicate.Add(1)
+	} else {
+		s.stats.putConflict.Add(1)
 	}
-	s.stats.putNew.Add(1)
-	return nil, false, s.writeRecord(key, value)
+	return existing, true, nil
 }
 
 // LiveCount
@@ -1317,11 +1758,64 @@ func (s *SegmentStore) LiveRecords() uint64 {
 	return s.liveRecords
 }
 
+// unlinkLater
+// Queue files a commit has made unreachable for deletion by a
+// goroutine that holds no store lock.  The files are already named by
+// no manifest, so nothing depends on when the unlink happens: a crash
+// first leaves orphans that recoverOrphans sweeps on the next open.
+// Close and the tests wait for the queue to drain (awaitUnlinks).
+func (s *SegmentStore) unlinkLater(paths ...string) {
+	if len(paths) == 0 {
+		return
+	}
+	s.unlinkMu.Lock()
+	defer s.unlinkMu.Unlock()
+	s.unlinkQueue = append(s.unlinkQueue, paths...)
+	if s.unlinking {
+		return
+	}
+	if s.unlinkDone == nil {
+		s.unlinkDone = sync.NewCond(&s.unlinkMu)
+	}
+	s.unlinking = true
+	go s.drainUnlinks()
+}
+
+// drainUnlinks deletes queued files until the queue is empty
+func (s *SegmentStore) drainUnlinks() {
+	for {
+		s.unlinkMu.Lock()
+		if len(s.unlinkQueue) == 0 {
+			s.unlinking = false
+			s.unlinkDone.Broadcast()
+			s.unlinkMu.Unlock()
+			return
+		}
+		batch := s.unlinkQueue
+		s.unlinkQueue = nil
+		s.unlinkMu.Unlock()
+		for _, path := range batch {
+			s.retire(path)
+		}
+	}
+}
+
+// awaitUnlinks blocks until every queued deletion has been done
+func (s *SegmentStore) awaitUnlinks() {
+	s.unlinkMu.Lock()
+	defer s.unlinkMu.Unlock()
+	for s.unlinking {
+		s.unlinkDone.Wait()
+	}
+}
+
 // retire
 // Delete a file a commit has made unreachable, or defer the delete
-// until the iterations reading it have finished.  The caller must hold
-// the Mutex.
+// until the iterations and pinned snapshots reading it have finished.
+// Safe under either tier lock, or none.
 func (s *SegmentStore) retire(path string) {
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
 	if s.iterating > 0 {
 		s.pendingDelete = append(s.pendingDelete, path)
 		return
@@ -1329,37 +1823,22 @@ func (s *SegmentStore) retire(path string) {
 	os.Remove(path)
 }
 
-// beginIterate
-// Take a snapshot to iterate: the sealed segments as they stand, and
-// the live tail's values copied out.  Holding the segments in a local
-// slice is what makes the iteration a snapshot; holding off deletion
-// is what keeps their files readable.  The caller must hold the Mutex.
-func (s *SegmentStore) beginIterate() (segs []*segment, live map[[32]byte][]byte, err error) {
-	if err = s.checkOpen(); err != nil {
-		return nil, nil, err
-	}
-	// The live tail is not a file the pool can hold open for us -- it is
-	// still being appended to -- so its values are copied out under the
-	// lock rather than read during the iteration
-	live = make(map[[32]byte][]byte, len(s.live))
-	for key, dbb := range s.live {
-		value := make([]byte, dbb.Length)
-		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return nil, nil, err
-		}
-		live[key] = value
-	}
-	segs = append([]*segment(nil), s.segments...)
+// pin
+// Hold off every file deletion until unpin: what a snapshot of either
+// tier needs in order to read the files it names after the locks are
+// released.  Taken BEFORE the snapshot, so that nothing the snapshot
+// names can be deleted between the two.
+func (s *SegmentStore) pin() {
+	s.retireMu.Lock()
 	s.iterating++
-	return segs, live, nil
+	s.retireMu.Unlock()
 }
 
-// endIterate
-// Finish an iteration and, if it was the last, delete what a
-// compaction retired while it ran.
-func (s *SegmentStore) endIterate() {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+// unpin releases a pin and, if it was the last, deletes what was
+// retired meanwhile
+func (s *SegmentStore) unpin() {
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
 	s.iterating--
 	if s.iterating > 0 {
 		return
@@ -1368,6 +1847,48 @@ func (s *SegmentStore) endIterate() {
 		os.Remove(path)
 	}
 	s.pendingDelete = nil
+}
+
+// beginIterate
+// Take a snapshot to iterate: the sealed segments of both tiers as
+// they stand, history first, and the live tail's values copied out.
+// Holding the segments in a local slice is what makes the iteration a
+// snapshot; the pin is what keeps their files readable.  Each tier is
+// read under its own lock, one after the other, never both at once.
+// The caller must unpin when done.
+func (s *SegmentStore) beginIterate() (segs []*segment, live map[[32]byte][]byte, cold coldStore, err error) {
+	s.pin()
+	defer func() {
+		if err != nil {
+			s.unpin()
+		}
+	}()
+
+	s.Mutex.RLock()
+	if err = s.checkOpen(); err != nil {
+		s.Mutex.RUnlock()
+		return nil, nil, nil, err
+	}
+	// The live tail is not a file the pool can hold open for us -- it is
+	// still being appended to -- so its values are copied out under the
+	// lock rather than read during the iteration
+	live = make(map[[32]byte][]byte, len(s.live))
+	for key, dbb := range s.live {
+		value := make([]byte, dbb.Length)
+		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
+			s.Mutex.RUnlock()
+			return nil, nil, nil, err
+		}
+		live[key] = value
+	}
+	active := append([]*segment(nil), s.active...)
+	cold = s.cold
+	s.Mutex.RUnlock()
+
+	s.History.RLock()
+	segs = append(append([]*segment(nil), s.history...), active...)
+	s.History.RUnlock()
+	return segs, live, cold, nil
 }
 
 // BlockHeight
@@ -1426,16 +1947,32 @@ func (s *SegmentStore) sync() (err error) {
 	if err = s.checkOpen(); err != nil {
 		return err
 	}
-	if !s.liveDirty {
-		return nil
+	if s.liveDirty {
+		if err = s.liveFile.Flush(); err != nil {
+			return err
+		}
+		if err = s.liveFile.File.Sync(); err != nil {
+			return err
+		}
+		s.liveDirty = false
 	}
-	if err = s.liveFile.Flush(); err != nil {
-		return err
+	// A layer that is synced rather than sealed at the block boundary
+	// -- the Dyna layer -- may go many blocks between active commits,
+	// and history is waiting on the next one to finish a handoff or to
+	// delete the inputs of a compaction the active manifest still
+	// names.  Commit one here when there is anything to finish: two
+	// barriers, once per compaction, at a boundary that already pays
+	// for a sync.  Otherwise a compacted layer keeps its old
+	// generations on disk until its tail next fills.
+	s.handoffMu.Lock()
+	finish := len(s.retireAfterActiveCommit) > 0
+	for _, h := range s.handoffs {
+		finish = finish || h.recorded
 	}
-	if err = s.liveFile.File.Sync(); err != nil {
-		return err
+	s.handoffMu.Unlock()
+	if finish {
+		return s.writeManifest()
 	}
-	s.liveDirty = false
 	return nil
 }
 
@@ -1519,10 +2056,11 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 	if err != nil {
 		return meta, err
 	}
-	s.segments = append(s.segments, seg)
+	s.active = append(s.active, seg)
 	// The tail's keys are in every live filter already, and the segment
 	// they now sit in is inside the window by construction, so the
-	// filters cover it; advancing the block is what may roll them
+	// filters cover it; advancing the block is what may roll them, and
+	// what may hand the oldest active segments to history
 	s.advanceBlock(height)
 	if blockBoundary {
 		s.advanceBlock(height + 1) // The next writes belong to the next block
@@ -1543,14 +2081,14 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 // newestMeta
 // The newest sealed segment by (Height, Seq).  ok is false when the
 // store has no sealed segments, so that height 0 (a genesis block) is
-// a usable height rather than a sentinel.
+// a usable height rather than a sentinel.  The caller must hold the
+// Mutex; history is consulted through the identity the active tier
+// keeps of it (historyNewest), not through History.
 func (s *SegmentStore) newestMeta() (newest SegmentMeta, ok bool) {
-	for _, seg := range s.segments {
-		if !ok || seg.meta.after(newest) {
-			newest, ok = seg.meta, true
-		}
+	if n := len(s.active); n > 0 {
+		return s.active[n-1].meta, true
 	}
-	return newest, ok
+	return s.historyNewest, s.historyAny
 }
 
 // nextKeyAt
@@ -1722,77 +2260,177 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
 }
 
 // DefaultCompactRatio
-// The share of a mutable store's records that must be superseded
-// before compacting is worth what it costs.
+// How much newer data must have gathered behind a history segment, as
+// a share of that segment's size, before a compaction rewrites it to
+// fold that data in.
 //
-// Compaction rewrites the whole layer: every live value is copied.
-// Doing that on a cadence -- every K commits, which is how a node
-// drives it -- costs O(N) each time and O(N × commits/K) over a run,
-// so the price of reclaiming a fixed amount of garbage grows with the
-// database (issue #31).  Waiting until a fixed *fraction* is garbage
-// makes the amortised cost constant instead: a compaction still costs
-// O(N), but roughly N/(1-r) × r overwrites happen before the next one
-// is due, so the cost per overwrite settles at a constant that depends
-// on r and not on N.
+// History is compacted in runs (CompactHistory): the newest segments
+// are always the run, and an older segment joins it only once the run
+// has grown to this share of the older one.  That is what makes the
+// cost amortised: a segment is rewritten only when enough has arrived
+// to make the rewrite worth its size, so the bytes rewritten over a
+// store's life are a constant multiple -- a few levels deep -- of the
+// bytes written, rather than a whole-layer copy per compaction
+// (issue #31).  Between rewrites the older segment holds records the
+// run's newer copies have superseded; that space is bounded by this
+// ratio.
 //
-// 0.25 spends at most a third of the layer's space on garbage and
-// compacts about once per quarter-layer of overwrites.
+// 0.25 folds a segment in once a quarter of its size has gathered
+// behind it.
 const DefaultCompactRatio = 0.25
 
-// CompactRatio is the ratio Compress uses.  Raise it to compact less
-// often and hold more garbage; lower it for the reverse.
+// CompactRatio is the ratio CompactHistory uses.  Raise it to rewrite
+// large segments less often and hold more garbage; lower it for the
+// reverse.
 var CompactRatio = DefaultCompactRatio
 
-// worthCompacting
-// Whether enough of this store is superseded records to pay for a
-// compaction.  The caller must hold the Mutex.
-//
-// An unmeasurable store -- no key filter, so no estimate -- says yes:
-// compacting when it was not needed costs time, and skipping when it
-// was needed costs unbounded space.
-func (s *SegmentStore) worthCompacting(ratio float64) bool {
-	if !s.Mutable || s.filters == nil {
-		return true
+// compactionRun
+// The suffix of history worth compacting into one segment: the newest
+// segment, and each older one in turn while it is no larger than
+// 1/ratio times what has gathered behind it.  A run shorter than two
+// is nothing to do.  Sized by physical record count, which every
+// segment holds in memory, so choosing costs no I/O.
+func compactionRun(history []*segment, ratio float64) (run []*segment) {
+	n := len(history)
+	if n == 0 {
+		return nil
 	}
-	var records uint64
-	for _, seg := range s.segments {
-		records += uint64(seg.records)
+	var behind float64
+	i := n - 1
+	for ; i >= 0; i-- {
+		if i < n-1 && float64(history[i].records)*ratio > behind {
+			break // Too big for what has gathered behind it, and so is everything older
+		}
+		behind += float64(history[i].records)
 	}
-	records += s.liveRecords
-	if records == 0 {
-		return false
+	if run = history[i+1:]; len(run) < 2 {
+		return nil
 	}
-	return float64(s.shadowed) >= ratio*float64(records)
+	return run
 }
 
-// Compact
-// Replace every sealed segment with one new segment holding only the
-// keys that are still live, and commit it by replacing the manifest.
+// CompactHistory
+// Reclaim what overwriting left behind in history: rewrite the run of
+// history segments compactionRun chooses into one segment holding
+// only the newest record for each key in the run.  Reports whether
+// anything was compacted.
 //
-// Crash-atomic: the new generation is fully durable before the
-// manifest names it, and a crash before that leaves the old generation
-// in force (issue #19).  The live tail is untouched.
-func (s *SegmentStore) Compact(height uint64) (meta SegmentMeta, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.compact(height)
+// This is the Dyna layer's compaction, and it touches HISTORY ONLY.  A
+// record written inside the window -- the last N to 2N blocks -- is in
+// the active tier, and compaction never reads or rewrites it; what it
+// reclaims is a record superseded by a later one that has also left
+// the window.  A record in history superseded only by an active one
+// stays until that newer record reaches history and a run includes
+// both, which bounds the garbage compaction cannot yet see by the size
+// of the window, not the size of the layer.  It replaced Compact, which
+// rewrote every generation under the store lock: on a node whose
+// dynamic layer had grown to 9.8 GB that was a 23-32 s pause of every
+// commit and every read, every 128 blocks (issue #57).
+//
+// The copy takes no store lock: the inputs are immutable and the
+// output is written aside.  History is taken exclusively only to swap
+// the run for its replacement and commit history.json, and the swap
+// checks that the run is still exactly where it was -- a drop or an
+// import could have changed history meanwhile -- and abandons the
+// output if not.  The identity is the sequence after the run's
+// newest, which is free: everything in history is below the window
+// and the run is history's newest suffix.  Crash safety is the merge's
+// rule: an uncommitted output sits below the newest active segment
+// and recoverOrphans deletes it, while the inputs are still named.
+func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
+	s.maint.Lock()
+	defer s.maint.Unlock()
+
+	s.History.RLock()
+	if err = s.checkOpen(); err != nil {
+		s.History.RUnlock()
+		return false, err
+	}
+	run := compactionRun(s.history, CompactRatio)
+	at := len(s.history) - len(run) // Where the run sits: history's newest suffix
+	s.History.RUnlock()
+	if run == nil {
+		return false, nil
+	}
+	// A run of one segment that holds one record per key has nothing
+	// to reclaim; compactionRun already refuses runs shorter than two,
+	// so anything here has at least two segments to fold together.
+
+	winners, keys, err := s.mergeInputs(run)
+	if err != nil {
+		return false, err
+	}
+	last := run[len(run)-1].meta
+	meta, seg, err := s.writeMergedSegment(winners, keys, last.Height, last.Seq+1)
+	if err != nil {
+		return false, err
+	}
+	// The new segment holds every key of every input, so it reaches
+	// back as far as the oldest of them
+	meta.Span = last.Height - run[0].meta.first()
+	seg.meta = meta
+	if maintenanceHook != nil {
+		maintenanceHook()
+	}
+
+	return s.swapHistory(run, seg, at)
 }
 
-// CompactNext
-// Compact at the next available height.  The Dyna layer numbers its
-// segments by generation rather than by block height, so it compacts
-// by generation too.
-func (s *SegmentStore) CompactNext() (meta SegmentMeta, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.compact(s.blockHeight)
+// swapHistory
+// Commit a history operation: replace `run`, which must still be the
+// n-th through last..th segments of history, with `out`, and write the
+// history manifest.  Takes History exclusively for exactly that.  If
+// history no longer holds the run where it was, or the commit fails,
+// the output is discarded and history is left as it was.  The caller
+// must hold maint.
+func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok bool, err error) {
+	s.History.Lock()
+	defer s.History.Unlock()
+	discard := func() {
+		out.close()
+		s.unlinkLater(out.dataPath, out.indexPath)
+	}
+	if err = s.checkOpen(); err != nil {
+		discard()
+		return false, err
+	}
+	if at < 0 || at+len(run) > len(s.history) {
+		discard()
+		return false, nil
+	}
+	for i, seg := range run {
+		if s.history[at+i] != seg {
+			discard()
+			return false, nil // History changed under the copy
+		}
+	}
+	old := s.history
+	s.history = make([]*segment, 0, len(old)-len(run)+1)
+	s.history = append(s.history, old[:at]...)
+	s.history = append(s.history, out)
+	s.history = append(s.history, old[at+len(run):]...)
+	if err = s.writeHistoryManifest(); err != nil {
+		s.history = old // Uncommitted; the inputs still stand
+		discard()
+		return false, err
+	}
+	for _, seg := range run {
+		s.releaseFromHistory(seg)
+	}
+	return true, nil
 }
+
+// maintenanceHook, when set, is called by a history operation after
+// its copy and before its swap, with no store lock held.  It exists so
+// that a test can hold a merge or a compaction at that point and show
+// what the protocol path can do meanwhile.  Nil except under test.
+var maintenanceHook func()
 
 // writeMergedSegment
 // Write the resolved keys and values of a merge into a new sealed
-// segment at (height, seq), build its index, and open it.  The caller
-// must hold the Mutex and is responsible for committing it into the
-// segment list.
+// segment at (height, seq), build its index, and open it.  No lock is
+// needed -- the inputs are immutable -- and the caller is responsible
+// for committing it into the segment list.
 //
 // The segment is complete and durable when this returns; it is simply
 // not yet named by the manifest, which is what makes the commit that
@@ -2027,7 +2665,7 @@ func shiftedIndex(segs []*segment, bases []uint64) (records []byte, err error) {
 // becomes dead bytes.  That is the trade: a little space in exchange
 // for never touching a value.
 //
-// The caller must hold the Mutex.
+// No lock: the sources are immutable and the output is written aside.
 func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta SegmentMeta, merged *segment, err error) {
 	// The index first: it needs only the sizes, and it is where a
 	// damaged source would be found, before anything is written
@@ -2112,7 +2750,7 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 }
 
 // MergeBelow
-// Merge every sealed segment belonging to a block below `height` into
+// Merge every history segment belonging to a block below `height` into
 // one, leaving the rest untouched.  Reports whether it merged anything.
 //
 // This is tier one of keeping the file count survivable.  A block
@@ -2125,15 +2763,26 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 //
 // It merges WITHIN one store, never across shards.  That keeps the
 // working set small -- a shard holds a few hundred entries per set --
-// and keeps the merge under the shard's own lock, so shards merge
-// independently and in parallel.  Merging across shards is what
-// produces globally sorted runs, and it is a separate, rarer pass.
+// so shards merge independently and in parallel.  Merging across
+// shards is what produces globally sorted runs, and it is a separate,
+// rarer pass.
 //
 // `height` is the caller's finalisation watermark: the block below
 // which nothing more will arrive and nothing is still being healed.
 // Segments at or above it are left alone, so a block a peer might
 // still ask for by number is never merged away, and block export is
-// untouched.
+// untouched.  Only HISTORY is merged: a segment still inside the
+// window is the protocol's, whatever the watermark says, and it is
+// merged once the window has rolled past it.  The watermark is free
+// to lag behind the window, and so is the merge behind the watermark;
+// nothing about correctness needs either to be current (issue #47).
+//
+// The copy takes no store lock.  Sealed segments are immutable and the
+// pool hands out descriptors for pread, so the run is read and the
+// merged file written aside while commits and reads carry on; History
+// is taken exclusively only to swap the run for the merged segment and
+// commit history.json.  A concurrent read of history sees either the
+// run or the merged segment, and both hold the same keys.
 //
 // Crash safety follows the same rule as compaction.  The merged file
 // is written and renamed before the manifest names it, and it takes an
@@ -2143,24 +2792,27 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 // manifest and are only retired after the commit succeeds, so the
 // discarded merge costs space and nothing else.
 func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.maint.Lock()
+	defer s.maint.Unlock()
+
+	s.History.RLock()
 	if err = s.checkOpen(); err != nil {
+		s.History.RUnlock()
 		return meta, false, err
 	}
-
 	// Segments are oldest first, so the finalised ones are a prefix
 	n := 0
-	for _, seg := range s.segments {
+	for _, seg := range s.history {
 		if seg.meta.Height >= height {
 			break
 		}
 		n++
 	}
+	run := append([]*segment(nil), s.history[:n]...)
+	s.History.RUnlock()
 	if n < 2 {
 		return meta, false, nil // Nothing to gain from merging one segment
 	}
-	run := s.segments[:n]
 
 	// The merged segment takes the sequence after the newest it
 	// replaces.  That is free and correctly ordered: everything merged
@@ -2180,68 +2832,66 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	// run's first block never saw its oldest keys and must not claim it.
 	meta.Span = outHeight - run[0].meta.first()
 	seg.meta = meta
-
-	// Commit: the manifest names the merged segment in place of the run
-	old := s.segments
-	s.segments = append([]*segment{seg}, old[n:]...)
-	if err = s.writeManifest(); err != nil {
-		s.segments = old // Uncommitted; the originals still stand
-		seg.close()
-		s.retire(seg.dataPath)
-		s.retire(seg.indexPath)
-		return meta, false, err
+	if maintenanceHook != nil {
+		maintenanceHook()
 	}
 
-	for _, o := range run {
-		o.close()
-		s.retire(o.dataPath)
-		s.retire(o.indexPath)
-	}
-	return meta, true, nil
+	merged, err = s.swapHistory(run, seg, 0)
+	return meta, merged, err
 }
 
-// segmentsBelow
-// The sealed segments belonging to blocks below `height`, oldest
-// first.  Segments are kept in order, so it is a prefix of the list.
-func (s *SegmentStore) segmentsBelow(height uint64) (segs []*segment, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+// historyBelow
+// The history segments belonging to blocks below `height`, oldest
+// first, pinned: their files stay readable until release is called,
+// whatever a merge or a drop does to them meanwhile.  Takes History
+// shared for the length of the copy of the list.
+func (s *SegmentStore) historyBelow(height uint64) (segs []*segment, release func(), err error) {
+	s.pin()
+	s.History.RLock()
+	defer s.History.RUnlock()
 	if err = s.checkOpen(); err != nil {
-		return nil, err
+		s.unpin()
+		return nil, nil, err
 	}
 	n := 0
-	for _, seg := range s.segments {
+	for _, seg := range s.history {
 		if seg.meta.Height >= height {
 			break
 		}
 		n++
 	}
-	return append([]*segment(nil), s.segments[:n]...), nil
+	return append([]*segment(nil), s.history[:n]...), s.unpin, nil
 }
 
 // DropBelow
-// Stop serving the sealed segments belonging to blocks below `height`
-// from this store, because their keys are now held cold.  Reports how
+// Stop serving the history segments belonging to blocks below `height`
+// from this store, because their keys are now held cold: commit a
+// history manifest without them and retire their files.  Reports how
 // many were dropped.
 //
-// No manifest is written.  Dropping is a consequence of a commit that
-// has already happened -- the block set holding these keys is durable
-// before anyone calls this -- so nothing is lost by recording it late,
-// and recording it now would cost two barriers per shard for a fact the
-// shard's next seal records for free.  The files stay until then
-// (retireOnCommit), still named by the manifest and still whole, so a
-// crash in between leaves a store that opens exactly as before and
-// simply drops them again.
+// The commit is this store's own, two barriers, off the protocol
+// path.  It used to be deferred to the shard's next seal, which
+// recorded it for free -- but the seal writes the active manifest
+// now and the drop is history's to record, and leaving the files to
+// the next merge would keep a packed set's worth of segments on disk
+// in every shard that merges rarely.  A pack drops its shards
+// concurrently, so the barriers overlap.  Dropping is a consequence
+// of a commit that has already happened -- the block set holding
+// these keys is durable before anyone calls this -- so a crash before
+// this commit leaves a store that opens exactly as before and simply
+// drops them again.
 //
 // The caller asserts the keys are held cold; the store cannot check.
 func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.maint.Lock()
+	defer s.maint.Unlock()
+	s.History.Lock()
+	defer s.History.Unlock()
 	if err = s.checkOpen(); err != nil {
 		return 0, err
 	}
 	n := 0
-	for _, seg := range s.segments {
+	for _, seg := range s.history {
 		if seg.meta.Height >= height {
 			break
 		}
@@ -2250,8 +2900,15 @@ func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
 	if n == 0 {
 		return 0, nil
 	}
-	s.retireOnCommit = append(s.retireOnCommit, s.segments[:n]...)
-	s.segments = append([]*segment(nil), s.segments[n:]...)
+	old := s.history
+	s.history = append([]*segment(nil), old[n:]...)
+	if err = s.writeHistoryManifest(); err != nil {
+		s.history = old
+		return 0, err
+	}
+	for _, seg := range old[:n] {
+		s.releaseFromHistory(seg)
+	}
 	return n, nil
 }
 
@@ -2273,7 +2930,7 @@ type mergeInput struct {
 // one.  The copies agree, so which one survives does not matter -- but
 // the merge still has to emit only one.
 //
-// The caller must hold the Mutex.
+// No lock: the segments are immutable and the caller holds them.
 func (s *SegmentStore) mergeInputs(segs []*segment) (winners map[[32]byte]mergeInput, keys [][32]byte, err error) {
 	winners = make(map[[32]byte]mergeInput)
 	for i := len(segs) - 1; i >= 0; i-- { // Newest first, so it wins
@@ -2306,93 +2963,32 @@ func (s *SegmentStore) mergeInputs(segs []*segment) (winners map[[32]byte]mergeI
 	return winners, keys, nil
 }
 
-// compact is Compact; the caller must hold the Mutex
-func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
-	if err = s.checkOpen(); err != nil {
-		return meta, err
-	}
-	if len(s.segments) == 0 {
-		return meta, nil
-	}
-	seq, err := s.nextKeyAt(height)
-	if err != nil {
-		return meta, err
-	}
-	s.advanceBlock(height)
-
-	// A single generation holding one record per key has nothing to
-	// reclaim: rewriting it would copy every value to produce the same
-	// file.  The Dyna layer compacts on a write count, so it lands here
-	// whenever a compaction has already run since the last seal.  The
-	// meta returned is the standing generation's, at its own height --
-	// not the height asked for, since no segment was written.
-	//
-	// count is the index's key count and records the data file's
-	// physical count, so their being equal is exactly "no key appears
-	// twice", which is what there would be to reclaim.
-	if len(s.segments) == 1 && s.segments[0].count == s.segments[0].records {
-		return s.segments[0].meta, nil
-	}
-
-	winners, keys, err := s.mergeInputs(s.segments)
-	if err != nil {
-		return meta, err
-	}
-
-	meta, seg, err := s.writeMergedSegment(winners, keys, height, seq)
-	if err != nil {
-		return meta, err
-	}
-	// The new generation holds every key of every old one, so it reaches
-	// back as far as the oldest of them
-	meta.Span = height - s.segments[0].meta.first()
-	seg.meta = meta
-
-	// Commit: the manifest now names only the new generation
-	old := s.segments
-	s.segments = []*segment{seg}
-	if err = s.writeManifest(); err != nil {
-		s.segments = old // Uncommitted; keep serving the old generation
-		seg.close()
-		return meta, err
-	}
-
-	// Committed.  The old files are unreachable; removing them is
-	// cleanup, and anything left behind is swept on the next open.
-	for _, o := range old {
-		o.close()
-		s.retire(o.dataPath)
-		s.retire(o.indexPath)
-	}
-
-	// Compaction is the one moment the true key set is already in hand:
-	// what survived is exactly the new generation plus the live tail.
-	// Keeping the old filters would only cost lookups -- they can name
-	// keys that are gone but never miss one that stayed -- but a
-	// rebuild here is free of that drift and bounds the layer count.
-	if s.filters != nil {
-		if err := s.rebuildKeyFilters(); err != nil {
-			s.filters = nil // Correct, just slower: lookups walk again
-		}
-	}
-	// Everything that was superseded has just been dropped; the count
-	// starts again from what the new generation accumulates
-	s.shadowed = 0
-	return meta, nil
-}
-
 // SegmentPaths
 // The sealed segment files backing this store, oldest first, with the
 // manifest metadata that identifies and verifies each one.  Syncing a
 // peer is copying these files.
 func (s *SegmentStore) SegmentPaths() (metas []SegmentMeta, paths []string) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	for _, seg := range s.segments {
+	for _, seg := range s.sealedSegments() {
 		metas = append(metas, seg.meta)
 		paths = append(paths, filepath.Join(s.Directory, seg.meta.File))
 	}
 	return metas, paths
+}
+
+// sealedSegments
+// Both tiers as they stand, history then active, oldest first.  Each
+// tier is read under its own lock, one after the other: the list can
+// name a segment twice or miss one that moved between the two reads
+// only if the window rolled in between, which a caller wanting a
+// consistent view avoids by not sealing meanwhile.
+func (s *SegmentStore) sealedSegments() (segs []*segment) {
+	s.History.RLock()
+	segs = append(segs, s.history...)
+	s.History.RUnlock()
+	s.Mutex.RLock()
+	segs = append(segs, s.active...)
+	s.Mutex.RUnlock()
+	return segs
 }
 
 // ImportSegmentFile
@@ -2413,14 +3009,12 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 		return fmt.Errorf("segment (block %d, seq %d) claims to reach %d blocks back", meta.Height, meta.Seq, meta.Span)
 	}
 
-	for _, seg := range s.segments {
+	// Only the active tier can hold it: a peer's segment is at or above
+	// the window, and one in history would fail the ordering check below
+	for _, seg := range s.active {
 		if seg.meta.Height == meta.Height && seg.meta.Seq == meta.Seq && seg.meta.Hash == meta.Hash {
 			return nil // Already have it
 		}
-	}
-	if newest, ok := s.newestMeta(); ok && !meta.after(newest) {
-		return fmt.Errorf("segment (block %d, seq %d) is not above the newest segment (block %d, seq %d)",
-			meta.Height, meta.Seq, newest.Height, newest.Seq)
 	}
 	// A block already packed into a set is finalized: the set is what
 	// answers for it, and a store that has dropped every segment has no
@@ -2430,6 +3024,10 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 			return fmt.Errorf("segment (block %d, seq %d) is not above the newest block set, which ends at block %d",
 				meta.Height, meta.Seq, last)
 		}
+	}
+	if newest, ok := s.newestMeta(); ok && !meta.after(newest) {
+		return fmt.Errorf("segment (block %d, seq %d) is not above the newest segment (block %d, seq %d)",
+			meta.Height, meta.Seq, newest.Height, newest.Seq)
 	}
 	if err = VerifySegmentFile(path, meta.Hash); err != nil {
 		return err
@@ -2502,7 +3100,22 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	seg.dataPath, seg.indexPath = dataPath, indexPath
 	s.advanceBlock(meta.Height)
 
-	s.segments = append(s.segments, seg)
+	if seg.meta.first() < s.tierStart() {
+		// A segment reaching below the window belongs to history, and
+		// the filters must not claim it.  It is the newest thing in the
+		// store, so it goes last, and the active manifest names it
+		// until a history commit does (a handoff, like any other).
+		s.History.Lock()
+		s.history = append(s.history, seg)
+		s.historyNewest, s.historyAny = seg.meta, true
+		s.handoffMu.Lock()
+		s.handoffs = append(s.handoffs, handoff{seg: seg})
+		s.handoffMu.Unlock()
+		s.History.Unlock()
+		s.epoch++
+		return s.writeManifest() // Commit
+	}
+	s.active = append(s.active, seg)
 	// Into every live filter, whether or not the segment's block is in
 	// its range: a filter holding a key it need not is slower, never
 	// wrong, and the segment is the newest thing in the store
@@ -2519,9 +3132,14 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 // Verify that no key in an incoming segment already has a different
 // value in this store, within the window the key filters cover: the
 // same N-to-2N-block guarantee a write gets, for the same reason (see
-// lookup).  A peer's segment is always the newest thing in the store,
-// so what it could diverge from is recent by construction.  The
-// caller must hold the Mutex, and seg must not yet be in s.segments.
+// Put).  A peer's segment is always the newest thing in the store, so
+// what it could diverge from is recent by construction.  The caller
+// must hold the Mutex, and seg must not yet be in either tier.
+//
+// A filter hit is followed into history under History, shared, while
+// the Mutex is held -- the one nesting the protocol path never does.
+// An import is not the protocol path: a node syncing is not one in
+// consensus, and what it waits for is at most a history swap.
 func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 	index, release, err := seg.index() // One borrow for the whole scan
 	if err != nil {
@@ -2544,8 +3162,20 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 			if err != nil {
 				return err
 			}
-			existing, err := s.lookup(key, false) // Filter-gated; no disk I/O unless a filter hits
+			// Filter-gated; no disk I/O unless a filter hits, and history
+			// only on a hit the active tier could not settle
+			existing, inWindow, found, err := s.lookupActive(key)
 			if err != nil {
+				return err
+			}
+			if !found && inWindow {
+				existing, err = s.lookupHistory(key, true)
+				found = err == nil
+				if err != nil && !errors.Is(err, errNotFound) {
+					return err
+				}
+			}
+			if !found {
 				continue // Not held locally: the common case
 			}
 			incoming, err := seg.value(dbb)
@@ -2566,20 +3196,31 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 func (s *SegmentStore) Close() (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+	s.History.Lock() // Both, in the one order they may nest; not the protocol path
+	defer s.History.Unlock()
+	if s.closed.Load() {
+		return nil
+	}
 
-	// Persist the key filters, then record in the manifest that they
-	// are current -- in that order, so a crash between the two leaves a
-	// manifest saying "rebuild" rather than one pointing at filters that
-	// have fallen behind the segments.  A save that fails is not a
+	// History first, then the active manifest: the history commit
+	// records every handoff, and the active commit that follows is the
+	// one that may stop naming them and delete what history retired.
+	// Then the key filters, and the manifest that says they are
+	// current -- in that order, so a crash between the two leaves a
+	// manifest saying "rebuild" rather than one pointing at filters
+	// that have fallen behind the segments.  A save that fails is not a
 	// reason to fail the close: the next open rebuilds.
-	if !s.closed && s.filters != nil {
+	if err = s.writeHistoryManifest(); err != nil {
+		return err
+	}
+	if s.filters != nil {
 		if claim, err := s.saveKeyFilters(); err == nil {
 			s.filterSaved = claim
 			s.filterValid = true
-			if err := s.writeManifest(); err != nil {
-				return err
-			}
 		}
+	}
+	if err = s.writeManifest(); err != nil {
+		return err
 	}
 
 	if s.liveFile != nil && s.liveFile.File != nil {
@@ -2587,11 +3228,16 @@ func (s *SegmentStore) Close() (err error) {
 			return err
 		}
 	}
-	for _, seg := range s.segments {
+	for _, seg := range s.active {
 		seg.close()
 	}
-	s.segments = nil
-	s.closed = true
+	for _, seg := range s.history {
+		seg.close()
+	}
+	s.active, s.history = nil, nil
+	s.historyNewest, s.historyAny = SegmentMeta{}, false
+	s.closed.Store(true)
+	s.awaitUnlinks() // So that a closed store has deleted what it retired
 	return nil
 }
 

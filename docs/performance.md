@@ -61,13 +61,24 @@ key count flat while the tail grew without bound.
 
 ### Filter Window
 
-`SetFilterBlocks(n)` on a `KVShard` or `KV2` sets N, the roll period of
-the Perm layer's key filter (default `DefaultFilterBlocks`, 128;
-minimum `MinFilterBlocks`, 20).  A fresh filter starts every N blocks
-and covers 2N, so two are live at once and the store holds the keys of
-the last N to 2N blocks in memory -- and no more, whatever the chain's
-length.  It is persisted in each shard's manifest; set it when the
-database is created, since changing it commits a manifest per shard.
+`SetFilterBlocks(n)` on a `KVShard` or `KV2` sets N for both layers:
+the roll period of the key filters (default `DefaultFilterBlocks`, 128;
+minimum `MinFilterBlocks`, 20), and the line between the **active
+tier** -- the live tail and the sealed segments of the last N to 2N
+blocks, which is all a commit writes and a consensus-path read hits --
+and **history**, which is everything older and is what merging,
+packing and compaction work on, under a lock of its own.  A fresh
+filter starts every N blocks and covers 2N, so two are live at once
+and the store holds the keys of the last N to 2N blocks in memory --
+and no more, whatever the chain's length.  It is persisted in each
+layer's manifest; set it when the database is created, since changing
+it commits a manifest per layer per shard.
+
+N is the caller's, and it is what bounds the pause a commit can suffer
+from storage maintenance: a merge or a compaction copies history with
+no lock and swaps under history's own lock, so the protocol path waits
+for nothing that grows with the chain (see *Maintenance Pauses*,
+below).
 
 N is the reach of the immutability check: a permanent key written in
 the last N to 2N blocks cannot be overwritten; older history is not
@@ -106,7 +117,15 @@ whatever window may still be written to -- healing, in Accumulate's
 case -- because segments at or above it are left alone so that block
 export keeps working.
 
-1. `KVShard.MergeFinalized(height)` merges each shard's sealed Perm
+Both stages work on **history** -- the segments the window of the
+last N to 2N blocks has rolled past -- and never on a segment still
+inside the window, whatever the watermark says.  A watermark inside
+the window finalises what has left it, and the rest follows once the
+window has passed; the merge lags the watermark by up to N blocks.
+Neither stage takes a shard's store lock: the copy is lock-free and
+the commit is a swap under the shard's history lock.
+
+1. `KVShard.MergeFinalized(height)` merges each shard's history
    segments below the watermark into one.  Sealing produces a segment
    per shard per block, so without this the file count grows with the
    chain and nothing bounds it: measured at 512 shards and 5,000
@@ -123,14 +142,14 @@ export keeps working.
 2. `KVShard.PackFinalized(height)` packs every shard's merged segment
    for the set into **one block-set file** under `<db>/sets/`, then
    drops those segments from the shards.  The 1,024 files become 1.
-   Measured on the same set: ~30 ms, one file of 7.6 MB for 40,000
-   keys.
+   Measured on the same set: ~30 ms for the file, one file of 7.6 MB
+   for 40,000 keys.
 
-   The drop writes no manifest.  Each shard records it at its next
-   seal, and only then deletes the files, so the pack costs two
-   barriers in all rather than two per shard.  Until a shard next
-   seals -- or closes -- its packed files linger on disk, harmlessly:
-   a shard that takes no writes for a long time keeps them that long.
+   Each shard's drop is a history-manifest commit of its own -- two
+   barriers -- run sixteen shards at a time, off the protocol path.
+   A merge's inputs that the active manifest still names wait for the
+   shard's next seal before they are deleted (*Two tiers, two locks*
+   in [Segments as storage](design/segment-store.md)).
 
 A lookup that reaches a set costs a bloom probe, one read of the
 shard's index slice, and one read of the value; a key the shard's own
@@ -139,23 +158,47 @@ filter says is absent never reaches the sets.  Measured over the packed
 absent key.  Memory
 per set is 16 KB of directory plus a bloom at ~1.5 bytes a key.
 
-Run stage two after stage one for the same watermark, never
-concurrently with it: the merge retires the files the pack is copying.
+Run stage two after stage one for the same watermark.  Running them
+concurrently is safe -- the pack reads pinned files -- but wasteful.
 
 ### Compaction Ratio
 
-`CompactRatio` (default 0.25) is the share of a mutable layer that must
-be superseded records before `Compress` does anything. `Compress` on a
-cadence used to rewrite the whole layer every call, so reclaiming a
-fixed amount of garbage grew more expensive as the database grew;
-waiting for a fixed *fraction* makes the amortised cost per overwrite
-constant instead. Raise it to compact less often and hold more
-garbage; lower it for the reverse.
+`Compress` compacts the Dyna layer's **history** -- the segments the
+window has rolled past -- and never a record last written inside the
+window.  It rewrites a run of history segments into one holding the
+newest record per key: the newest segment always, and each older one
+while it is no larger than 1/`CompactRatio` of what has gathered
+behind it.  At the default 0.25 a large old segment is rewritten only
+once a quarter of its size has arrived behind it, which keeps the
+bytes rewritten over the store's life a constant multiple of the bytes
+written rather than a whole-layer copy per call.  Raise the ratio to
+rewrite large segments less often and hold more garbage; lower it for
+the reverse.
 
-The estimate behind it is maintained as writes arrive -- a probe of the
-store's own key filter, so deciding costs nothing -- and is carried in
-the manifest, so a reopened store resumes it rather than believing it
-holds no garbage.
+Choosing the run costs no I/O -- it is decided from the record counts
+the segments hold in memory -- so `Compress` on a cadence is cheap when
+there is nothing to do.
+
+### Maintenance Pauses
+
+Every history operation -- merge, compaction, pack -- copies immutable
+segments with no lock, writes its output aside, and takes the history
+lock only to swap the segment list and commit `history.json`.  The
+protocol path (`Put`, `Seal`, `Get` of recent data) takes the store's
+own lock and never the history lock, so it waits for nothing the copy
+does.  Measured with a writer committing every 50 ms and a reader
+every 2 ms while `Compress` and `MergeBelow` ran (N=20; details in
+[Segments as storage](design/segment-store.md)):
+
+| dyna layer | `Compress` | max commit pause before → after | max read pause before → after |
+|---|---|---|---|
+| 0.60 GB | 0.77 s → 0.71 s | 1.06 s → <1 ms | 1.10 s → 20 ms |
+| 1.20 GB | 1.83 s → 1.71 s | 2.13 s → <1 ms | 2.17 s → 24 ms |
+| 2.40 GB | 4.60 s → 4.81 s | 4.88 s → <1 ms | 4.92 s → 48 ms |
+| 4.81 GB | 11.75 s → 11.09 s | 12.09 s → <1 ms | 12.09 s → 55 ms |
+
+Before, the pause was the copy: ~2.4 s per GB of the dynamic layer,
+growing without bound.  After, the compaction takes the same time (it is the same copy, off the lock) and the longest a `Put` waited was under a millisecond in every row; the longest a `Seal` waited was 22, 22, 50 and 56 ms against an idle 15-23 ms, and the longest a `Get` 20, 24, 48 and 55 ms -- the history swap and the disk contention of a multi-GB copy, not the copy itself. Memory is lower too: heap 7/10/16/28 MB before against 6/7/10/14 MB after, and the Dyna layer's resident filters 2.4/4.7/9.4/18.7 MB before against 0.3/0.6/1.1/2.1 MB after, because the filter covers the window rather than the whole layer.
 
 ### Buffer Size
 
@@ -201,10 +244,11 @@ by its own hash -- belongs there.  State that changes belongs in Dyna.
 
 ### 2. Compact Dyna, not Perm
 
-`Compress()` writes a new sealed generation of the Dyna layer and
-commits it with a single manifest rename, reclaiming the space that
-overwritten values still occupy.  It is proportional to live data, so
-run it on a cadence tied to write volume rather than on every block.
+`Compress()` rewrites a run of the Dyna layer's history segments into
+one and commits it with a single history-manifest rename, reclaiming
+the space that overwritten values still occupy.  It never touches the
+segments inside the window, takes no lock a commit takes, and is
+cheap to call when there is nothing to do, so run it on a cadence.
 It is a no-op on the Perm layer, which has nothing to reclaim.
 
 ```go

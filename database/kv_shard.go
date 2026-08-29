@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const NumShards = 512
@@ -27,9 +28,10 @@ func ShardIndex(key []byte) int {
 // Concurrency: KVShard methods are safe for concurrent use.  The Shards
 // array is fixed after creation, and each KV2 serializes access with its
 // own mutex - so operations on different shards run in parallel, while
-// operations on the same shard are serialized.  (BFile and SegmentStore
-// are NOT safe for concurrent use on their own; they rely on the KV2
-// lock when accessed through this layer.)
+// operations on the same shard are serialized.  The finalisation
+// methods -- MergeFinalized, PackFinalized, Compress -- take no
+// shard's store lock: they work on history, under each store's own
+// history lock, and run alongside the commits (issue #57).
 type KVShard struct {
 	Directory string
 	Shards    [NumShards]*KV2
@@ -88,8 +90,8 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 		return nil, err
 	}
 	// A shard still naming segments a committed set already holds was
-	// interrupted between the set's commit and its own next manifest;
-	// drop them again, and that next manifest retires them
+	// interrupted between the set's commit and its own drop; drop them
+	// again, which commits and retires them
 	if newest, ok := kVShard.Sets.Newest(); ok {
 		for i, shard := range kVShard.Shards {
 			if _, err = shard.PermKV.DropBelow(newest.Last + 1); err != nil {
@@ -134,11 +136,12 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 }
 
 // SetFilterBlocks
-// Set the key filter's roll period on every shard: the window, N to 2N
-// blocks, over which a permanent key cannot be overwritten
-// (keyfilter.go).  A creation-time call -- it commits a manifest per
-// shard, two barriers each -- and a period below MinFilterBlocks is
-// refused before any shard is touched.
+// Set N on every shard, both layers: the key filters' roll period --
+// the window, N to 2N blocks, over which a permanent key cannot be
+// overwritten (keyfilter.go) -- and the line between the active tier
+// and history (issue #57).  A creation-time call -- it commits a
+// manifest per layer per shard, two barriers each -- and a period
+// below MinFilterBlocks is refused before any shard is touched.
 func (k *KVShard) SetFilterBlocks(n uint64) (err error) {
 	if err = checkFilterBlocks(n); err != nil {
 		return err
@@ -329,8 +332,14 @@ func (k *KVShard) adoptBlockHeight() error {
 		return nil
 	}
 	for _, shard := range k.Shards {
-		if shard != nil && shard.PermKV != nil {
+		if shard == nil {
+			continue
+		}
+		if shard.PermKV != nil {
 			shard.PermKV.AdvanceBlock(height)
+		}
+		if shard.DynaKV != nil { // So that its window is where the set's is
+			shard.DynaKV.AdvanceBlock(height)
 		}
 	}
 	return nil
@@ -430,9 +439,13 @@ func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
 // then deletes the files, so a crash in between costs the space of the
 // segments until that seal (DropBelow).
 //
-// Not safe to run concurrently with MergeFinalized at the same
-// watermark: the merge retires the segments this is copying.  Drive
-// both from one scheduler, in order.
+// Only HISTORY is packed -- a segment still inside a shard's window
+// is the protocol's -- so a watermark inside the window packs what
+// has rolled out of it and no more; the rest follows once it has.  No
+// shard's store lock is taken: the segments are read pinned, so a
+// merge that commits meanwhile leaves their files readable until the
+// pack is done, and whichever of the two lands first, the drop that
+// follows removes what the set holds.
 func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err error) {
 	if newest, ok := k.Sets.Newest(); ok && height <= newest.Last+1 {
 		return meta, false, nil // Everything below is already packed
@@ -443,9 +456,11 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 		if err = shard.Open(); err != nil {
 			return meta, false, fmt.Errorf("shard %d: %w", i, err)
 		}
-		if shards[i], err = shard.PermKV.segmentsBelow(height); err != nil {
+		var release func()
+		if shards[i], release, err = shard.PermKV.historyBelow(height); err != nil {
 			return meta, false, fmt.Errorf("shard %d: %w", i, err)
 		}
+		defer release()
 		for _, seg := range shards[i] {
 			if h := seg.meta.Height; !any || h > last {
 				last = h
@@ -469,13 +484,33 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 		return meta, false, err
 	}
 	// Committed.  The shards can stop serving what the set now holds.
+	// Each drop is a history commit of its own -- two barriers -- so
+	// they run concurrently and the barriers overlap on the device:
+	// what took 512 seals' worth of fsync in series takes a few dozen.
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	slots := make(chan struct{}, packDropWorkers)
 	for i, shard := range k.Shards {
-		if _, dropErr := shard.PermKV.DropBelow(height); dropErr != nil && err == nil {
-			err = fmt.Errorf("shard %d: %w", i, dropErr)
-		}
+		wg.Add(1)
+		slots <- struct{}{}
+		go func(i int, shard *KV2) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			if _, dropErr := shard.PermKV.DropBelow(height); dropErr != nil {
+				mu.Lock()
+				if err == nil {
+					err = fmt.Errorf("shard %d: %w", i, dropErr)
+				}
+				mu.Unlock()
+			}
+		}(i, shard)
 	}
+	wg.Wait()
 	return set.meta, true, err
 }
+
+// packDropWorkers is how many shards PackFinalized drops at once
+const packDropWorkers = 16
 
 // Compress
 // Compress all the shards

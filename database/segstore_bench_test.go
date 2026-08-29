@@ -158,8 +158,10 @@ func TestDynaCost(t *testing.T) {
 	dir := filepath.Join(base, "dyna")
 	store, err := NewSegmentStore(dir, true)
 	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 	vr := NewFastRandom([]byte{121, 121})
 	written := 0
+	block := uint64(0)
 	start := time.Now()
 	for round := 0; round < rounds; round++ {
 		for i := range keys {
@@ -173,16 +175,22 @@ func TestDynaCost(t *testing.T) {
 				require.NoError(t, err)
 			}
 			if written++; written%compressEvery == 0 {
+				// Compaction works on history: what the window has
+				// rolled past.  Roll it past everything sealed so far.
 				_, err = store.SealNext()
 				require.NoError(t, err)
-				_, err = store.CompactNext()
+				block += 3 * MinFilterBlocks
+				store.AdvanceBlock(block)
+				_, err = store.CompactHistory()
 				require.NoError(t, err)
 			}
 		}
 	}
 	_, err = store.SealNext()
 	require.NoError(t, err)
-	_, err = store.CompactNext()
+	block += 3 * MinFilterBlocks
+	store.AdvanceBlock(block)
+	_, err = store.CompactHistory()
 	require.NoError(t, err)
 	elapsed := time.Since(start)
 	require.NoError(t, store.Close())

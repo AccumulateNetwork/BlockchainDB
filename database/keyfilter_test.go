@@ -65,7 +65,7 @@ func TestKeyFilterNeverMissesAKey(t *testing.T) {
 		require.NoError(t, err)
 		mustFindAll(store, "after seal")
 	}
-	require.Greater(t, len(store.segments), 1, "the walk being skipped must be worth skipping")
+	require.Greater(t, len(store.sealedSegments()), 1, "the walk being skipped must be worth skipping")
 
 	// A tail on top of the sealed segments
 	write(20)
@@ -130,6 +130,7 @@ func TestKeyFilterSurvivesCompaction(t *testing.T) {
 	dir := storeDir(t, "s")
 	store, err := NewSegmentStore(dir, true)
 	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{33})
 	keys := make([][32]byte, 100)
@@ -143,8 +144,10 @@ func TestKeyFilterSurvivesCompaction(t *testing.T) {
 		_, err = store.SealNext()
 		require.NoError(t, err)
 	}
-	_, err = store.CompactNext()
+	ageOut(t, store)
+	compacted, err := store.CompactHistory()
 	require.NoError(t, err)
+	require.True(t, compacted)
 
 	for i, key := range keys {
 		got, err := store.Get(key)
@@ -327,9 +330,9 @@ func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
 	}
 	_, err = store.SealNext()
 	require.NoError(t, err)
-	require.Len(t, store.segments, 1)
-	require.Equal(t, uint64(0), store.segments[0].meta.Height)
-	require.Equal(t, uint64(0), store.segments[0].meta.Seq, "the case only arises for segment (0,0)")
+	require.Len(t, store.sealedSegments(), 1)
+	require.Equal(t, uint64(0), store.sealedSegments()[0].meta.Height)
+	require.Equal(t, uint64(0), store.sealedSegments()[0].meta.Seq, "the case only arises for segment (0,0)")
 
 	// Now put the manifest back as it was before the seal: this is a
 	// crash after the segment file reached disk but before the manifest
@@ -338,7 +341,7 @@ func TestKeyFilterEmptyDoesNotCoverSegmentZero(t *testing.T) {
 
 	reopened, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
-	require.Len(t, reopened.segments, 1, "the orphan segment must have been adopted")
+	require.Len(t, reopened.sealedSegments(), 1, "the orphan segment must have been adopted")
 
 	for i, key := range keys {
 		v, err := reopened.Get(key)
@@ -450,12 +453,16 @@ func filterStartsOf(s *SegmentStore) (starts []uint64) {
 // filters must not claim it unless they saw its oldest keys.
 //
 // After sealing 60 blocks with N=20 the filters cover blocks 40 on.
-// Merging the blocks below 50 makes one segment at height 49 reaching
-// back to block 1.  A filter that judged the segment by its height
-// alone would call it covered, answer "absent" for a key from block
-// 10, and skip the one segment that holds it: a false negative, with
-// nothing downstream to catch it.  Without SegmentMeta.Span this fails
-// with "key from block 1 went missing after the merge".
+// Merging the blocks below 50 merges the history below the window --
+// blocks 1-39 -- into one segment at height 39 reaching back to block
+// 1.  A filter that judged the segment by its height alone would
+// call it covered, answer "absent" for a key from block 10, and skip
+// the one segment that holds it: a false negative, with nothing
+// downstream to catch it.  Without SegmentMeta.Span this fails with
+// "key from block 1 went missing after the merge".  (With the tiers
+// of issue #57 a merged segment is history and never covered; the
+// span is still what says so on a reopen, when the tiers are placed
+// by each segment's oldest block.)
 func TestKeyFilterCoversAMergedSegmentByItsOldestBlock(t *testing.T) {
 	dir := storeDir(t, "span")
 	store, keys := rollingStore(t, dir, 63, 60, 5)
@@ -464,8 +471,8 @@ func TestKeyFilterCoversAMergedSegmentByItsOldestBlock(t *testing.T) {
 	_, merged, err := store.MergeBelow(50)
 	require.NoError(t, err)
 	require.True(t, merged)
-	require.Equal(t, uint64(49), store.segments[0].meta.Height)
-	require.Equal(t, uint64(1), store.segments[0].meta.first(), "the merged segment reaches back to block 1")
+	require.Equal(t, uint64(39), store.sealedSegments()[0].meta.Height)
+	require.Equal(t, uint64(1), store.sealedSegments()[0].meta.first(), "the merged segment reaches back to block 1")
 
 	find := func(s *SegmentStore, when string) {
 		t.Helper()
