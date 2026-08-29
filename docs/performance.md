@@ -20,9 +20,13 @@ the trade-offs behind them.
    plus one manifest commit -- not a re-insertion of every record.
    The cost does not grow with what the receiving node already holds.
 
-4. **Shards give you cores.**  Keys route to one of 512 shards by
-   `ShardIndex`, and each shard has its own lock, so writes to
-   different shards proceed in parallel.
+4. **Shards give you cores, and so do readers.**  Keys route to one
+   of 512 shards by `ShardIndex`, and each shard has its own lock, so
+   writes to different shards proceed in parallel.  Reads take every
+   lock shared, so readers of the *same* shard proceed in parallel
+   too: measured 107,000 gets/s with one reader and 976,000 with
+   sixteen on a store of 1,000 sealed segments.  Under the exclusive
+   lock reads used to take, a second reader halved throughput.
 
 Measured on the running database (see
 [Segments as storage](design/segment-store.md) for methodology):

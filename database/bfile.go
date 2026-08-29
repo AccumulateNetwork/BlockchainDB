@@ -204,15 +204,20 @@ func (b *BFile) ReadAt(offset uint64, data []byte) (err error) {
 
 	switch {
 	case DataLastOffset <= b.EOD:
-		if err = b.Open(); err != nil {
-			return err
+		// pread, not seek-then-read.  Readers of the live tail hold only
+		// a shared lock (issue #50), so two of them can be here at once;
+		// a seek followed by a read is two syscalls sharing one file
+		// offset, and interleaved they hand each reader the other's
+		// bytes.  ReadAt takes the offset as an argument and touches no
+		// shared state.
+		//
+		// Nor does this open the file: Open mutates b.File, which is not
+		// safe under a shared lock either.  A nil File means the store
+		// is closed, which checkOpen reports before any read gets here.
+		if b.File == nil {
+			return fmt.Errorf("%s is not open", b.Filename)
 		}
-		// Question: Why not call File.ReadAt and avoid the call to Seek and
-		// avoid clobbering the file offset?
-		if _, err = b.File.Seek(int64(offset), io.SeekStart); err != nil {
-			return err
-		}
-		if _, err = b.File.Read(data); err != nil {
+		if _, err = b.File.ReadAt(data, int64(offset)); err != nil {
 			return err
 		}
 	case DataLastOffset > b.EOB+b.EOD:

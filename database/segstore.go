@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Sealed segments as storage.
@@ -266,7 +267,20 @@ func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
 // A key/value store built from sealed segments and a live tail.
 // Methods are safe for concurrent use.
 type SegmentStore struct {
-	Mutex     sync.Mutex
+	// Mutex guards the store.  Writers -- anything that appends to the
+	// live tail, seals, compacts, merges, imports, or closes -- take it
+	// exclusively.  Readers take it SHARED: a sealed segment is
+	// immutable and the pool hands out descriptors for pread, so
+	// lookups against sealed data need no lock at all; the shared lock
+	// exists only to keep the live map and the segment list stable
+	// while a reader is looking at them.
+	//
+	// It was an exclusive mutex for reads too, and that serialised
+	// every read in the process on one lock whose hold time grew with
+	// the segment walk.  Measured on an 8-node Accumulate network at
+	// 500 tx/s: the busiest node ran at ~110% CPU -- one core, seven
+	// idle -- while block time climbed from 3.0 s to 5.2 s (issue #50).
+	Mutex     sync.RWMutex
 	Directory string
 	Mutable   bool // Mutable: newer segments shadow older; immutable: conflicts error
 
@@ -404,7 +418,7 @@ type SegmentStore struct {
 	// (attachCold).  A filter loaded from disk was saved complete.
 	keysLackCold bool
 
-	stats StoreStats // Counted under the Mutex, like everything else here
+	stats storeCounters // Atomic: the read path holds only a shared lock
 }
 
 // coldStore
@@ -470,12 +484,31 @@ type StoreStats struct {
 	LiveHit      uint64 // Answered from the live tail, before any filter
 }
 
+// storeCounters is StoreStats as the store keeps it: atomics, because
+// the counters on the read path are bumped under a SHARED lock, and a
+// plain increment there is a data race.
+type storeCounters struct {
+	putTotal, putNew, putDuplicate, putConflict           atomic.Uint64
+	lookupTotal, filterAbsent, filterWalked, filterMisled atomic.Uint64
+	liveHit                                               atomic.Uint64
+}
+
 // Stats
-// A snapshot of the store's counters.
+// A snapshot of the store's counters.  Taken without any lock: each
+// counter is read atomically, and a snapshot that straddles a
+// concurrent operation is off by one, which is what a counter is for.
 func (s *SegmentStore) Stats() StoreStats {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.stats
+	return StoreStats{
+		PutTotal:     s.stats.putTotal.Load(),
+		PutNew:       s.stats.putNew.Load(),
+		PutDuplicate: s.stats.putDuplicate.Load(),
+		PutConflict:  s.stats.putConflict.Load(),
+		LookupTotal:  s.stats.lookupTotal.Load(),
+		FilterAbsent: s.stats.filterAbsent.Load(),
+		FilterWalked: s.stats.filterWalked.Load(),
+		FilterMisled: s.stats.filterMisled.Load(),
+		LiveHit:      s.stats.liveHit.Load(),
+	}
 }
 
 // NewSegmentStore
@@ -1105,8 +1138,8 @@ func (s *SegmentStore) checkOpen() error {
 // Return the value for a key.  Checks the live tail, then the sealed
 // segments newest to oldest.
 func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
 	return s.get(key)
 }
 
@@ -1115,23 +1148,23 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 	if err = s.checkOpen(); err != nil {
 		return nil, err
 	}
-	s.stats.LookupTotal++
+	s.stats.lookupTotal.Add(1)
 	if dbb, ok := s.live[key]; ok {
 		value = make([]byte, dbb.Length)
 		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
 			return nil, err
 		}
-		s.stats.LiveHit++
+		s.stats.liveHit.Add(1)
 		return value, nil
 	}
 	// One probe settles the common case.  The filter covers every key
 	// in the store, so a "no" here is definitive and the walk below --
 	// which is what grows with the seal count -- is skipped entirely.
 	if s.keys != nil && !s.keys.Test(key) {
-		s.stats.FilterAbsent++
+		s.stats.filterAbsent.Add(1)
 		return nil, errNotFound
 	}
-	s.stats.FilterWalked++
+	s.stats.filterWalked.Add(1)
 	for i := len(s.segments) - 1; i >= 0; i-- { // Newest segment wins
 		dbb, found, err := s.segments[i].lookup(key)
 		if err != nil {
@@ -1151,7 +1184,7 @@ func (s *SegmentStore) get(key [32]byte) (value []byte, err error) {
 		}
 	}
 	if s.keys != nil {
-		s.stats.FilterMisled++ // The walk was the filter's fault
+		s.stats.filterMisled.Add(1) // The walk was the filter's fault
 	}
 	return nil, errNotFound
 }
@@ -1173,18 +1206,18 @@ func (s *SegmentStore) put(key [32]byte, value []byte) (err error) {
 	if err = s.checkOpen(); err != nil {
 		return err
 	}
-	s.stats.PutTotal++
+	s.stats.putTotal.Add(1)
 	if !s.Mutable {
 		if existing, err := s.get(key); err == nil {
 			if bytes.Equal(existing, value) {
-				s.stats.PutDuplicate++
+				s.stats.putDuplicate.Add(1)
 				return nil // Same value: no-op
 			}
-			s.stats.PutConflict++
+			s.stats.putConflict.Add(1)
 			return ErrImmutable
 		}
 	}
-	s.stats.PutNew++
+	s.stats.putNew.Add(1)
 	return s.writeRecord(key, value)
 }
 
@@ -1239,30 +1272,30 @@ func (s *SegmentStore) PutIfAbsent(key [32]byte, value []byte) (existing []byte,
 	if err = s.checkOpen(); err != nil {
 		return nil, false, err
 	}
-	s.stats.PutTotal++
+	s.stats.putTotal.Add(1)
 	switch existing, err = s.get(key); {
 	case err == nil:
 		// Split the two ways a key can already be here, because they
 		// mean opposite things: an identical rewrite is a write this
 		// check avoided, a differing one is a write it caught.
 		if bytes.Equal(existing, value) {
-			s.stats.PutDuplicate++
+			s.stats.putDuplicate.Add(1)
 		} else {
-			s.stats.PutConflict++
+			s.stats.putConflict.Add(1)
 		}
 		return existing, true, nil
 	case !errors.Is(err, errNotFound):
 		return nil, false, err
 	}
-	s.stats.PutNew++
+	s.stats.putNew.Add(1)
 	return nil, false, s.writeRecord(key, value)
 }
 
 // LiveCount
 // The number of keys in the live tail (not yet sealed)
 func (s *SegmentStore) LiveCount() int {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
 	return len(s.live)
 }
 
@@ -1272,8 +1305,8 @@ func (s *SegmentStore) LiveCount() int {
 // records: this, not LiveCount, is what bounds the tail's size on disk
 // and its replay cost on open.
 func (s *SegmentStore) LiveRecords() uint64 {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
 	return s.liveRecords
 }
 
@@ -1336,8 +1369,8 @@ func (s *SegmentStore) endIterate() {
 // not need this, but one resuming after a crash does -- the block it
 // was about to seal may already be sealed and recorded.
 func (s *SegmentStore) BlockHeight() uint64 {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
 	return s.blockHeight
 }
 

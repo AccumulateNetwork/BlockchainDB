@@ -42,7 +42,7 @@ const DynaDirName = "dyna"
 // key/values are kept in one store.
 
 type KV2 struct {
-	Mutex     sync.Mutex    // Serializes access; KV2 methods are safe for concurrent use
+	Mutex     sync.RWMutex  // Writers exclusive, readers shared; KV2 methods are safe for concurrent use
 	Directory string        // Directory where the PermKV and DynaKV directories are
 	PermKV    *SegmentStore // The Perm layer: sealed, immutable segments
 	DynaKV    *SegmentStore // The Dyna layer: sealed, mutable segments
@@ -159,8 +159,8 @@ func (k *KV2) Close() error {
 // GetDyna
 // Get a k/v from the DynaKV db.  Doesn't check the PermKV.
 func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
 
 	if value, err = k.DynaKV.Get(key); err != nil { // Not in DynaKV, then return whatever
 		return nil, err
@@ -171,8 +171,8 @@ func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
 // GetPerm
 // Get a k/v from the PermKV db.  Doesn't check the DynaKV.
 func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
 
 	if value, err = k.PermKV.Get(key); err != nil { // Not in PermKV, then return whatever
 		return nil, err
@@ -183,8 +183,8 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 // Get
 // Get a value from the KV2.  Checks the DynaKV first, then the PermKV
 func (k *KV2) Get(key [32]byte) (value []byte, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
 
 	// Check and see if this is a key that has been changed
 	if value, err = k.DynaKV.Get(key); err == nil { // Not in DynaKV, then return whatever
