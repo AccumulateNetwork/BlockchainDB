@@ -222,11 +222,19 @@ sitting on disk — failed **twice in fifty-five runs**. A pre-merge run
 sees green and merges it. Repetition is what finds that class of bug,
 and repetition is too slow to gate a push.
 
-The suite is slow enough (~27 minutes, ~20 with `-short`) that this
-split is a necessity rather than a preference. Most of that time is
-fsync: a block boundary seals all 512 shards, and a shard with no
-writes still pays two fsyncs for a manifest it did not change. That is
-issues #32 and #33; if they are fixed, the gate can be simpler.
+The suite is slow enough locally (~27 minutes, 21m17s with `-short`)
+that this split is a necessity rather than a preference. Most of that
+time is fsync: a block boundary seals all 512 shards, and a shard with
+no writes still pays two fsyncs for a manifest it did not change. That
+is issues #32 and #33.
+
+A GitHub runner ran the same `-short` suite in **3m4s**. The gap is
+worth understanding rather than celebrating: the work is 93% fsync wait
+(38s user and 52s system out of the local 21 minutes), and a runner's
+virtual disk acknowledges an fsync far faster than a physical one
+honouring a cache flush. **The local number is the one that describes a
+real node**, and it is what #32 and #33 are measured against. A green
+CI run says the code is correct, not that the fsync cost is acceptable.
 
 ## Conclusion
 
