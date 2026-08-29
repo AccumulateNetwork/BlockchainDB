@@ -60,22 +60,29 @@ import (
 
 const (
 	// DefaultFilterBlocks is the roll period N for a store that is not
-	// told otherwise: a fresh filter every 1,000 blocks, so the live
-	// pair covers 1,000 to 2,000 blocks -- a quarter to half an hour of
-	// chain at a block a second.
+	// told otherwise: a fresh filter every 128 blocks, so the live pair
+	// covers 128 to 256 blocks -- two to four minutes of chain at a
+	// block a second.
 	//
 	// The window is the reach of the immutability check (lookup), so N
 	// trades that reach against two bounded costs: what the two filters
 	// hold, at ~1.5 bytes a key for the keys of 2N blocks, and what a
 	// reopen after a crash rescans, the index of every segment inside
 	// the window at 48 bytes a key.  At 5,000 entries a block that is
-	// 15 MB a filter and a rescan of 480 MB; at 100 entries a block, the
-	// 4 KB floor per filter and 10 MB.  1,000 is fifty times the healing
-	// floor MinFilterBlocks sets and well past any finalisation
-	// watermark that packs segments into sets, so the window reaches
-	// every write a node makes on its own behalf and none it asks for
-	// by API.
-	DefaultFilterBlocks = 1_000
+	// ~1.9 MB a filter and a rescan of ~61 MB; at 100 entries a block,
+	// the 4 KB floor per filter and ~1.2 MB.
+	//
+	// What the window has to reach is short.  Healing writes reach back
+	// several blocks (MinFilterBlocks is the floor for that), and replay
+	// after a crash re-applies the last committed block or two.  It
+	// does NOT need to reach the packed block sets: those carry a
+	// filter of their own, and a hit is followed into them.  128 is
+	// twice the merge lag Accumulate's adapter runs with, so every write
+	// still sitting in a per-block segment is inside the window, and
+	// anything beyond a few hundred blocks would buy nothing but a
+	// larger rescan.  It was 1,000 at first, chosen as a cautious
+	// bound; the repository owner set it to 128.
+	DefaultFilterBlocks = 128
 
 	// MinFilterBlocks is the smallest roll period a store accepts.
 	// Healing writes reach back over several blocks, and a window that

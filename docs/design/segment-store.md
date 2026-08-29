@@ -399,7 +399,7 @@ just before the next, so what is resident is the keys of the last N to
 2N blocks and never more. A filter that completes its span is dropped:
 the block sets its blocks were packed into carry a filter of their own,
 so writing it out would duplicate one. N is `FilterBlocks`, persisted
-in each layer's manifest, `DefaultFilterBlocks` (1,000) unless
+in each layer's manifest, `DefaultFilterBlocks` (128) unless
 `SetFilterBlocks` says otherwise, and refused below `MinFilterBlocks`
 (20) — the floor healing sets, since healing writes reach back several
 blocks. A manifest without it is refused rather than defaulted.

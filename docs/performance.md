@@ -62,7 +62,7 @@ key count flat while the tail grew without bound.
 ### Filter Window
 
 `SetFilterBlocks(n)` on a `KVShard` or `KV2` sets N, the roll period of
-the Perm layer's key filter (default `DefaultFilterBlocks`, 1,000;
+the Perm layer's key filter (default `DefaultFilterBlocks`, 128;
 minimum `MinFilterBlocks`, 20).  A fresh filter starts every N blocks
 and covers 2N, so two are live at once and the store holds the keys of
 the last N to 2N blocks in memory -- and no more, whatever the chain's
