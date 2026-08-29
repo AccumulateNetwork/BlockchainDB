@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,6 +53,8 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 			return nil, err
 		}
 	}
+	kVShard.useSharedBlockRecord()
+	kVShard.adoptBlockHeight()
 
 	return kVShard, nil
 }
@@ -77,6 +80,7 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 			return nil, err
 		}
 	}
+	kvs.useSharedBlockRecord()
 
 	return kvs, nil
 }
@@ -165,10 +169,106 @@ func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
 	return value, nil
 }
 
+// blockFileName is the shard set's record of which block its shards
+// are accumulating into
+const blockFileName = "block.json"
+
+// blockRecord is what that file holds
+type blockRecord struct {
+	// BlockHeight is the block the shards accumulate into next: the
+	// height above the last one sealed
+	BlockHeight uint64 `json:"blockHeight"`
+}
+
+// readBlockHeight
+// The block the shard set was last known to be accumulating into.  A
+// missing file reads as 0, which constrains nothing -- so a database
+// written before this file existed opens unchanged.
+func (k *KVShard) readBlockHeight() uint64 {
+	data, err := os.ReadFile(filepath.Join(k.Directory, blockFileName))
+	if err != nil {
+		return 0
+	}
+	var rec blockRecord
+	if err = json.Unmarshal(data, &rec); err != nil {
+		return 0
+	}
+	return rec.BlockHeight
+}
+
+// writeBlockHeight
+// Record, once for the whole shard set, the block its shards now
+// accumulate into.
+//
+// This is the whole point of the exercise.  Every shard used to
+// persist this number itself, and a shard with no writes in a block
+// still committed a manifest to do it: two fsyncs, ~11 ms, for a value
+// identical across all 512 shards.  That was the dominant cost of a
+// block boundary -- ~5.6 seconds of pure device wait before any shard
+// with actual data did any work (issue #32).
+func (k *KVShard) writeBlockHeight(height uint64) (err error) {
+	data, err := json.Marshal(blockRecord{BlockHeight: height})
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(k.Directory, blockFileName+segTmpSuffix)
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, filepath.Join(k.Directory, blockFileName)); err != nil {
+		return err
+	}
+	return syncDir(k.Directory)
+}
+
+// adoptBlockHeight
+// Tell every shard the block the set is accumulating into, so a shard
+// that sealed nothing for a long time still tags its next auto-seal
+// with the block it belongs to
+func (k *KVShard) adoptBlockHeight() {
+	height := k.readBlockHeight()
+	if height == 0 {
+		return
+	}
+	for _, shard := range k.Shards {
+		if shard != nil && shard.PermKV != nil {
+			shard.PermKV.AdvanceBlock(height)
+		}
+	}
+}
+
+// useSharedBlockRecord marks every shard's Perm layer as having its
+// block height recorded by the set rather than by itself
+func (k *KVShard) useSharedBlockRecord() {
+	for _, shard := range k.Shards {
+		if shard != nil && shard.PermKV != nil {
+			shard.PermKV.ExternalBlockRecord = true
+		}
+	}
+}
+
 // SealBlock
 // Seal every shard's Perm layer at a block height.  This is the
 // durability point for permanent data and the boundary a peer syncs;
 // ExportBlock calls it as its first step.
+//
+// The block the shards move on to is recorded once, for the set, after
+// they are all sealed -- so a shard with nothing to seal costs nothing
+// rather than a manifest commit of its own (issue #32).  It is written
+// before this returns, and so before any write belonging to the next
+// block, which is what a shard needs it for.
 func (k *KVShard) SealBlock(height uint64) (err error) {
 	for i, shard := range k.Shards {
 		if err = shard.Open(); err != nil {
@@ -178,7 +278,7 @@ func (k *KVShard) SealBlock(height uint64) (err error) {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
 	}
-	return nil
+	return k.writeBlockHeight(height + 1)
 }
 
 // Compress

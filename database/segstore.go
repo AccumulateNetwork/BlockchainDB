@@ -245,6 +245,23 @@ type SegmentStore struct {
 	// they actually belong to rather than allocating one of their own.
 	blockHeight uint64
 
+	// ExternalBlockRecord says something outside this store persists
+	// blockHeight, so a block boundary with nothing to seal need not
+	// commit a manifest just to record it.
+	//
+	// It exists because that commit was the dominant cost of a block.
+	// A boundary seals every shard, most shards take no writes in any
+	// given block, and each of those was paying two fsyncs -- ~11 ms --
+	// to persist a number identical across all 512 of them.  KVShard
+	// writes it once for the whole set instead (issue #32).
+	//
+	// It must not be set by a store whose block height nothing else
+	// records.  Losing blockHeight is not harmless: SealNext tags an
+	// auto-sealed segment with it, so a stale value labels a segment
+	// with a block it does not belong to, and ExportBlock -- which
+	// selects by block -- would then never export those records.
+	ExternalBlockRecord bool
+
 	segments    []*segment           // Sealed segments, oldest first
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
@@ -1144,6 +1161,22 @@ func (s *SegmentStore) BlockHeight() uint64 {
 	return s.blockHeight
 }
 
+// AdvanceBlock
+// Raise the block the live tail is accumulating into, without sealing
+// anything and without writing a manifest.
+//
+// This is how a store with ExternalBlockRecord learns, on open, the
+// block that the shard set recorded on its behalf.  It only ever
+// raises: a store that has sealed past the recorded block knows better
+// than the record does.
+func (s *SegmentStore) AdvanceBlock(height uint64) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if s.blockHeight < height {
+		s.blockHeight = height
+	}
+}
+
 // Sync
 // Make the live tail durable without sealing it: flush the buffer and
 // fsync the file, so every record written so far survives a power loss.
@@ -1234,6 +1267,9 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		// the next writes belong to the block after this one
 		if blockBoundary && s.blockHeight <= height {
 			s.blockHeight = height + 1
+			if s.ExternalBlockRecord {
+				return meta, nil // Recorded once for the whole shard set
+			}
 			return meta, s.writeManifest()
 		}
 		return meta, nil

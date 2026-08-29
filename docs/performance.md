@@ -103,10 +103,13 @@ Two consequences worth knowing:
   between 250 and 2,000 sealed segments; the manifest rewrite that
   grows with the segment count added about 2 ms across that range,
   against ~24 ms of barriers.
-- **A block boundary seals every shard**, and a shard with no writes
-  still commits a manifest -- two more barriers, ~11 ms, for a shard
-  that changed nothing. At 512 shards that is the dominant cost of a
-  block (issue #32).
+- **A block boundary seals every shard**, but a shard with no writes
+  now costs nothing.  It used to commit a manifest purely to record
+  the block it had moved on to -- two barriers, ~11 ms, for a number
+  identical across all 512 shards -- which made an otherwise idle
+  block cost seconds.  `KVShard` records that number once for the set
+  instead.  Measured over 512 shards with one shard writing:
+  **5,789 ms per block to 34 ms** (issue #32).
 
 ## Performance Optimization Strategies
 

@@ -244,3 +244,75 @@ func TestSegmentImmutableConflict(t *testing.T) {
 func TestSegmentBlockDirName(t *testing.T) {
 	assert.Equal(t, "block-00000007", fmt.Sprintf("block-%08d", 7))
 }
+
+// TestQuietShardKeepsItsBlockAcrossAReopen
+// A block boundary seals every shard, and most shards take no writes in
+// any given block.  Each of those used to commit a manifest purely to
+// record the block it had moved on to -- two fsyncs for a number
+// identical across all 512 shards, which was the dominant cost of a
+// block (issue #32).
+//
+// The set records it once instead.  What must survive is the reason
+// each shard held it in the first place: SealNext tags an auto-sealed
+// segment with the store's block height, so a shard that comes back
+// from a restart believing it is in an older block labels its next
+// segment with a block it does not belong to -- and ExportBlock,
+// which selects by block, would never export those records.
+func TestQuietShardKeepsItsBlockAcrossAReopen(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	exportDir := filepath.Join(os.TempDir(), t.Name()+"_export")
+	for _, d := range []string{dir, exportDir} {
+		os.RemoveAll(d)
+		defer os.RemoveAll(d)
+	}
+
+	const busy, quiet = 3, 7
+	node, err := NewKVShard(dir, 2) // Tiny, so the quiet shard auto-seals as soon as it writes
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{95})
+	vr := NewFastRandom([]byte{95, 95})
+
+	// Blocks 1..4: only the busy shard writes.  The quiet shard seals
+	// nothing, so nothing of its own records the block it is in.
+	var prev *Manifest
+	for h := uint64(1); h <= 4; h++ {
+		require.NoError(t, node.PutPerm(keyForShard(kr, busy), vr.RandBuff(20, 100)))
+		prev, err = node.ExportBlock(exportDir, h, prev)
+		require.NoError(t, err)
+	}
+	// Reopen WITHOUT closing: a crash, not a clean shutdown.  Close
+	// would hide this -- it writes a manifest per shard on the bloom
+	// save path, and that carries blockHeight to disk for every shard
+	// whether or not the shard sealed anything.
+	reopened, err := OpenKVShard(dir)
+	require.NoError(t, err)
+
+	// Now the quiet shard finally takes writes, in block 5, and its
+	// tiny seal limit makes it auto-seal before the boundary
+	keys := make([][32]byte, 6)
+	for i := range keys {
+		keys[i] = keyForShard(kr, quiet)
+		require.NoError(t, reopened.PutPerm(keys[i], vr.RandBuff(20, 100)))
+	}
+	segs := reopened.Shards[quiet].PermKV.segments
+	require.NotEmpty(t, segs, "the quiet shard must have auto-sealed for this to test anything")
+	for _, seg := range segs {
+		assert.GreaterOrEqualf(t, seg.meta.Height, uint64(5),
+			"an auto-seal after the reopen was tagged with block %d, but the set is in block 5",
+			seg.meta.Height)
+	}
+
+	// And the records reach a peer: block 5 must carry them
+	m5, err := reopened.ExportBlock(exportDir, 5, prev)
+	require.NoError(t, err)
+	exported := 0
+	for _, s := range m5.Segments {
+		if s.Shard == quiet {
+			exported += int(s.Count)
+		}
+	}
+	assert.Equal(t, len(keys), exported, "block 5 must export every record the quiet shard wrote")
+	require.NoError(t, reopened.Close())
+	require.NoError(t, node.Close())
+}
