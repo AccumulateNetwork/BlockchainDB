@@ -86,10 +86,30 @@ memory.
 ### Block Cadence
 
 `SealBlock(height)` is the durability point for permanent data and the
-boundary a peer syncs.  Sealing is where the Perm layer's time goes --
-about 60% of it at a 25,000-key block, most of that the SHA-256
-read-back of the segment just written.  Sealing more often costs more
-of that; sealing less often makes blocks coarser for peers.
+boundary a peer syncs.  Sealing more often costs more of what follows;
+sealing less often makes blocks coarser for peers.
+
+What a seal costs is **fsync**, not computation.  Measured on a
+consumer NVMe, a seal of a one-record tail takes ~24.6 ms, essentially
+all of it device wait: four barriers at roughly 5.5 ms each.  Those
+four are the data file's contents, the index's contents, the
+manifest's contents, and one fsync of the directory that covers all
+three renames.  It was six until the three separate directory fsyncs
+were collapsed into one (issue #33).
+
+Two consequences worth knowing:
+
+- **Seal cost is flat in database size.** It did not change measurably
+  between 250 and 2,000 sealed segments; the manifest rewrite that
+  grows with the segment count added about 2 ms across that range,
+  against ~24 ms of barriers.
+- **A block boundary seals every shard**, but a shard with no writes
+  now costs nothing.  It used to commit a manifest purely to record
+  the block it had moved on to -- two barriers, ~11 ms, for a number
+  identical across all 512 shards -- which made an otherwise idle
+  block cost seconds.  `KVShard` records that number once for the set
+  instead.  Measured over 512 shards with one shard writing:
+  **5,789 ms per block to 34 ms** (issue #32).
 
 ## Performance Optimization Strategies
 

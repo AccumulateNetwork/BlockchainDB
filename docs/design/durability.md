@@ -79,9 +79,9 @@ store has already closed is an error.
 
 ## How the windows are covered
 
-Every multi-step rewrite follows write-new → fsync → atomic rename →
-fsync directory, so the old state survives until the new state is
-durable:
+Every multi-step rewrite follows write-new → fsync → atomic rename, and
+the operation ends with **one** fsync of the directory, so the old
+state survives until the new state is durable:
 
 | operation | mechanism |
 |---|---|
@@ -93,6 +93,8 @@ durable:
 | stale tmp files | removed on open; a `.tmp` file is by construction always incomplete |
 | torn live-tail record | the live tail is replayed record by record on open; a record whose value bytes run past end-of-data is dropped **and the file is truncated to the last complete record**, so the next append lands on a record boundary |
 | live file with no header | `seal` creates the new `live.dat` and leaves its 24-byte header in the `BFile` buffer, so a crash before the first flush leaves the file at 0 bytes; open rewrites the header rather than trusting it to be there |
+| the block a shard is in | recorded once for the whole shard set (`block.json`, one fsync), not once per shard.  A shard with no writes advances in memory and commits nothing.  On open the set tells every shard the block it is in, which is what a shard needs it for: `SealNext` tags an auto-sealed segment with its block height, so a shard that came back believing it was in an older block would label segments with a block they do not belong to and `ExportBlock`, which selects by block, would never export them.  A missing file reads as 0 and constrains nothing, so an existing database opens unchanged (issue #32) |
+| one barrier per operation | a seal renames up to three files into the same directory -- the sealed data file, its index, then the manifest -- and fsyncs that directory once, at the manifest commit. One directory fsync commits every name change made in it, and the renames are issued in order, so the manifest can never become durable ahead of the data file it names. Each file's own fsync is still taken before its rename: that is what makes a published name always point at durable contents. Six barriers a seal became four, measured 36 ms to 24.6 ms (issue #33) |
 | operations on a closed store | `Close` drops the sealed segment list but keeps the live map, so reads and writes refuse with `errStoreClosed` rather than running against half a store |
 
 ## Recovery by replay
