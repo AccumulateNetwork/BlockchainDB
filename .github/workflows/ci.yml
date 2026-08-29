@@ -1,0 +1,98 @@
+# What runs on every push and pull request.
+#
+# Split by cost, so a mistake that a compiler or vet catches reports in
+# a minute rather than behind a twenty-minute suite.  The full suite and
+# the full race build are in nightly.yml: they are too slow to gate a
+# push, and the failures they catch are mostly intermittent, which a
+# nightly run over a week finds better than any single pre-merge run.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.22.1" # Matches go.mod
+
+jobs:
+  build:
+    name: Build, vet, and format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      # Vet catches the class of mistake that a split or a rebase
+      # introduces -- an unused import, a shadowed error, a Printf that
+      # does not match its arguments -- and costs seconds
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    # Measured 21m17s here with -short, of which 38s is user time and
+    # 52s system: ~93% is waiting on fsync, not computing (issues #32,
+    # #33).  So a slower runner disk hurts and more cores do not help.
+    # Allow generously more before calling it hung.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # -short skips the measurement tests (TestMultiCoreScaling,
+      # TestSyncCost, TestDynaCost), which report numbers rather than
+      # assert behaviour and are worth nothing on a shared runner whose
+      # disk is somebody else's too.  Every correctness test still runs.
+      #
+      # It saves ~6 of the 27 minutes; the rest is correctness tests
+      # that are slow for the reasons #32 and #33 describe, not for
+      # anything -short can skip.
+      - name: Test
+        run: go test -short -timeout 55m ./...
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The tests that actually exercise concurrency: the sharded write
+      # path, the shared file pool, and iteration running alongside a
+      # compaction.  The whole suite under -race is a nightly job --
+      # here the point is fast feedback on the code where a data race
+      # is plausible.
+      - name: Test with -race
+        run: |
+          go test -short -race -timeout 25m ./database/ \
+            -run 'Concurrent|FileCache|SegmentFDs|ForEach|ShardWriter|MultiCore'
