@@ -33,6 +33,30 @@ func ShardIndex(key []byte) int {
 type KVShard struct {
 	Directory string
 	Shards    [NumShards]*KV2
+
+	// Sets holds the finalized Perm data that has left the shards: one
+	// block-set file per completed set of blocks, packed from every
+	// shard's merged segment (blockset.go).  Each shard's Perm layer
+	// consults it for keys its own segments no longer hold.
+	Sets *SetStore
+}
+
+// setDir is where the block-set files live
+func (k *KVShard) setDir() string {
+	return filepath.Join(k.Directory, setDirName)
+}
+
+// attachSets points every shard's Perm layer at the set store
+func (k *KVShard) attachSets() (err error) {
+	for i, shard := range k.Shards {
+		if shard == nil || shard.PermKV == nil {
+			continue
+		}
+		if err = shard.PermKV.attachCold(shardSets{k.Sets, i}); err != nil {
+			return fmt.Errorf("shard %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 func (k *KVShard) ShardDir(index int) string {
@@ -56,6 +80,22 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 	kVShard.useSharedBlockRecord()
 	if err = kVShard.adoptBlockHeight(); err != nil {
 		return nil, err
+	}
+	if kVShard.Sets, err = OpenSetStore(kVShard.setDir()); err != nil {
+		return nil, err
+	}
+	if err = kVShard.attachSets(); err != nil {
+		return nil, err
+	}
+	// A shard still naming segments a committed set already holds was
+	// interrupted between the set's commit and its own next manifest;
+	// drop them again, and that next manifest retires them
+	if newest, ok := kVShard.Sets.Newest(); ok {
+		for i, shard := range kVShard.Shards {
+			if _, err = shard.PermKV.DropBelow(newest.Last + 1); err != nil {
+				return nil, fmt.Errorf("shard %d: %w", i, err)
+			}
+		}
 	}
 
 	return kVShard, nil
@@ -83,6 +123,12 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 		}
 	}
 	kvs.useSharedBlockRecord()
+	if kvs.Sets, err = NewSetStore(kvs.setDir()); err != nil {
+		return nil, err
+	}
+	if err = kvs.attachSets(); err != nil {
+		return nil, err
+	}
 
 	return kvs, nil
 }
@@ -341,6 +387,73 @@ func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
 		}
 	}
 	return mergedShards, err
+}
+
+// PackFinalized
+// Pack every shard's Perm segments below a block height into one
+// block-set file, then drop those segments from their shards.  Reports
+// whether anything was packed.  This is the second stage of
+// finalization; MergeFinalized is the first, and this expects to find
+// its output -- one segment per shard -- though it copes with more.
+//
+// The file count is the reason.  The first stage leaves one segment per
+// shard per set, which at 512 shards is still 1,024 files a set; this
+// leaves one file a set, outside any shard, and a lookup that reaches
+// it costs a bloom probe, one read of the shard's index slice, and one
+// read of the value (blockset.go).
+//
+// The set's commit is the rename of its file.  Nothing is dropped from
+// a shard before that, so a crash during the build leaves a .tmp that
+// the next open deletes and every shard as it was.  Dropping after it
+// writes no manifest: the shard's next seal records the drop and only
+// then deletes the files, so a crash in between costs the space of the
+// segments until that seal (DropBelow).
+//
+// Not safe to run concurrently with MergeFinalized at the same
+// watermark: the merge retires the segments this is copying.  Drive
+// both from one scheduler, in order.
+func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err error) {
+	if newest, ok := k.Sets.Newest(); ok && height <= newest.Last+1 {
+		return meta, false, nil // Everything below is already packed
+	}
+	shards := make([][]*segment, NumShards)
+	last, any := uint64(0), false
+	for i, shard := range k.Shards {
+		if err = shard.Open(); err != nil {
+			return meta, false, fmt.Errorf("shard %d: %w", i, err)
+		}
+		if shards[i], err = shard.PermKV.segmentsBelow(height); err != nil {
+			return meta, false, fmt.Errorf("shard %d: %w", i, err)
+		}
+		for _, seg := range shards[i] {
+			if h := seg.meta.Height; !any || h > last {
+				last = h
+			}
+			any = true
+		}
+	}
+	if !any {
+		return meta, false, nil
+	}
+	// A set covers every block since the previous set, and the first
+	// set covers every block there has been.  The segments cannot say
+	// which those are: a merged segment carries the height of the
+	// newest block it holds, not the oldest.
+	first := uint64(0)
+	if newest, ok := k.Sets.Newest(); ok {
+		first = newest.Last + 1
+	}
+	set, err := k.Sets.build(first, last, shards)
+	if err != nil {
+		return meta, false, err
+	}
+	// Committed.  The shards can stop serving what the set now holds.
+	for i, shard := range k.Shards {
+		if _, dropErr := shard.PermKV.DropBelow(height); dropErr != nil && err == nil {
+			err = fmt.Errorf("shard %d: %w", i, dropErr)
+		}
+	}
+	return set.meta, true, err
 }
 
 // Compress

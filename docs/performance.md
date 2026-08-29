@@ -64,19 +64,47 @@ target the pool returns to rather than a ceiling at every instant.
 
 ### Finalisation Watermark
 
-`KVShard.MergeFinalized(height)` merges each shard's sealed Perm
-segments below a block height into one.  Sealing produces a segment per
-shard per block, so without this the file count grows with the chain
-and nothing bounds it: measured at 512 shards and 5,000 entries a
-block, ~1,016 files per block, which is ~88M a day at one block per
-second against 240M inodes.  Merging a completed 20-block set took
-17,960 files to 1,024.
+Finalisation is two stages, both driven by the caller from its own
+scheduler, both below a watermark `height` that must sit behind
+whatever window may still be written to -- healing, in Accumulate's
+case -- because segments at or above it are left alone so that block
+export keeps working.
 
-Set `height` behind whatever window may still be written to -- healing,
-in Accumulate's case -- because segments at or above it are left alone
-so that block export keeps working.  Run it from your own scheduler,
-concurrently across shards: one set measured 12.2 s serially, against
-20 seconds of chain time.
+1. `KVShard.MergeFinalized(height)` merges each shard's sealed Perm
+   segments below the watermark into one.  Sealing produces a segment
+   per shard per block, so without this the file count grows with the
+   chain and nothing bounds it: measured at 512 shards and 5,000
+   entries a block, ~1,016 files per block, ~88M a day at one block per
+   second against 240M inodes.  A completed 20-block set goes from
+   17,960 files to 1,024.
+
+   The merge copies bodies and shifts index entries; no value is read
+   individually.  Its cost is fsync -- four barriers per shard -- so
+   run it **concurrently across shards**: the same 20-block set of
+   2,000 entries a block measured 12.1 s serially and 1.3 s with
+   16 goroutines, against 20 seconds of chain time.
+
+2. `KVShard.PackFinalized(height)` packs every shard's merged segment
+   for the set into **one block-set file** under `<db>/sets/`, then
+   drops those segments from the shards.  The 1,024 files become 1.
+   Measured on the same set: ~30 ms, one file of 7.6 MB for 40,000
+   keys.
+
+   The drop writes no manifest.  Each shard records it at its next
+   seal, and only then deletes the files, so the pack costs two
+   barriers in all rather than two per shard.  Until a shard next
+   seals -- or closes -- its packed files linger on disk, harmlessly:
+   a shard that takes no writes for a long time keeps them that long.
+
+A lookup that reaches a set costs a bloom probe, one read of the
+shard's index slice, and one read of the value; a key the shard's own
+filter says is absent never reaches the sets.  Measured over the packed
+20-block set: 2.5 µs per hit from the page cache, and 0.45 µs per
+absent key.  Memory
+per set is 16 KB of directory plus a bloom at ~1.5 bytes a key.
+
+Run stage two after stage one for the same watermark, never
+concurrently with it: the merge retires the files the pack is copying.
 
 ### Compaction Ratio
 

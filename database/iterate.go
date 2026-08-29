@@ -41,6 +41,7 @@ import (
 func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err error) {
 	s.Mutex.Lock()
 	segs, live, err := s.beginIterate()
+	cold := s.cold
 	s.Mutex.Unlock()
 	if err != nil {
 		return err
@@ -64,6 +65,18 @@ func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err e
 		if err = forEachInSegment(segs[i], buff, batch, seen, fn); err != nil {
 			return err
 		}
+	}
+	// Then what has left the segments for a block set.  The set list is
+	// append-only, so this is a snapshot too; a key that a set and a
+	// not-yet-retired segment both hold is emitted once.
+	if cold != nil {
+		return cold.forEach(func(key [32]byte, value []byte) error {
+			if _, ok := seen[key]; ok {
+				return nil
+			}
+			seen[key] = struct{}{}
+			return fn(key, value)
+		})
 	}
 	return nil
 }
