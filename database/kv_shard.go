@@ -196,12 +196,17 @@ func (k *KVShard) Compress() (err error) {
 }
 
 // Close
-// Close all the shards
+// Close every shard, and report the first failure.
+//
+// Every shard, even after one fails.  Close is the durability point
+// that flushes and fsyncs each shard's buffered live tail, so stopping
+// at the first error abandoned the tail of every shard after it -- 511
+// of them, in the worst case, for one bad shard (issue #38).
 func (k *KVShard) Close() (err error) {
-	for _, kvs := range k.Shards {
-		if err = kvs.Close(); err != nil {
-			return err
+	for i, kvs := range k.Shards {
+		if closeErr := kvs.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("shard %d: %w", i, closeErr)
 		}
 	}
-	return nil
+	return err
 }
