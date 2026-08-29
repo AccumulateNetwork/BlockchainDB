@@ -13,7 +13,10 @@ the trade-offs behind them.
 2. **Reads are bounded by segment count, not key count.**  A lookup
    checks the live tail, then each sealed segment newest to oldest.
    Every segment carries a Bloom filter sized from its own key count,
-   so a segment that does not hold the key is rejected from memory.
+   so a segment that does not hold the key is rejected from memory --
+   and a pair of store-level filters over the last N to 2N blocks
+   settles every segment inside that window with one probe, so a write
+   (which asks whether its key is new) does not pay per segment.
 
 3. **Sync is a file copy.**  Sealed segments are the storage format
    *and* the transport format, so adopting a peer's segment is a copy
@@ -55,6 +58,35 @@ The Perm layer seals on distinct keys; the Dyna layer seals on
 *physical records*, because a mutable layer leaves one record per
 write and a handful of hot keys rewritten every block would hold the
 key count flat while the tail grew without bound.
+
+### Filter Window
+
+`SetFilterBlocks(n)` on a `KVShard` or `KV2` sets N, the roll period of
+the Perm layer's key filter (default `DefaultFilterBlocks`, 128;
+minimum `MinFilterBlocks`, 20).  A fresh filter starts every N blocks
+and covers 2N, so two are live at once and the store holds the keys of
+the last N to 2N blocks in memory -- and no more, whatever the chain's
+length.  It is persisted in each shard's manifest; set it when the
+database is created, since changing it commits a manifest per shard.
+
+N is the reach of the immutability check: a permanent key written in
+the last N to 2N blocks cannot be overwritten; older history is not
+consulted on write (see [Segments as storage](design/segment-store.md)).
+It also sets two bounded costs, at ~1.5 bytes a key for the keys of 2N
+blocks resident, and the index of every segment inside the window
+rescanned on a reopen after a crash (48 bytes a key).  Measured at 1M
+keys:
+
+| | store-level filter bytes | crash reopen | absent-key `Get` |
+|---|---|---|---|
+| whole-history filter (before) | 7.45 MB, growing without bound | rescans every segment: 33 ms at 200, 96 ms at 2,000 | 430 ns |
+| N=20 | 615 KB, flat | 40 blocks: 10 ms | 8 µs (walks 180 uncovered segments) |
+| N=100 | 0.9 MB at steady state | 200 blocks: 31 ms | 4.7 µs |
+
+A `Get` for a key the store does not hold anywhere probes every packed
+set's filter after the window says no: 19-48 ns per set, so ~45 µs at
+1,000 sets.  Merging sets into larger ones (issue #47) is what bounds
+that.
 
 ### Open File Limit
 
@@ -226,20 +258,29 @@ go test -load ./database/
 
 ### Issue: Slow open
 
-**Possible cause:** a large unsealed live tail, which is replayed
-record by record on open.
+**Possible causes:**
+- A large unsealed live tail, which is replayed record by record on
+  open
+- A reopen after a crash, which rebuilds the key filters from the
+  index of every segment inside the filter window
 
-**Solution:** lower `sealLimit`, or seal on a block boundary, so the
-tail stays bounded.
+**Solutions:**
+- Lower `sealLimit`, or seal on a block boundary, so the tail stays
+  bounded
+- Lower the filter window (`SetFilterBlocks`) if crash reopens are
+  slow; a clean close saves the filters and loads them in milliseconds
 
 ### Issue: High memory usage
 
 **Possible causes:**
 - A large live tail: every unsealed record is tracked in a map
-- Bloom filters, which are sized from each segment's key count
+- Bloom filters, which are sized from each segment's key count, plus
+  the two rolling key filters sized for the keys of 2N blocks, plus one
+  filter per packed set at ~1.5 bytes a key
 
 **Solutions:**
 - Lower `sealLimit`
+- Lower the filter window (`SetFilterBlocks`)
 - Reduce `BufferSize` if memory is severely constrained
 
 ### Issue: Slow write performance

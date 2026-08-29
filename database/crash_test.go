@@ -287,10 +287,10 @@ func crashDiagnose(kv *KV2, dir string, i int, key [32]byte) string {
 		s := l.store
 		s.Mutex.Lock()
 		_, inLive := s.live[key]
-		inFilter := s.keys == nil || s.keys.Test(key)
-		fmt.Fprintf(&b, "%s: %d segments, live keys %d, records %d, blockHeight %d, filter=%v inLive=%v filterSays=%v\n",
+		inFilter := s.filterTest(key)
+		fmt.Fprintf(&b, "%s: %d segments, live keys %d, records %d, blockHeight %d, filters=%d inLive=%v filterSays=%v\n",
 			l.name, len(s.segments), len(s.live), s.liveRecords, s.blockHeight,
-			s.keys != nil, inLive, inFilter)
+			len(s.filters), inLive, inFilter)
 		for _, seg := range s.segments {
 			dbb, found, err := seg.lookup(key)
 			mark := ""

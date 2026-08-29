@@ -50,6 +50,20 @@ func TestManifestVersionIsWrittenAndChecked(t *testing.T) {
 		require.Errorf(t, err, "format version %d must be refused", v)
 		assert.Containsf(t, err.Error(), "format version", "the error must say what is wrong: %v", err)
 	}
+
+	// A manifest of the right version that lacks a field the version
+	// requires is refused too, not defaulted: the key filter's roll
+	// period is the reach of the immutability check, and a store that
+	// opened with a guessed one would keep a different promise than the
+	// one it was created with
+	m.Version = StoreFormatVersion
+	m.FilterBlocks = 0
+	out, err := json.MarshalIndent(&m, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, out, 0644))
+	_, err = OpenSegmentStore(dir)
+	require.Error(t, err, "a manifest with no filter window must be refused")
+	assert.Contains(t, err.Error(), "filter window")
 }
 
 // TestSegmentHeaderVersionsAreChecked
