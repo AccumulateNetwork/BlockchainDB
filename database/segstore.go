@@ -101,6 +101,18 @@ type StoreManifest struct {
 	BlockHeight uint64        `json:"blockHeight"` // Block currently being accumulated
 	Segments    []SegmentMeta `json:"segments"`    // Oldest first
 
+	// Shadowed carries the store's estimate of how many of its records
+	// a later write has superseded -- its garbage -- across a restart.
+	//
+	// Without it a reopened store believed it held none, whatever it
+	// actually held, and deferred reclaiming until it had accumulated a
+	// threshold fraction of the whole layer again in fresh overwrites
+	// (issue #40).  It is written whenever the manifest is, so a crash
+	// costs the writes since the last seal, import, or compaction: an
+	// under-estimate, which defers compaction rather than forcing a
+	// pointless one.
+	Shadowed uint64 `json:"shadowed,omitempty"`
+
 	// BloomValid says the persisted key filter (bloom.dat) covers
 	// exactly the sealed segments listed here; BloomHeight/BloomSeq name
 	// the newest of them and BloomSegments counts them.
@@ -274,11 +286,11 @@ type SegmentStore struct {
 	// slightly early.  Nil filter means no estimate, and the caller
 	// falls back to compacting unconditionally.
 	//
-	// It is process state: not persisted, and not reconstructed by
-	// load, so a reopened store believes it holds no garbage until it
-	// accumulates more.  That defers reclamation rather than losing
-	// anything, and it is the trade the threshold makes -- compacting
-	// unconditionally had no such state to lose (issue #40).
+	// It survives a restart: the manifest carries it, so a reopened
+	// store resumes its estimate rather than believing it holds no
+	// garbage at all (issue #40).  What a crash costs is the writes
+	// since the last manifest -- an under-estimate, which defers a
+	// compaction rather than forcing a pointless one.
 	shadowed uint64
 
 	// keys is a membership filter over everything the store holds --
@@ -459,6 +471,7 @@ func (s *SegmentStore) load() (err error) {
 	s.Mutable = m.Mutable
 	s.SealLimit = m.SealLimit
 	s.blockHeight = m.BlockHeight
+	s.shadowed = m.Shadowed
 
 	for _, meta := range m.Segments {
 		seg, err := s.openSegment(meta)
@@ -816,7 +829,7 @@ func (s *SegmentStore) writeManifest() (err error) {
 
 	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
 		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq,
-		BloomSegments: s.bloomSegments}
+		BloomSegments: s.bloomSegments, Shadowed: s.shadowed}
 	for _, seg := range s.segments {
 		m.Segments = append(m.Segments, seg.meta)
 	}

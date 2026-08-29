@@ -72,6 +72,11 @@ waiting for a fixed *fraction* makes the amortised cost per overwrite
 constant instead. Raise it to compact less often and hold more
 garbage; lower it for the reverse.
 
+The estimate behind it is maintained as writes arrive -- a probe of the
+store's own key filter, so deciding costs nothing -- and is carried in
+the manifest, so a reopened store resumes it rather than believing it
+holds no garbage.
+
 ### Buffer Size
 
 The `BufferSize` constant (default: 32KB) is the buffer `BFile` uses

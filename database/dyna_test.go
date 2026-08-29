@@ -302,3 +302,58 @@ func copyFile(t *testing.T, src, dst string) {
 	require.NoError(t, err)
 	require.NoError(t, out.Sync())
 }
+
+// TestCompressEstimateSurvivesReopen
+// The estimate that decides whether Compress is worth running is
+// maintained as writes arrive.  It used to be process state, so a
+// reopened store believed it held no garbage whatever it actually
+// held, and would not compact until it had accumulated a threshold
+// fraction of the whole layer again in fresh overwrites (issue #40).
+func TestCompressEstimateSurvivesReopen(t *testing.T) {
+	dir := storeDir(t, "kv2")
+	kv2, err := NewKV2(dir, 1000)
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{204})
+	vr := NewFastRandom([]byte{204, 204})
+	keys := make([][32]byte, 40)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		_, err = kv2.PutDyna(keys[i], vr.RandBuff(20, 100))
+		require.NoError(t, err)
+	}
+	// Overwrite every one of them, so most of the layer is garbage
+	values := make([][]byte, len(keys))
+	for round := 0; round < 3; round++ {
+		for i := range keys {
+			values[i] = vr.RandBuff(20, 100)
+			_, err = kv2.PutDyna(keys[i], values[i])
+			require.NoError(t, err)
+		}
+	}
+
+	// Seal, so the estimate reaches the manifest, then reopen
+	_, err = kv2.DynaKV.SealNext()
+	require.NoError(t, err)
+	before := kv2.DynaKV.shadowed
+	require.Greater(t, before, uint64(0), "the writes must have been counted as superseded")
+	require.NoError(t, kv2.Close())
+
+	reopened, err := OpenKV2(dir)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Open())
+	assert.Equal(t, before, reopened.DynaKV.shadowed,
+		"the reopened store must know the garbage it holds")
+
+	// And it acts on it: a Compress right after reopening compacts,
+	// rather than waiting to re-accumulate the same garbage
+	require.NoError(t, reopened.Compress())
+	assert.Len(t, reopened.DynaKV.segments, 1, "a reopened store must still compact what it holds")
+
+	for i, key := range keys {
+		v, err := reopened.Get(key)
+		require.NoErrorf(t, err, "key %d", i)
+		assert.Equal(t, values[i], v)
+	}
+	require.NoError(t, reopened.Close())
+}
