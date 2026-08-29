@@ -54,7 +54,9 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 		}
 	}
 	kVShard.useSharedBlockRecord()
-	kVShard.adoptBlockHeight()
+	if err = kVShard.adoptBlockHeight(); err != nil {
+		return nil, err
+	}
 
 	return kVShard, nil
 }
@@ -175,25 +177,39 @@ const blockFileName = "block.json"
 
 // blockRecord is what that file holds
 type blockRecord struct {
+	// Version is the on-disk format; see StoreFormatVersion
+	Version uint32 `json:"version"`
+
 	// BlockHeight is the block the shards accumulate into next: the
 	// height above the last one sealed
 	BlockHeight uint64 `json:"blockHeight"`
 }
 
 // readBlockHeight
-// The block the shard set was last known to be accumulating into.  A
-// missing file reads as 0, which constrains nothing -- so a database
-// written before this file existed opens unchanged.
-func (k *KVShard) readBlockHeight() uint64 {
+// The block the shard set was last known to be accumulating into.
+//
+// A MISSING file is not an error: a set that has never sealed a block
+// has none, and 0 constrains nothing.  A file that is present and
+// unreadable is: it is the only record of which block the quiet shards
+// are in, and guessing 0 there would let them tag segments with a
+// block they do not belong to.
+func (k *KVShard) readBlockHeight() (uint64, error) {
 	data, err := os.ReadFile(filepath.Join(k.Directory, blockFileName))
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	var rec blockRecord
 	if err = json.Unmarshal(data, &rec); err != nil {
-		return 0
+		return 0, fmt.Errorf("%s: %w", blockFileName, err)
 	}
-	return rec.BlockHeight
+	if rec.Version != StoreFormatVersion {
+		return 0, fmt.Errorf("%s is on-disk format version %d; this build reads version %d",
+			filepath.Join(k.Directory, blockFileName), rec.Version, StoreFormatVersion)
+	}
+	return rec.BlockHeight, nil
 }
 
 // writeBlockHeight
@@ -207,7 +223,7 @@ func (k *KVShard) readBlockHeight() uint64 {
 // block boundary -- ~5.6 seconds of pure device wait before any shard
 // with actual data did any work (issue #32).
 func (k *KVShard) writeBlockHeight(height uint64) (err error) {
-	data, err := json.Marshal(blockRecord{BlockHeight: height})
+	data, err := json.Marshal(blockRecord{Version: StoreFormatVersion, BlockHeight: height})
 	if err != nil {
 		return err
 	}
@@ -237,16 +253,20 @@ func (k *KVShard) writeBlockHeight(height uint64) (err error) {
 // Tell every shard the block the set is accumulating into, so a shard
 // that sealed nothing for a long time still tags its next auto-seal
 // with the block it belongs to
-func (k *KVShard) adoptBlockHeight() {
-	height := k.readBlockHeight()
+func (k *KVShard) adoptBlockHeight() error {
+	height, err := k.readBlockHeight()
+	if err != nil {
+		return err
+	}
 	if height == 0 {
-		return
+		return nil
 	}
 	for _, shard := range k.Shards {
 		if shard != nil && shard.PermKV != nil {
 			shard.PermKV.AdvanceBlock(height)
 		}
 	}
+	return nil
 }
 
 // useSharedBlockRecord marks every shard's Perm layer as having its
