@@ -53,10 +53,16 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
-    # Measured 21m17s here with -short, of which 38s is user time and
-    # 52s system: ~93% is waiting on fsync, not computing (issues #32,
-    # #33).  So a slower runner disk hurts and more cores do not help.
-    # Allow generously more before calling it hung.
+    # This job measured 3m4s on a GitHub runner, against 21m17s for the
+    # same -short suite on the developer machine it was written on.
+    # The suite is almost entirely fsync wait (38s user, 52s system out
+    # of those 21 minutes), and a runner's virtual disk acknowledges an
+    # fsync far faster than a physical one honouring a cache flush.
+    #
+    # Do not read the 3 minutes as "the suite is fast".  The number
+    # that describes a real node is the local one, which is what
+    # issues #32 and #33 are measured against.  The timeout below is
+    # generous because a busy runner is not a fast one.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -70,9 +76,9 @@ jobs:
       # assert behaviour and are worth nothing on a shared runner whose
       # disk is somebody else's too.  Every correctness test still runs.
       #
-      # It saves ~6 of the 27 minutes; the rest is correctness tests
-      # that are slow for the reasons #32 and #33 describe, not for
-      # anything -short can skip.
+      # It saves ~6 of the 27 minutes locally; the rest is correctness
+      # tests that are slow for the reasons #32 and #33 describe, not
+      # for anything -short can skip.
       - name: Test
         run: go test -short -timeout 55m ./...
 
