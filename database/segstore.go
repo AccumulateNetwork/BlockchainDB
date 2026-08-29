@@ -1569,74 +1569,24 @@ func (s *SegmentStore) CompactNext() (meta SegmentMeta, err error) {
 	return s.compact(s.blockHeight)
 }
 
-// compact is Compact; the caller must hold the Mutex
-func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
-	if err = s.checkOpen(); err != nil {
-		return meta, err
-	}
-	if len(s.segments) == 0 {
-		return meta, nil
-	}
-	seq, err := s.nextKeyAt(height)
-	if err != nil {
-		return meta, err
-	}
-	if s.blockHeight < height {
-		s.blockHeight = height
-	}
-
-	// Newest wins: walk segments newest to oldest, keeping the first
-	// value seen for each key
-	type liveVal struct {
-		seg *segment
-		dbb *DBBKey
-	}
-	winners := make(map[[32]byte]liveVal)
-	for i := len(s.segments) - 1; i >= 0; i-- {
-		seg := s.segments[i]
-		entries := make([]byte, seg.count*DBKeyFullSize)
-		index, release, err := seg.index()
-		if err != nil {
-			return meta, err
-		}
-		_, err = index.ReadAt(entries, segIndexHdrSize)
-		release()
-		if err != nil {
-			return meta, err
-		}
-		for pos := 0; pos+DBKeyFullSize <= len(entries); pos += DBKeyFullSize {
-			key, dbb, err := GetDBBKey(entries[pos : pos+DBKeyFullSize])
-			if err != nil {
-				return meta, err
-			}
-			if _, seen := winners[key]; !seen {
-				winners[key] = liveVal{seg, dbb}
-			}
-		}
-	}
-
-	// A single generation holding one record per key has nothing to
-	// reclaim: rewriting it would copy every value to produce the same
-	// file.  The Dyna layer compacts on a write count, so it lands here
-	// whenever a compaction has already run since the last seal.  The
-	// meta returned is the standing generation's, at its own height --
-	// not the height asked for, since no segment was written.
-	if len(s.segments) == 1 && int64(len(winners)) == s.segments[0].records {
-		return s.segments[0].meta, nil
-	}
-
-	keys := make([][32]byte, 0, len(winners))
-	for key := range winners {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-
+// writeMergedSegment
+// Write the resolved keys and values of a merge into a new sealed
+// segment at (height, seq), build its index, and open it.  The caller
+// must hold the Mutex and is responsible for committing it into the
+// segment list.
+//
+// The segment is complete and durable when this returns; it is simply
+// not yet named by the manifest, which is what makes the commit that
+// follows the only thing that decides whether the merge happened.
+func (s *SegmentStore) writeMergedSegment(
+	winners map[[32]byte]mergeInput, keys [][32]byte, height, seq uint64,
+) (meta SegmentMeta, merged *segment, err error) {
 	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 	tmpPath := filepath.Join(s.Directory, segCompactName+segTmpSuffix)
 	f, err := os.Create(tmpPath)
 	if err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 	defer func() {
 		if f != nil {
@@ -1657,7 +1607,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
 	if _, err = out.Write(header[:]); err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 
 	// Record where each value lands, so the index needs no read-back
@@ -1669,37 +1619,37 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 		w := winners[key]
 		value, err := w.seg.value(w.dbb)
 		if err != nil {
-			return meta, err
+			return meta, nil, err
 		}
 		copy(recHdr[:32], key[:])
 		binary.BigEndian.PutUint64(recHdr[32:], uint64(len(value)))
 		if _, err = out.Write(recHdr[:]); err != nil {
-			return meta, err
+			return meta, nil, err
 		}
 		if _, err = out.Write(value); err != nil {
-			return meta, err
+			return meta, nil, err
 		}
 		entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
 		offset += segRecHdrSize + uint64(len(value))
 	}
 	if err = bw.Flush(); err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 	if err = f.Sync(); err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 	if err = f.Close(); err != nil {
 		f = nil
-		return meta, err
+		return meta, nil, err
 	}
 	f = nil
 	if err = os.Rename(tmpPath, dataPath); err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if err = writeIndexFile(indexPath, keys, entries); err != nil {
-		return meta, err
+		return meta, nil, err
 	}
 
 	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(keys)), Hash: ""}
@@ -1707,6 +1657,187 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
 	seg, err := s.openSegment(meta)
+	if err != nil {
+		return meta, nil, err
+	}
+	return meta, seg, nil
+}
+
+// MergeBelow
+// Merge every sealed segment belonging to a block below `height` into
+// one, leaving the rest untouched.  Reports whether it merged anything.
+//
+// This is tier one of keeping the file count survivable.  A block
+// boundary seals one segment per shard that took writes, so a shard
+// accumulates one file pair per block -- measured at ~1,016 files per
+// block across 512 shards at 5,000 entries a block, which is ~88M
+// files a day and exhausts a 240M-inode filesystem in under three days
+// (issue #47).  Merging a finished block set down to one segment per
+// shard cuts that by the number of blocks in the set.
+//
+// It merges WITHIN one store, never across shards.  That keeps the
+// working set small -- a shard holds a few hundred entries per set --
+// and keeps the merge under the shard's own lock, so shards merge
+// independently and in parallel.  Merging across shards is what
+// produces globally sorted runs, and it is a separate, rarer pass.
+//
+// `height` is the caller's finalisation watermark: the block below
+// which nothing more will arrive and nothing is still being healed.
+// Segments at or above it are left alone, so a block a peer might
+// still ask for by number is never merged away, and block export is
+// untouched.
+//
+// Crash safety follows the same rule as compaction.  The merged file
+// is written and renamed before the manifest names it, and it takes an
+// identity BELOW the newest segment, so a crash before the commit
+// leaves it as an orphan at or below the manifest's newest height --
+// which recoverOrphans deletes.  The originals are still named by the
+// manifest and are only retired after the commit succeeds, so the
+// discarded merge costs space and nothing else.
+func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err error) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	if err = s.checkOpen(); err != nil {
+		return meta, false, err
+	}
+
+	// Segments are oldest first, so the finalised ones are a prefix
+	n := 0
+	for _, seg := range s.segments {
+		if seg.meta.Height >= height {
+			break
+		}
+		n++
+	}
+	if n < 2 {
+		return meta, false, nil // Nothing to gain from merging one segment
+	}
+	run := s.segments[:n]
+
+	// The merged segment takes the sequence after the newest it
+	// replaces.  That is free and correctly ordered: everything merged
+	// is at or below (H, S), and the first segment left standing is in
+	// a block above H, because the run is exactly the segments below
+	// `height` and the remainder is exactly those at or above it.
+	last := run[n-1].meta
+	outHeight, outSeq := last.Height, last.Seq+1
+
+	winners, keys, err := s.mergeInputs(run)
+	if err != nil {
+		return meta, false, err
+	}
+
+	meta, seg, err := s.writeMergedSegment(winners, keys, outHeight, outSeq)
+	if err != nil {
+		return meta, false, err
+	}
+
+	// Commit: the manifest names the merged segment in place of the run
+	old := s.segments
+	s.segments = append([]*segment{seg}, old[n:]...)
+	if err = s.writeManifest(); err != nil {
+		s.segments = old // Uncommitted; the originals still stand
+		seg.close()
+		s.retire(seg.dataPath)
+		s.retire(seg.indexPath)
+		return meta, false, err
+	}
+
+	for _, o := range run {
+		o.close()
+		s.retire(o.dataPath)
+		s.retire(o.indexPath)
+	}
+	return meta, true, nil
+}
+
+// mergeInput names where a key's surviving value lives
+type mergeInput struct {
+	seg *segment
+	dbb *DBBKey
+}
+
+// mergeInputs
+// Resolve what a merge of segs should write: one entry per key, taking
+// the newest where a key appears more than once, and the keys sorted so
+// the output is a sorted run.
+//
+// Newest-wins matters even in the Perm layer, where a key is written
+// once and never overwritten: adopting a peer's segment can introduce a
+// second copy of a key the store already holds, because
+// checkNoConflicts rejects a DIFFERING value and permits an identical
+// one.  The copies agree, so which one survives does not matter -- but
+// the merge still has to emit only one.
+//
+// The caller must hold the Mutex.
+func (s *SegmentStore) mergeInputs(segs []*segment) (winners map[[32]byte]mergeInput, keys [][32]byte, err error) {
+	winners = make(map[[32]byte]mergeInput)
+	for i := len(segs) - 1; i >= 0; i-- { // Newest first, so it wins
+		seg := segs[i]
+		entries := make([]byte, seg.count*DBKeyFullSize)
+		index, release, err := seg.index()
+		if err != nil {
+			return nil, nil, err
+		}
+		_, err = index.ReadAt(entries, segIndexHdrSize)
+		release()
+		if err != nil {
+			return nil, nil, err
+		}
+		for pos := 0; pos+DBKeyFullSize <= len(entries); pos += DBKeyFullSize {
+			key, dbb, err := GetDBBKey(entries[pos : pos+DBKeyFullSize])
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, seen := winners[key]; !seen {
+				winners[key] = mergeInput{seg, dbb}
+			}
+		}
+	}
+	keys = make([][32]byte, 0, len(winners))
+	for key := range winners {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
+	return winners, keys, nil
+}
+
+// compact is Compact; the caller must hold the Mutex
+func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
+	if err = s.checkOpen(); err != nil {
+		return meta, err
+	}
+	if len(s.segments) == 0 {
+		return meta, nil
+	}
+	seq, err := s.nextKeyAt(height)
+	if err != nil {
+		return meta, err
+	}
+	if s.blockHeight < height {
+		s.blockHeight = height
+	}
+
+	// A single generation holding one record per key has nothing to
+	// reclaim: rewriting it would copy every value to produce the same
+	// file.  The Dyna layer compacts on a write count, so it lands here
+	// whenever a compaction has already run since the last seal.  The
+	// meta returned is the standing generation's, at its own height --
+	// not the height asked for, since no segment was written.
+	//
+	// count is the index's key count and records the data file's
+	// physical count, so their being equal is exactly "no key appears
+	// twice", which is what there would be to reclaim.
+	if len(s.segments) == 1 && s.segments[0].count == s.segments[0].records {
+		return s.segments[0].meta, nil
+	}
+
+	winners, keys, err := s.mergeInputs(s.segments)
+	if err != nil {
+		return meta, err
+	}
+
+	meta, seg, err := s.writeMergedSegment(winners, keys, height, seq)
 	if err != nil {
 		return meta, err
 	}

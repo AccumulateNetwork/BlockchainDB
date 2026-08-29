@@ -281,6 +281,48 @@ func (k *KVShard) SealBlock(height uint64) (err error) {
 	return k.writeBlockHeight(height + 1)
 }
 
+// MergeFinalized
+// Merge each shard's Perm segments below a block height into one, and
+// report how many shards merged anything.
+//
+// This is meant to be driven in the background, on a cadence the
+// caller chooses, and deliberately is not a goroutine this package
+// starts.  Only the caller knows its block rate and how far back
+// healing may still write, which is what sets the watermark; and a
+// background goroutine owned by the store would need a lifecycle,
+// somewhere to report errors, and a way to not be running during a
+// block boundary.  A method the caller calls from its own scheduler
+// has none of those problems and is testable besides.
+//
+// Shards merge independently -- each under its own lock, over its own
+// few hundred entries -- so this can be spread out or run
+// concurrently.  It walks them in order and keeps going past a failure
+// so that one bad shard does not stop the rest from being merged,
+// reporting the first error.
+func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
+	for i, shard := range k.Shards {
+		if shard == nil {
+			continue
+		}
+		if openErr := shard.Open(); openErr != nil {
+			if err == nil {
+				err = fmt.Errorf("shard %d: %w", i, openErr)
+			}
+			continue
+		}
+		_, merged, mergeErr := shard.MergeBelow(height)
+		switch {
+		case mergeErr != nil:
+			if err == nil {
+				err = fmt.Errorf("shard %d: %w", i, mergeErr)
+			}
+		case merged:
+			mergedShards++
+		}
+	}
+	return mergedShards, err
+}
+
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {

@@ -275,6 +275,20 @@ func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	return meta, err
 }
 
+// MergeBelow
+// Merge the Perm layer's sealed segments below a block height into one.
+// Reports whether anything was merged.
+//
+// Only the Perm layer.  The Dyna layer already has Compress, which
+// merges for a different reason -- to reclaim what overwriting left
+// behind -- and its segments are local, so their count is bounded by
+// how often it compacts rather than by the chain's length.
+func (k *KV2) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err error) {
+	k.Mutex.Lock()
+	defer k.Mutex.Unlock()
+	return k.PermKV.MergeBelow(height)
+}
+
 // Put
 // Returns the number of writes since the last compress, and an err if the put failed
 func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
