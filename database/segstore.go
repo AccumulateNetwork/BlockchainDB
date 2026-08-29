@@ -819,7 +819,22 @@ func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 
 // writeManifest
 // Replace the manifest atomically.  This is the commit point for
-// sealing, importing, and compaction.
+// sealing, importing, and compaction -- and the single durability
+// barrier for the whole operation.
+//
+// The directory fsync at the end is the only one any of those paths
+// performs.  Each of them renames files into this directory before
+// calling here -- the sealed data file, its index, then the manifest
+// itself -- and one fsync of a directory commits every name change
+// made in it, not just the last.  The renames are issued in order and
+// journal transactions commit in order, so the manifest can never
+// become durable ahead of the data file it names.
+//
+// What each file's own fsync still buys is different and still
+// required: it makes the file's CONTENTS durable before its name is
+// published, so a name that survives a crash never points at a file
+// that does not.  A seal was paying six barriers for that; three of
+// them were this directory, fsynced three times over (issue #33).
 func (s *SegmentStore) writeManifest() (err error) {
 	// The coverage claim is true only of the manifest written directly
 	// after the filter was saved.  Everything else that writes a
@@ -1341,9 +1356,9 @@ func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
 	if err = os.Rename(livePath, dataPath); err != nil {
 		return sl, err
 	}
-	if err = syncDir(s.Directory); err != nil {
-		return sl, err
-	}
+	// No directory fsync here: the manifest commit that ends this
+	// operation fsyncs the same directory, and that one barrier makes
+	// this rename durable too (see writeManifest)
 
 	// The rename moved no bytes, so the live tail's offsets are the
 	// sealed segment's offsets
@@ -1437,9 +1452,7 @@ func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
 	if err = os.Rename(tmpPath, dataPath); err != nil {
 		return sl, err
 	}
-	if err = syncDir(s.Directory); err != nil {
-		return sl, err
-	}
+	// The manifest commit's directory fsync covers this rename
 
 	// The old live file is superseded by the sealed segment
 	if s.liveFile.File != nil {
@@ -1647,9 +1660,7 @@ func (s *SegmentStore) compact(height uint64) (meta SegmentMeta, err error) {
 	if err = os.Rename(tmpPath, dataPath); err != nil {
 		return meta, err
 	}
-	if err = syncDir(s.Directory); err != nil {
-		return meta, err
-	}
+	// The manifest commit's directory fsync covers this rename
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if err = writeIndexFile(indexPath, keys, entries); err != nil {
 		return meta, err
@@ -1748,9 +1759,7 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	if err = os.Rename(tmpPath, dataPath); err != nil {
 		return err
 	}
-	if err = syncDir(s.Directory); err != nil {
-		return err
-	}
+	// The manifest commit at the end of the import covers this rename
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if err = buildIndexFor(dataPath, indexPath); err != nil {
 		return err
@@ -1991,10 +2000,11 @@ func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DB
 		return err
 	}
 	out = nil
-	if err = os.Rename(tmpPath, indexPath); err != nil {
-		return err
-	}
-	return syncDir(filepath.Dir(indexPath))
+	// No directory fsync: an index is derived data -- buildIndexFor
+	// reconstructs it from the .dat, which is what openSegment does
+	// when one is missing -- and the manifest commit that follows
+	// fsyncs this directory anyway
+	return os.Rename(tmpPath, indexPath)
 }
 
 // identify
