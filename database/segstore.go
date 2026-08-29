@@ -62,9 +62,23 @@ const (
 
 	segIndexMagic   = 0x53494458 // "SIDX"
 	segIndexVersion = 1
-	segIndexHdrSize = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
-	segDataHdrSize  = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
-	segRecHdrSize   = 40 // key(32) valueLen(8) precede each value in a .dat
+
+	// StoreFormatVersion is the on-disk layout this build reads and
+	// writes: the manifest's shape, the files beside it, and what the
+	// segment headers mean.
+	//
+	// The check on it is STRICT -- a store whose manifest carries any
+	// other version is refused, not opened and worked around.  There is
+	// no database in the wild predating this, so there is nothing to be
+	// compatible with, and a hard failure is worth more than a silent
+	// one: every field added to the manifest so far happens to have a
+	// zero value that degrades safely, but nothing enforced that and
+	// the next field need not be so lucky.  Refusing to open says so
+	// immediately, at the one moment a person can act on it.
+	StoreFormatVersion = 1
+	segIndexHdrSize    = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
+	segDataHdrSize     = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
+	segRecHdrSize      = 40 // key(32) valueLen(8) precede each value in a .dat
 )
 
 // SegmentMeta
@@ -96,6 +110,10 @@ func (a SegmentMeta) after(b SegmentMeta) bool {
 // The authoritative list of a store's sealed segments.  Replacing it
 // is the commit point for both sealing and compaction.
 type StoreManifest struct {
+	// Version is the on-disk format; see StoreFormatVersion.  It is
+	// first so that it is readable at the head of the file.
+	Version uint32 `json:"version"`
+
 	Mutable     bool          `json:"mutable"`
 	SealLimit   uint64        `json:"sealLimit"`   // 0: unset, caller decides
 	BlockHeight uint64        `json:"blockHeight"` // Block currently being accumulated
@@ -485,6 +503,11 @@ func (s *SegmentStore) load() (err error) {
 	if err != nil {
 		return err
 	}
+	if m.Version != StoreFormatVersion {
+		return fmt.Errorf(
+			"%s is on-disk format version %d; this build reads version %d",
+			s.Directory, m.Version, StoreFormatVersion)
+	}
 	s.Mutable = m.Mutable
 	s.SealLimit = m.SealLimit
 	s.blockHeight = m.BlockHeight
@@ -602,6 +625,36 @@ func (s *SegmentStore) addSegmentKeys(seg *segment) (err error) {
 	return nil
 }
 
+// checkSegmentHeader
+// Verify a segment data file's header.  Both fields were written from
+// the beginning and neither was ever read: openSegment took the record
+// count on trust, so a file that was not a segment at all -- or was one
+// written by a format this build does not understand -- was parsed as
+// though it were.
+func checkSegmentHeader(path string, hdr []byte) error {
+	if magic := binary.BigEndian.Uint32(hdr[:]); magic != segmentMagic {
+		return fmt.Errorf("%s is not a segment file (magic %#08x)", path, magic)
+	}
+	if v := binary.BigEndian.Uint32(hdr[4:]); v != segmentVersion {
+		return fmt.Errorf("%s is segment format version %d; this build reads version %d",
+			path, v, segmentVersion)
+	}
+	return nil
+}
+
+// checkIndexHeader is checkSegmentHeader for an index.  Its version was
+// likewise written and never read.
+func checkIndexHeader(path string, hdr []byte) error {
+	if magic := binary.BigEndian.Uint32(hdr[:]); magic != segIndexMagic {
+		return fmt.Errorf("%s is not a segment index (magic %#08x)", path, magic)
+	}
+	if v := binary.BigEndian.Uint32(hdr[4:]); v != segIndexVersion {
+		return fmt.Errorf("%s is index format version %d; this build reads version %d",
+			path, v, segIndexVersion)
+	}
+	return nil
+}
+
 // openSegment
 // Adopt a sealed segment: read what a lookup needs to keep in memory
 // -- the record count, the key count, and the bloom filter -- and give
@@ -619,6 +672,10 @@ func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 	}
 	var dataHdr [segDataHdrSize]byte
 	if _, err = data.ReadAt(dataHdr[:], 0); err != nil {
+		releaseData()
+		return nil, err
+	}
+	if err = checkSegmentHeader(dataPath, dataHdr[:]); err != nil {
 		releaseData()
 		return nil, err
 	}
@@ -643,9 +700,9 @@ func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 		seg.close()
 		return nil, err
 	}
-	if binary.BigEndian.Uint32(header[:]) != segIndexMagic {
+	if err = checkIndexHeader(indexPath, header[:]); err != nil {
 		seg.close()
-		return nil, fmt.Errorf("%s is not a segment index", indexPath)
+		return nil, err
 	}
 	seg.count = int64(binary.BigEndian.Uint64(header[8:]))
 	bloomBytes := binary.BigEndian.Uint64(header[16:])
@@ -859,7 +916,8 @@ func (s *SegmentStore) writeManifest() (err error) {
 	// segment set, so clearing it here means no path can forget to.
 	defer func() { s.bloomValid = false }()
 
-	m := StoreManifest{Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
+	m := StoreManifest{Version: StoreFormatVersion,
+		Mutable: s.Mutable, SealLimit: s.SealLimit, BlockHeight: s.blockHeight,
 		BloomValid: s.bloomValid, BloomHeight: s.bloomAt.Height, BloomSeq: s.bloomAt.Seq,
 		BloomSegments: s.bloomSegments, Shadowed: s.shadowed}
 	for _, seg := range s.segments {
@@ -2060,8 +2118,8 @@ func buildIndexFor(dataPath, indexPath string) (err error) {
 	if _, err = f.ReadAt(header[:], 0); err != nil {
 		return err
 	}
-	if binary.BigEndian.Uint32(header[:]) != segmentMagic {
-		return fmt.Errorf("%s is not a segment file", dataPath)
+	if err = checkSegmentHeader(dataPath, header[:]); err != nil {
+		return err
 	}
 	info, err := f.Stat()
 	if err != nil {
