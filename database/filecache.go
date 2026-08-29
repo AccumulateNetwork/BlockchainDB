@@ -69,15 +69,94 @@ type cachedFile struct {
 }
 
 func newFileCache(limit int) *fileCache {
-	if limit < 1 {
-		limit = 1
+	if limit < 0 {
+		limit = 0 // Cache nothing; every release closes
 	}
 	return &fileCache{limit: limit, open: make(map[string]*cachedFile), lru: list.New()}
 }
 
+// filePoolShards is how many independent caches the process-wide pool
+// is split into, by a hash of the path.
+//
+// One cache under one mutex was the read path's serialisation point
+// once the store's own lock went shared (issue #50): every lookup
+// borrows an index file and a data file, so every read took that mutex
+// twice, and a mutex profile at eight readers put 100% of the wait on
+// it -- acquire 69%, release 31%.  Sixty-four shards make the
+// contention per shard a sixty-fourth of what it was, and a path's
+// shard is fixed, so a file is only ever in one cache.
+//
+// Each shard enforces a sixty-fourth of the limit.  That is an
+// approximation of a global bound -- a skewed working set can hold one
+// shard at its limit while others sit empty -- but the limit was
+// always a target rather than a ceiling, and this keeps eviction a
+// per-shard decision that needs no cross-shard lock.
+const filePoolShards = 64
+
+// filePool is the process-wide pool: filePoolShards caches, each with
+// its own lock, LRU, and share of the limit.
+type filePool struct {
+	shards [filePoolShards]*fileCache
+}
+
+func newFilePool(limit int) *filePool {
+	p := &filePool{}
+	for i := range p.shards {
+		p.shards[i] = newFileCache(perShardLimit(limit))
+	}
+	return p
+}
+
+// perShardLimit divides the pool's limit among its shards.  A share of
+// zero is legitimate and means the shard caches nothing: a file it
+// hands out is closed as soon as its last borrow ends.  No floor is
+// needed to serve a file -- a file in use is never an eviction
+// candidate, whatever the limit -- and a floor of one would make the
+// pool's real minimum filePoolShards, not what the caller asked for.
+func perShardLimit(limit int) int {
+	if limit < 0 {
+		return 0
+	}
+	return limit / filePoolShards
+}
+
+// shard picks the cache for a path.  FNV-1a over the bytes: cheap, and
+// what matters is only that the same path always lands in the same
+// shard.
+func (p *filePool) shard(path string) *fileCache {
+	var h uint32 = 2166136261
+	for i := 0; i < len(path); i++ {
+		h ^= uint32(path[i])
+		h *= 16777619
+	}
+	return p.shards[h%filePoolShards]
+}
+
+func (p *filePool) acquire(path string) (*os.File, func(), error) {
+	return p.shard(path).acquire(path)
+}
+
+func (p *filePool) forget(path string) { p.shard(path).forget(path) }
+
+func (p *filePool) setLimit(limit int) {
+	for _, c := range p.shards {
+		c.setLimit(perShardLimit(limit))
+	}
+}
+
+// stats sums the shards.  Not a consistent snapshot -- each shard is
+// read under its own lock -- which is fine for what it is used for.
+func (p *filePool) stats() (open, idle, limit int) {
+	for _, c := range p.shards {
+		o, i, l := c.stats()
+		open, idle, limit = open+o, idle+i, limit+l
+	}
+	return open, idle, limit
+}
+
 // segmentFiles is the pool every store borrows from.  It is process
 // wide on purpose; see defaultOpenFiles.
-var segmentFiles = newFileCache(defaultOpenFiles)
+var segmentFiles = newFilePool(defaultOpenFiles)
 
 // SetOpenFileLimit
 // Bound how many segment files the process keeps open.  Files
@@ -90,8 +169,8 @@ func SetOpenFileLimit(limit int) {
 }
 
 func (c *fileCache) setLimit(limit int) {
-	if limit < 1 {
-		limit = 1
+	if limit < 0 {
+		limit = 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

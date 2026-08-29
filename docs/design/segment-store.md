@@ -382,6 +382,58 @@ keeps reading after the path is unlinked. A reader can therefore hold
 a segment open across a compaction that retires and deletes it, which
 is what lets iteration run without the store's lock.
 
+### Reads share the lock; the file pool is sharded
+
+Every read used to take the store's mutex exclusively, and `KV2.Get`
+took its own exclusively above that. Sealed segments are immutable and
+the pool hands out descriptors for `pread`, so a lookup against sealed
+data needs no lock at all; the exclusive one existed only by default.
+Measured on an 8-node Accumulate network at 500 tx/s: the busiest node
+ran at ~110% CPU — one core, seven idle — while every shard's reads
+queued on that lock and its hold time grew with the segment walk
+(issue #50).
+
+Readers now take both locks shared. Writers — anything that appends,
+seals, compacts, merges, imports, or closes — still take them
+exclusively, so a reader never sees the live map or the segment list
+mid-change. Three things had to follow:
+
+- **The counters are atomic.** A plain increment under a shared lock
+  is a data race.
+- **The live tail is read with `pread`.** `BFile.ReadAt` was seek then
+  read: two syscalls sharing one file offset, which interleaved between
+  two readers hand each the other's bytes.
+- **The file pool is sharded 64 ways** by a hash of the path. Once the
+  store lock went shared, a mutex profile at eight readers put 100% of
+  the remaining wait on the pool's single mutex — every lookup borrows
+  an index file and a data file through it. Each shard enforces a
+  sixty-fourth of the limit; a share of zero means the shard caches
+  nothing, which is what a very small limit should mean.
+
+Measured, one store with 1,000 sealed segments and 100,000 keys, random
+`Get` from N goroutines:
+
+| readers | exclusive lock | shared lock, one pool | shared lock, sharded pool |
+|---|---|---|---|
+| 1 | 107,000/s | 120,000/s | 112,000/s |
+| 2 | 50,000/s | 207,000/s | 205,000/s |
+| 4 | 50,000/s | 142,000/s | 392,000/s |
+| 8 | 53,000/s | 125,000/s | 668,000/s |
+| 16 | 48,000/s | 131,000/s | **976,000/s** |
+
+The first column is the finding: under the exclusive lock, adding a
+second reader *halved* throughput and it never recovered — a lock
+convoy. The middle column shows the store lock was only the first wall.
+
+Two deterministic tests pin the property rather than the timing: hold
+the lock shared from outside and call `Get`; under an exclusive lock it
+blocks forever, so the harness timeout is the failure.
+
+What remains on the read path is the walk itself: at 1,000 segments a
+hit probes 1,000 per-segment blooms (`Bloom.Test` was 25% of CPU in the
+profile). That is the segment count, which block-set packing collapses
+— a packed set is one bloom, not one per block.
+
 ### Iteration takes a snapshot and holds no lock
 
 `ForEach` used to hold the store's mutex for the whole iteration, so a
