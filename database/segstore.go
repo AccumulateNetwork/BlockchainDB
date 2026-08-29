@@ -664,6 +664,13 @@ func checkIndexHeader(path string, hdr []byte) error {
 func (s *SegmentStore) openSegment(meta SegmentMeta) (seg *segment, err error) {
 	dataPath := filepath.Join(s.Directory, meta.File)
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	return s.openSegmentAt(meta, dataPath, indexPath)
+}
+
+// openSegmentAt is openSegment for a segment whose files are not yet at
+// the names the manifest will know them by -- an import being checked
+// before it is allowed into place.
+func (s *SegmentStore) openSegmentAt(meta SegmentMeta, dataPath, indexPath string) (seg *segment, err error) {
 	seg = &segment{meta: meta, dataPath: dataPath, indexPath: indexPath}
 
 	data, releaseData, err := seg.data()
@@ -1975,31 +1982,47 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 		return err
 	}
 
+	// Build and check the incoming segment under TEMPORARY names, and
+	// only rename it into place once it has been accepted.
+	//
+	// The obvious order -- put it in place, then check, then undo if the
+	// check fails -- cannot be made safe.  The undo is two os.Remove
+	// calls with no barrier behind them, so a crash in that window
+	// leaves the file on disk; and recoverOrphans cannot tell it apart
+	// from an interrupted seal, because it IS a complete, correctly
+	// hashed segment above the newest height.  It was rejected for
+	// conflicting with local data, not for being malformed.  So the next
+	// open adopted the very segment the import refused, and
+	// checkNoConflicts never ran again (issue #45).
+	//
+	// Checking first removes the undo instead of making it durable.  A
+	// crash before the rename leaves *.tmp files, which recoverOrphans
+	// deletes unconditionally.
 	dataName := segmentFileName(meta.Height, meta.Seq)
 	dataPath := filepath.Join(s.Directory, dataName)
-	tmpPath := dataPath + segTmpSuffix
-	if err = copyFileSynced(path, tmpPath); err != nil {
-		return err
-	}
-	if err = os.Rename(tmpPath, dataPath); err != nil {
-		return err
-	}
-	// The manifest commit at the end of the import covers this rename
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = buildIndexFor(dataPath, indexPath); err != nil {
+	tmpData := dataPath + segTmpSuffix
+	tmpIndex := indexPath + segTmpSuffix
+	if err = copyFileSynced(path, tmpData); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil { // Rejected or failed: leave nothing behind
+			os.Remove(tmpData)
+			os.Remove(tmpIndex)
+		}
+	}()
+	if err = buildIndexFor(tmpData, tmpIndex); err != nil {
 		return err
 	}
 
 	meta.File = dataName
-	seg, err := s.openSegment(meta)
+	seg, err := s.openSegmentAt(meta, tmpData, tmpIndex)
 	if err != nil {
 		return err
 	}
 	meta.Count = uint64(seg.count)
 	seg.meta = meta
-	if s.blockHeight < meta.Height {
-		s.blockHeight = meta.Height
-	}
 
 	// An immutable store must not silently shadow a value it already
 	// holds: that is a divergence, not an update.  Checking is cheap
@@ -2009,10 +2032,23 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	if !s.Mutable {
 		if err = s.checkNoConflicts(seg); err != nil {
 			seg.close()
-			os.Remove(dataPath)
-			os.Remove(indexPath)
 			return err
 		}
+	}
+
+	// Accepted.  Publish the names, and point the segment at them; its
+	// contents and index are unchanged, so nothing needs re-reading.
+	seg.close() // Release the pool's handles on the temporary names
+	if err = os.Rename(tmpData, dataPath); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpIndex, indexPath); err != nil {
+		return err
+	}
+	// The manifest commit at the end of the import covers both renames
+	seg.dataPath, seg.indexPath = dataPath, indexPath
+	if s.blockHeight < meta.Height {
+		s.blockHeight = meta.Height
 	}
 
 	s.segments = append(s.segments, seg)
