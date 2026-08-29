@@ -311,3 +311,74 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 		len(all), block, sets-1, len(reopened.segments))
 	require.NoError(t, reopened.Close())
 }
+
+// TestRejectedImportIsNotAdoptedAfterACrash
+// Rejecting a peer's conflicting segment used to be undone by two
+// os.Remove calls with no barrier behind them.  A crash in that window
+// left the file on disk, and recoverOrphans could not tell it apart
+// from an interrupted seal -- it IS a complete, correctly hashed
+// segment above the newest height; it was refused for conflicting with
+// local data, not for being malformed.  So the next open adopted the
+// segment whose import had been refused, and the conflict check never
+// ran again (issue #45).
+//
+// The crash is simulated the only way it can be without killing a
+// process: the import is rejected, and then the store is reopened
+// WITHOUT closing, so recovery runs against whatever the rejection
+// left on disk.
+func TestRejectedImportIsNotAdoptedAfterACrash(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	os.RemoveAll(dir)
+	defer os.RemoveAll(dir)
+	require.NoError(t, os.MkdirAll(dir, os.ModePerm))
+
+	// A peer's segment holding one key
+	srcDir := filepath.Join(dir, "peer")
+	src, err := NewSegmentStore(srcDir, false)
+	require.NoError(t, err)
+	key := NewFastRandom([]byte{64}).NextHash()
+	require.NoError(t, src.Put(key, []byte("the peer's value")))
+	meta, err := src.Seal(1)
+	require.NoError(t, err)
+	metas, paths := src.SegmentPaths()
+	require.Len(t, metas, 1)
+	segPath := paths[0]
+
+	// A local store holding the SAME key with a DIFFERENT value: the
+	// divergence the check exists to catch
+	dstDir := filepath.Join(dir, "local")
+	dst, err := NewSegmentStore(dstDir, false)
+	require.NoError(t, err)
+	require.NoError(t, dst.Put(key, []byte("the local value")))
+	// Durable, but not sealed: the local key stays in the live tail, so
+	// the peer's segment is still above the newest and the import is
+	// refused for CONFLICTING rather than for being out of order
+	require.NoError(t, dst.Sync())
+
+	err = dst.ImportSegmentFile(segPath, metas[0])
+	require.Error(t, err, "a conflicting segment must be refused")
+	require.Empty(t, dst.segments, "nothing may be adopted by a refused import")
+
+	// Reopen without closing: recovery sees whatever the refusal left
+	reopened, err := OpenSegmentStore(dstDir)
+	require.NoError(t, err)
+	assert.Empty(t, reopened.segments,
+		"recovery adopted the segment whose import was refused")
+
+	v, err := reopened.Get(key)
+	require.NoError(t, err)
+	assert.Equal(t, "the local value", string(v),
+		"the local value must stand; the peer's was rejected")
+
+	// Nothing of the refused import may be left on disk
+	entries, err := os.ReadDir(dstDir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotEqualf(t, meta.File, e.Name(),
+			"the refused segment is still on disk and will be adopted on a later open")
+		assert.NotContainsf(t, e.Name(), segTmpSuffix,
+			"a temporary file from the refused import was left behind: %s", e.Name())
+	}
+	require.NoError(t, reopened.Close())
+	require.NoError(t, src.Close())
+}
