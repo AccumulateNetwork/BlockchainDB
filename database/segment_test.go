@@ -51,8 +51,8 @@ func TestSegmentRoundTrip(t *testing.T) {
 	// Confirm the premise: some shard really did auto-seal
 	autoSealed := 0
 	for _, sh := range nodeA.Shards {
-		if len(sh.PermKV.segments) > 0 {
-			autoSealed += len(sh.PermKV.segments)
+		if len(sh.PermKV.sealedSegments()) > 0 {
+			autoSealed += len(sh.PermKV.sealedSegments())
 		}
 	}
 	require.Greater(t, autoSealed, 0, "no shard auto-sealed; the test would not exercise issue #27")
@@ -295,7 +295,7 @@ func TestQuietShardKeepsItsBlockAcrossAReopen(t *testing.T) {
 		keys[i] = keyForShard(kr, quiet)
 		require.NoError(t, reopened.PutPerm(keys[i], vr.RandBuff(20, 100)))
 	}
-	segs := reopened.Shards[quiet].PermKV.segments
+	segs := reopened.Shards[quiet].PermKV.sealedSegments()
 	require.NotEmpty(t, segs, "the quiet shard must have auto-sealed for this to test anything")
 	for _, seg := range segs {
 		assert.GreaterOrEqualf(t, seg.meta.Height, uint64(5),

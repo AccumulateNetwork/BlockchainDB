@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 const PermDirName = "perm"
@@ -42,13 +43,24 @@ const DynaDirName = "dyna"
 // key/values are kept in one store.
 
 type KV2 struct {
-	Mutex     sync.RWMutex  // Writers exclusive, readers shared; KV2 methods are safe for concurrent use
+	// Mutex is the protocol's lock at this level: Put, PutPerm, PutDyna
+	// and Seal take it exclusively, Get and its variants shared.  The
+	// history maintenance -- MergeBelow and Compress -- does NOT take
+	// it: each layer has a lock of its own for history (SegmentStore.
+	// History), and holding this one for a merge or a compaction held
+	// every commit and read of the shard for the whole copy (issue #57).
+	Mutex     sync.RWMutex
 	Directory string        // Directory where the PermKV and DynaKV directories are
 	PermKV    *SegmentStore // The Perm layer: sealed, immutable segments
 	DynaKV    *SegmentStore // The Dyna layer: sealed, mutable segments
 	DWrites   int           // Number of writes to the DynaKV since the last compress
 	PWrites   int           // Number of writes to the PermKV since the last compress
 	SealLimit int           // Seal a layer when its live tail reaches this many records
+
+	// opened says both layers are open and SealLimit is set, so that
+	// Open -- which every operation calls first -- can say so without
+	// the lock.  Set at the end of Open and cleared by Close, under it.
+	opened atomic.Bool
 }
 
 // NewKV2
@@ -105,19 +117,25 @@ func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
 }
 
 // SetFilterBlocks
-// Set the roll period of the Perm layer's key filter -- the window,
-// N to 2N blocks, over which a permanent key cannot be overwritten
-// (keyfilter.go) -- and record it in the layer's manifest.  Meant for
-// the moment a database is created, since it rebuilds the layer's
-// filters and commits a manifest.  Below MinFilterBlocks is refused.
+// Set N for both layers: the roll period of the key filters -- the
+// window, N to 2N blocks, over which a permanent key cannot be
+// overwritten (keyfilter.go) -- and the line between the active tier
+// and history, which is what bounds the pause a commit can suffer from
+// maintenance (issue #57).  Recorded in each layer's manifest.  Meant
+// for the moment a database is created, since it rebuilds the filters
+// and commits a manifest per layer.  Below MinFilterBlocks is refused.
 //
-// Only the Perm layer.  The Dyna layer's block never advances, so its
-// filter never rolls whatever the period, and its reach is bounded by
-// compaction instead.
+// The Dyna layer takes the same N.  Its block advances with every
+// Seal, so its window rolls like Perm's, and a dynamic record that
+// left the window more than N to 2N blocks ago is history -- which is
+// what makes it reclaimable without touching the protocol's tier.
 func (k *KV2) SetFilterBlocks(n uint64) (err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
-	return k.PermKV.SetFilterBlocks(n)
+	if err = k.PermKV.SetFilterBlocks(n); err != nil {
+		return err
+	}
+	return k.DynaKV.SetFilterBlocks(n)
 }
 
 func OpenKV2(directory string) (kv2 *KV2, err error) {
@@ -135,6 +153,12 @@ func OpenKV2(directory string) (kv2 *KV2, err error) {
 }
 
 func (k *KV2) Open() error {
+	// Every operation on a shard calls this first, the maintenance
+	// included, so an open database answers without the lock: a merge
+	// waiting here behind a seal would be waiting on the protocol
+	if k.opened.Load() {
+		return nil
+	}
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
 	if err := k.PermKV.Open(); err != nil {
@@ -149,7 +173,11 @@ func (k *KV2) Open() error {
 			k.SealLimit = int(DefaultBloomCapacity)
 		}
 	}
-	return k.DynaKV.Open()
+	if err := k.DynaKV.Open(); err != nil {
+		return err
+	}
+	k.opened.Store(true)
+	return nil
 }
 
 // Close
@@ -165,6 +193,7 @@ func (k *KV2) Open() error {
 func (k *KV2) Close() error {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
+	k.opened.Store(false)
 	err := k.PermKV.Close()
 	if dynaErr := k.DynaKV.Close(); err == nil {
 		err = dynaErr
@@ -281,6 +310,15 @@ func (k *KV2) sealDynaIfFull() (err error) {
 // Both layers are advanced before either error is returned, so a
 // failure to sync Dyna does not leave Perm unsealed and the block
 // unrepeatable.
+//
+// The Dyna layer is also told the block, so that it ages.  Its
+// segments are tagged with the block they were sealed in and its
+// window rolls with Perm's, which is what puts a dynamic record that
+// has not been rewritten for 2N blocks into history, where
+// CompactHistory can reclaim what superseded it without touching the
+// tier a commit writes (issue #57).  No manifest is written for it:
+// the next Dyna seal records the block, and a reopened layer that is
+// a few blocks behind simply hands the same segments off again.
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
 	defer k.Mutex.Unlock()
@@ -288,20 +326,23 @@ func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	if syncErr := k.DynaKV.Sync(); err == nil {
 		err = syncErr
 	}
+	k.DynaKV.AdvanceBlock(height + 1)
 	return meta, err
 }
 
 // MergeBelow
-// Merge the Perm layer's sealed segments below a block height into one.
-// Reports whether anything was merged.
+// Merge the Perm layer's history segments below a block height into
+// one.  Reports whether anything was merged.
 //
-// Only the Perm layer.  The Dyna layer already has Compress, which
-// merges for a different reason -- to reclaim what overwriting left
-// behind -- and its segments are local, so their count is bounded by
-// how often it compacts rather than by the chain's length.
+// Only the Perm layer.  The Dyna layer has Compress, which merges for
+// a different reason -- to reclaim what overwriting left behind.
+//
+// The KV2 lock is NOT taken.  A merge is a history operation: it reads
+// immutable segments with no lock, writes the merged segment aside,
+// and takes the Perm layer's history lock to swap them.  Holding the
+// KV2 lock here held every Put, Get and Seal of the shard for the
+// whole copy, which is the pause issue #57 measures.
 func (k *KV2) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
 	return k.PermKV.MergeBelow(height)
 }
 
@@ -352,19 +393,32 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 }
 
 // Compress
-// Reclaim the space the Dyna layer's overwrites left behind: seal its
-// live tail, then replace every sealed generation with one segment
-// holding only the keys still reachable.  The Perm layer is not
-// compacted -- its values are immutable, so none of them are trash.
+// Reclaim the space the Dyna layer's overwrites left behind, in the
+// part of the layer the protocol no longer touches: compact the run of
+// history segments that is worth compacting (SegmentStore.CompactHistory)
+// into one holding only the newest record per key.  The Perm layer is
+// not compacted -- its values are immutable, so none of them are trash.
 //
-// This is crash-atomic.  The compacted generation is fully durable
-// before the manifest names it, so there is no window in which keys
-// and values disagree (issue #19); a crash before the commit costs
-// only the space the old generation still occupies, which the next
-// compaction reclaims.  The v1 kfile Compress this replaced swapped
-// the values file and rewrote the key offsets as two separate steps,
-// and a crash between them left keys pointing into the wrong layout --
-// reads returned wrong bytes with no error.
+// Neither the KV2 lock nor the Dyna layer's store lock is taken.  The
+// records compaction touches are the ones that left the window of the
+// last N to 2N blocks; what the window holds -- the live tail and the
+// active segments -- is the protocol's, and a record last written
+// there is never read or rewritten here.  So a commit runs during a
+// compaction as it does at any other time, and the pause a compaction
+// can cause is the history swap, bounded by nothing that grows with
+// the chain.  It used to seal the tail and rewrite every generation
+// under both locks once a garbage ratio was crossed, and that stopped
+// every commit and read on the node for 12 s at block 400 and up to
+// 32 s at block 1,040 (issue #57).
+//
+// This is crash-atomic.  The compacted segment is fully durable
+// before the history manifest names it, so there is no window in
+// which keys and values disagree (issue #19); a crash before the
+// commit costs only the space of a file recoverOrphans deletes.  The
+// v1 kfile Compress this replaced swapped the values file and rewrote
+// the key offsets as two separate steps, and a crash between them
+// left keys pointing into the wrong layout -- reads returned wrong
+// bytes with no error.
 //
 // A key written to Dyna keeps a stale copy in Perm, which compaction
 // does not remove; Get resolves the layer order, so the copy is dead
@@ -372,35 +426,12 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 //
 // TODO: Cleanse PermKV of keys in DynaKV
 func (k *KV2) Compress() error {
+	if _, err := k.DynaKV.CompactHistory(); err != nil {
+		return err
+	}
 	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-
-	// Do nothing unless there is enough garbage to be worth a rewrite
-	// of the layer.  A caller drives this on a cadence -- every K
-	// commits -- and the cadence says when to *consider* compacting,
-	// not that a compaction is due: obeying it literally cost O(N) per
-	// call and O(N × commits/K) over a run, so reclaiming a fixed
-	// amount of garbage got more expensive the larger the database grew
-	// (issue #31).
-	//
-	// The seal is inside the check for the same reason.  Sealing first
-	// and then compacting is what made compaction unable to opt out:
-	// the seal had already added a second segment, so the
-	// single-generation early-out never applied.
-	k.DynaKV.Mutex.Lock()
-	worth := k.DynaKV.worthCompacting(CompactRatio)
-	k.DynaKV.Mutex.Unlock()
-	if !worth {
-		return nil
-	}
-
-	if _, err := k.DynaKV.SealNext(); err != nil { // Everything to reclaim must be sealed
-		return err
-	}
-	if _, err := k.DynaKV.CompactNext(); err != nil {
-		return err
-	}
 	k.DWrites = 0 // Clear write counts
 	k.PWrites = 0
+	k.Mutex.Unlock()
 	return nil
 }

@@ -52,7 +52,7 @@ func TestSegmentFDsStayBounded(t *testing.T) {
 		_, err = store.Seal(uint64(i + 1))
 		require.NoError(t, err)
 	}
-	require.Len(t, store.segments, seals, "every seal must have produced a segment")
+	require.Len(t, store.sealedSegments(), seals, "every seal must have produced a segment")
 
 	after := openFDs(t)
 	growth := after - before

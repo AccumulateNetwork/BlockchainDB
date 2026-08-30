@@ -37,16 +37,15 @@ import (
 // it is iterating.  It used to run under the store's lock for the
 // whole iteration, which made a callback that called Get deadlock and
 // made any callback block every other reader and writer for as long as
-// it ran (issue #31).
+// it ran (issue #31).  The snapshot itself reads each tier under its
+// own lock, one after the other, and pins the files first so that
+// nothing either tier retires meanwhile is deleted under the walk.
 func (s *SegmentStore) ForEach(fn func(key [32]byte, value []byte) error) (err error) {
-	s.Mutex.Lock()
-	segs, live, err := s.beginIterate()
-	cold := s.cold
-	s.Mutex.Unlock()
+	segs, live, cold, err := s.beginIterate()
 	if err != nil {
 		return err
 	}
-	defer s.endIterate()
+	defer s.unpin()
 
 	seen := make(map[[32]byte]struct{}, len(live))
 

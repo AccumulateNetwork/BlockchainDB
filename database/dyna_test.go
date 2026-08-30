@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,15 +14,31 @@ import (
 // dynaDir is the Dyna layer's directory within a KV2
 func dynaDir(kv2 *KV2) string { return filepath.Join(kv2.Directory, DynaDirName) }
 
+// ageOut
+// Advance a store's block far enough that every segment it has sealed
+// so far falls below the window and is handed to history: what a
+// mutable layer needs before CompactHistory has anything to compact,
+// since a record last written inside the window is the protocol's and
+// compaction never touches it (issue #57).
+func ageOut(t *testing.T, s *SegmentStore) {
+	t.Helper()
+	s.AdvanceBlock(s.BlockHeight() + 3*s.FilterBlocks)
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
+	require.Empty(t, s.active, "every sealed segment should now be history")
+}
+
 // TestDynaCompressReclaims
 // The Dyna layer accumulates trash as keys are overwritten, and
 // Compress reclaims it -- the property KV.Compress used to provide,
 // now by writing a new sealed generation instead of swapping the
-// values file in place.
+// values file in place.  What it reclaims is history: the segments
+// the window has rolled past.
 func TestDynaCompressReclaims(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	kv2, err := NewKV2(dir, 500) // SealLimit 500 records
 	require.NoError(t, err)
+	require.NoError(t, kv2.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{201})
 	vr := NewFastRandom([]byte{201, 201})
@@ -39,13 +56,23 @@ func TestDynaCompressReclaims(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	require.Greater(t, len(kv2.DynaKV.segments), 1, "overwrites should have sealed several generations")
+	_, err = kv2.DynaKV.SealNext()
+	require.NoError(t, err)
+	require.Greater(t, len(kv2.DynaKV.sealedSegments()), 1, "overwrites should have sealed several generations")
 
+	// Nothing to reclaim while every generation is inside the window
 	sizeBefore := dirSize(t, dynaDir(kv2))
+	require.NoError(t, kv2.Compress())
+	require.Equal(t, sizeBefore, dirSize(t, dynaDir(kv2)), "a record inside the window is not compaction's to touch")
+
+	// Sealing blocks ages the Dyna layer: past 2N blocks the generations
+	// are history, and Compress folds them into one
+	for h := uint64(1); h <= 3*MinFilterBlocks; h++ {
+		_, err = kv2.Seal(h)
+		require.NoError(t, err)
+	}
 	require.NoError(t, kv2.Compress(), "compress")
-	sizeAfter := dirSize(t, dynaDir(kv2))
-	assert.Lessf(t, sizeAfter, sizeBefore/3, "space not reclaimed (%d -> %d)", sizeBefore, sizeAfter)
-	assert.Len(t, kv2.DynaKV.segments, 1, "compaction should leave one generation")
+	assert.Len(t, kv2.DynaKV.sealedSegments(), 1, "compaction should leave one generation")
 
 	for i := range keys {
 		v, err := kv2.Get(keys[i])
@@ -53,8 +80,14 @@ func TestDynaCompressReclaims(t *testing.T) {
 		assert.Equalf(t, latest[i], v, "key %d after compress", i)
 	}
 
-	// And across a reopen
+	// The generations it replaced were still named by the active
+	// manifest, as handoffs in flight, so their files wait for the
+	// next active commit; the close is one
 	require.NoError(t, kv2.Close())
+	sizeAfter := dirSize(t, dynaDir(kv2))
+	assert.Lessf(t, sizeAfter, sizeBefore/3, "space not reclaimed (%d -> %d)", sizeBefore, sizeAfter)
+
+	// And across a reopen
 	reopened, err := OpenKV2(dir)
 	require.NoError(t, err)
 	require.NoError(t, reopened.Open())
@@ -71,15 +104,13 @@ func TestDynaCompressReclaims(t *testing.T) {
 // must not lose anything either way.  KVShard compresses on a write
 // count, so a shard whose keys rarely repeat hits this path often.
 //
-// "Nothing to reclaim" now means Compress does nothing at all, rather
-// than sealing the tail and rewriting the single generation that
-// produced.  The seal was the reason it could not opt out: it added a
-// second segment, so the single-generation early-out never applied and
-// every call paid for a full rewrite of the layer (issue #31).
+// "Nothing to reclaim" means Compress does nothing at all: it never
+// seals the tail, and a single history segment is left as it is.
 func TestDynaCompressIsIdempotent(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	kv2, err := NewKV2(dir, 1000)
 	require.NoError(t, err)
+	require.NoError(t, kv2.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{202})
 	vr := NewFastRandom([]byte{202, 202})
@@ -93,7 +124,7 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 
 	// Distinct keys, so not one record is superseded
 	require.NoError(t, kv2.Compress())
-	assert.Empty(t, kv2.DynaKV.segments,
+	assert.Empty(t, kv2.DynaKV.sealedSegments(),
 		"nothing was overwritten: Compress must not seal a generation in order to rewrite it")
 	for i := range keys {
 		v, err := kv2.Get(keys[i])
@@ -101,22 +132,26 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 		assert.Equal(t, values[i], v)
 	}
 
-	// Now overwrite every key enough times to be worth reclaiming
+	// Now overwrite every key enough times to be worth reclaiming, a
+	// generation per round, and age them out of the window
 	for round := 0; round < 3; round++ {
 		for i := range keys {
 			values[i] = vr.RandBuff(20, 100)
 			_, err = kv2.PutDyna(keys[i], values[i])
 			require.NoError(t, err)
 		}
+		_, err = kv2.DynaKV.SealNext()
+		require.NoError(t, err)
 	}
+	ageOut(t, kv2.DynaKV)
 	require.NoError(t, kv2.Compress())
-	require.Len(t, kv2.DynaKV.segments, 1, "three quarters of the layer is garbage: it must compact")
-	first := kv2.DynaKV.segments[0].meta
+	require.Len(t, kv2.DynaKV.sealedSegments(), 1, "three quarters of the layer is garbage: it must compact")
+	first := kv2.DynaKV.sealedSegments()[0].meta
 
 	// The generation just written has nothing superseded in it
 	require.NoError(t, kv2.Compress(), "second compress")
-	require.Len(t, kv2.DynaKV.segments, 1)
-	assert.Equal(t, first, kv2.DynaKV.segments[0].meta, "nothing to reclaim: the generation should stand as it is")
+	require.Len(t, kv2.DynaKV.sealedSegments(), 1)
+	assert.Equal(t, first, kv2.DynaKV.sealedSegments()[0].meta, "nothing to reclaim: the generation should stand as it is")
 
 	for i := range keys {
 		v, err := kv2.Get(keys[i])
@@ -173,6 +208,7 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	crashed := storeDir(t, "crashed")
 	kv2, err := NewKV2(dir, 200)
 	require.NoError(t, err)
+	require.NoError(t, kv2.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{204})
 	vr := NewFastRandom([]byte{204, 204})
@@ -190,7 +226,15 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	}
 	_, err = kv2.DynaKV.SealNext() // Everything reclaimable is sealed
 	require.NoError(t, err)
-	require.Greater(t, len(kv2.DynaKV.segments), 1)
+	ageOut(t, kv2.DynaKV) // ... and out of the window
+	require.Greater(t, len(kv2.DynaKV.sealedSegments()), 1)
+	// One more record, sealed inside the window, so the store has an
+	// active segment above everything the compaction will replace
+	_, err = kv2.PutDyna(keys[0], latest[0])
+	require.NoError(t, err)
+	_, err = kv2.DynaKV.SealNext()
+	require.NoError(t, err)
+	before := len(kv2.DynaKV.sealedSegments())
 
 	// Snapshot the pre-commit state, then compact for real.  Copying
 	// the compacted data file back over the snapshot reproduces
@@ -198,21 +242,32 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	// leaves behind: the new generation on disk, the manifest still
 	// naming the old one.
 	copyDir(t, dynaDir(kv2), crashed)
-	meta, err := kv2.DynaKV.CompactNext()
+	compacted, err := kv2.DynaKV.CompactHistory()
 	require.NoError(t, err)
-	copyFile(t, filepath.Join(dynaDir(kv2), meta.File), filepath.Join(crashed, meta.File))
+	require.True(t, compacted)
 	require.NoError(t, kv2.Close())
+	kv2.DynaKV.History.RLock()
+	require.Empty(t, kv2.DynaKV.history) // Closed; find the output on disk instead
+	kv2.DynaKV.History.RUnlock()
+	reopened, err := OpenSegmentStore(dynaDir(kv2))
+	require.NoError(t, err)
+	reopened.History.RLock()
+	require.Len(t, reopened.history, 1)
+	out := reopened.history[0].meta
+	reopened.History.RUnlock()
+	require.NoError(t, reopened.Close())
+	copyFile(t, filepath.Join(dynaDir(kv2), out.File), filepath.Join(crashed, out.File))
 
 	store, err := OpenSegmentStore(crashed)
 	require.NoError(t, err, "open after a crash mid-compaction")
 
-	// The compacted segment sits above every height the manifest names,
-	// so recovery adopts it rather than discarding it: it joins the old
-	// generation as the newest segment, and newest wins.  Nothing is
-	// lost either way -- what a crash here costs is the space the old
-	// generation still occupies, until the next compaction.
-	require.Len(t, store.segments, 4, "old generation plus the adopted compaction")
-	assert.Equal(t, meta.Height, store.segments[len(store.segments)-1].meta.Height)
+	// The compacted segment sits below the newest segment the manifests
+	// name -- the one sealed inside the window -- so recovery deletes
+	// it: the inputs it would have replaced are still named and still
+	// whole, and nothing is lost.  What the crash costs is the copy.
+	require.Len(t, store.sealedSegments(), before, "the old generations, and only those, after recovery")
+	_, err = os.Stat(filepath.Join(crashed, out.File))
+	assert.True(t, errors.Is(err, os.ErrNotExist), "an uncommitted compaction below the newest segment is swept")
 
 	for i := range keys {
 		v, err := store.Get(keys[i])
@@ -221,9 +276,10 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	}
 
 	// And compaction still converges from the recovered state
-	_, err = store.CompactNext()
+	compacted, err = store.CompactHistory()
 	require.NoError(t, err)
-	require.Len(t, store.segments, 1)
+	require.True(t, compacted)
+	require.Len(t, store.sealedSegments(), 2, "one compacted history segment plus the active one")
 	for i := range keys {
 		v, err := store.Get(keys[i])
 		require.NoErrorf(t, err, "key %d after recompaction", i)
@@ -303,57 +359,90 @@ func copyFile(t *testing.T, src, dst string) {
 	require.NoError(t, out.Sync())
 }
 
-// TestCompressEstimateSurvivesReopen
-// The estimate that decides whether Compress is worth running is
-// maintained as writes arrive.  It used to be process state, so a
-// reopened store believed it held no garbage whatever it actually
-// held, and would not compact until it had accumulated a threshold
-// fraction of the whole layer again in fresh overwrites (issue #40).
-func TestCompressEstimateSurvivesReopen(t *testing.T) {
+// TestCompressNeverTouchesTheWindow
+// A record last written inside the window -- the last N to 2N blocks
+// -- is the protocol's, and compaction never reads or rewrites it.
+// Only what has rolled out of the window is reclaimed, and a record in
+// history superseded by one still in the window waits until that one
+// has rolled out too.  This is the rule that bounds what a compaction
+// can cost a commit (issue #57).
+func TestCompressNeverTouchesTheWindow(t *testing.T) {
 	dir := storeDir(t, "kv2")
 	kv2, err := NewKV2(dir, 1000)
 	require.NoError(t, err)
+	require.NoError(t, kv2.SetFilterBlocks(MinFilterBlocks))
 
-	kr := NewFastRandom([]byte{204})
-	vr := NewFastRandom([]byte{204, 204})
+	kr := NewFastRandom([]byte{206})
+	vr := NewFastRandom([]byte{206, 206})
 	keys := make([][32]byte, 40)
+	values := make([][]byte, len(keys))
 	for i := range keys {
 		keys[i] = kr.NextHash()
-		_, err = kv2.PutDyna(keys[i], vr.RandBuff(20, 100))
-		require.NoError(t, err)
 	}
-	// Overwrite every one of them, so most of the layer is garbage
-	values := make([][]byte, len(keys))
+	// Three generations of every key, all sealed, then aged out
 	for round := 0; round < 3; round++ {
 		for i := range keys {
 			values[i] = vr.RandBuff(20, 100)
 			_, err = kv2.PutDyna(keys[i], values[i])
 			require.NoError(t, err)
 		}
+		_, err = kv2.DynaKV.SealNext()
+		require.NoError(t, err)
+	}
+	ageOut(t, kv2.DynaKV)
+	// Then half the keys rewritten inside the window, in two generations
+	for round := 0; round < 2; round++ {
+		for i := 0; i < len(keys)/2; i++ {
+			values[i] = vr.RandBuff(20, 100)
+			_, err = kv2.PutDyna(keys[i], values[i])
+			require.NoError(t, err)
+		}
+		_, err = kv2.DynaKV.SealNext()
+		require.NoError(t, err)
+	}
+	kv2.DynaKV.Mutex.RLock()
+	var active []SegmentMeta
+	for _, seg := range kv2.DynaKV.active {
+		active = append(active, seg.meta)
+	}
+	kv2.DynaKV.Mutex.RUnlock()
+	require.Len(t, active, 2, "two generations inside the window")
+
+	require.NoError(t, kv2.Compress())
+
+	kv2.DynaKV.Mutex.RLock()
+	for i, seg := range kv2.DynaKV.active {
+		assert.Equal(t, active[i], seg.meta, "a segment inside the window was rewritten")
+	}
+	kv2.DynaKV.Mutex.RUnlock()
+	kv2.DynaKV.History.RLock()
+	require.Len(t, kv2.DynaKV.history, 1, "the three aged-out generations compact to one")
+	hist := kv2.DynaKV.history[0]
+	kv2.DynaKV.History.RUnlock()
+	// Every key is still in history -- the rewrites inside the window
+	// shadow it but cannot reclaim it until they age out themselves
+	assert.Equal(t, int64(len(keys)), hist.count, "history keeps one record per key")
+
+	for i := range keys {
+		v, err := kv2.Get(keys[i])
+		require.NoErrorf(t, err, "key %d", i)
+		assert.Equal(t, values[i], v, "key %d resolved to the wrong generation", i)
 	}
 
-	// Seal, so the estimate reaches the manifest, then reopen
-	_, err = kv2.DynaKV.SealNext()
-	require.NoError(t, err)
-	before := kv2.DynaKV.shadowed
-	require.Greater(t, before, uint64(0), "the writes must have been counted as superseded")
-	require.NoError(t, kv2.Close())
-
-	reopened, err := OpenKV2(dir)
-	require.NoError(t, err)
-	require.NoError(t, reopened.Open())
-	assert.Equal(t, before, reopened.DynaKV.shadowed,
-		"the reopened store must know the garbage it holds")
-
-	// And it acts on it: a Compress right after reopening compacts,
-	// rather than waiting to re-accumulate the same garbage
-	require.NoError(t, reopened.Compress())
-	assert.Len(t, reopened.DynaKV.segments, 1, "a reopened store must still compact what it holds")
-
-	for i, key := range keys {
-		v, err := reopened.Get(key)
+	// Once the window has rolled past the rewrites, they reach history
+	// and the next compaction reclaims the copies they superseded
+	ageOut(t, kv2.DynaKV)
+	require.NoError(t, kv2.Compress())
+	kv2.DynaKV.History.RLock()
+	require.Len(t, kv2.DynaKV.history, 1)
+	hist = kv2.DynaKV.history[0]
+	kv2.DynaKV.History.RUnlock()
+	assert.Equal(t, int64(len(keys)), hist.count)
+	assert.Equal(t, hist.count, hist.records, "one record per key: the superseded copies are gone")
+	for i := range keys {
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d", i)
 		assert.Equal(t, values[i], v)
 	}
-	require.NoError(t, reopened.Close())
+	require.NoError(t, kv2.Close())
 }

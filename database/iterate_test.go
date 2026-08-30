@@ -203,6 +203,7 @@ func TestForEachSurvivesConcurrentCompaction(t *testing.T) {
 	store, err := NewSegmentStore(dir, true)
 	require.NoError(t, err)
 	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{48})
 	keys := make([][32]byte, 400)
@@ -214,7 +215,8 @@ func TestForEachSurvivesConcurrentCompaction(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	require.Greater(t, len(store.segments), 1, "need several generations to compact away")
+	ageOut(t, store) // Compaction works on history: roll the window past them
+	require.Greater(t, len(store.sealedSegments()), 1, "need several generations to compact away")
 
 	compacted := make(chan error, 1)
 	var once sync.Once
@@ -224,7 +226,7 @@ func TestForEachSurvivesConcurrentCompaction(t *testing.T) {
 		if seen == 10 { // Well into the sealed segments
 			once.Do(func() {
 				go func() {
-					_, err := store.CompactNext()
+					_, err := store.CompactHistory()
 					compacted <- err
 				}()
 			})

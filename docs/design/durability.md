@@ -61,8 +61,13 @@ land kills in the buffered-write, seal, compaction, and manifest-commit
 paths.  The child compacts on its own cadence (`crashCompressEvery`)
 because nothing in `KV2` compacts by itself -- `sealPermIfFull` and
 `sealDynaIfFull` seal and stop there -- so without it the compaction
-path would never be under the kill.  Adding it is what surfaced the
-three defects listed under *Fixed here*.
+path would never be under the kill.  Compaction works on history, the
+segments the window of the last N to 2N blocks has rolled past, and a
+child that lives for a few hundred puts never seals that many blocks,
+so before each `Compress` it advances the Dyna layer's block past the
+window (`AdvanceBlock`), which is what the blocks passing would do.
+Adding the compaction is what surfaced the three defects listed under
+*Fixed here*.
 
 `TestCrashRecoverySeal` runs the same rounds against the other
 durability point: the child checkpoints at `Seal` and never closes.
@@ -86,17 +91,18 @@ state survives until the new state is durable:
 | operation | mechanism |
 |---|---|
 | seal | the usual path renames `live.dat` itself: the header is filled in, the file fsynced, then renamed to `seg-<height>.dat`, so no record is copied and a `.dat` on disk is complete by construction. A tail holding overwrites is rewritten to `seg-<height>.dat.tmp` first, then fsynced and renamed |
-| manifest commit | `segments.json.tmp` + rename; the manifest is the single point at which a seal or compaction becomes real |
-| compaction | writes a whole new sealed generation, then commits it with one manifest rename (issue #19) — there is no window in which keys and values disagree |
-| interrupted seal | a data file *above* the manifest's newest height reached disk but not the manifest; `recoverOrphans` adopts it on open |
-| superseded files | a data file at or below the newest height was replaced by a committed compaction; `recoverOrphans` deletes it |
+| manifest commit | `segments.json.tmp` + rename for the active tier, `history.json.tmp` + rename for history; each is the single point at which its tier's operation becomes real — a seal or import for the active manifest, a merge, compaction or drop for the history manifest (issue #57) |
+| a segment between the manifests | the window rolling past a segment moves it to history in memory and writes nothing.  The active manifest keeps naming it until a history commit names it, and only the active commit after that stops; so every sealed segment is named by at least one manifest on disk at every moment, and open reads both and takes the union.  A merge's inputs that the active manifest might still name are deleted only after the next active commit (`TestHandoffSurvivesACrash`, three crash points) |
+| compaction | rewrites a run of history segments into one holding the newest record per key, then commits it with one history-manifest rename (issue #19) — there is no window in which keys and values disagree.  It never touches a segment inside the window: a record last written in the last N to 2N blocks is the protocol's (issue #57) |
+| interrupted seal | a data file *above* the newest height either manifest names reached disk but not the manifest; `recoverOrphans` adopts it on open |
+| superseded files | a data file at or below the newest height was replaced by a committed merge or compaction; `recoverOrphans` deletes it.  A compaction's output takes the sequence after its run's newest segment, which is below the active tier, so an uncommitted one is deleted while its inputs still stand (`TestDynaCompressCrashMidway`) |
 | stale tmp files | removed on open; a `.tmp` file is by construction always incomplete |
 | torn live-tail record | the live tail is replayed record by record on open; a record whose value bytes run past end-of-data is dropped **and the file is truncated to the last complete record**, so the next append lands on a record boundary |
 | live file with no header | `seal` creates the new `live.dat` and leaves its 24-byte header in the `BFile` buffer, so a crash before the first flush leaves the file at 0 bytes; open rewrites the header rather than trusting it to be there |
 | the block a shard is in | recorded once for the whole shard set (`block.json`, one fsync), not once per shard.  A shard with no writes advances in memory and commits nothing.  On open the set tells every shard the block it is in, which is what a shard needs it for: `SealNext` tags an auto-sealed segment with its block height, so a shard that came back believing it was in an older block would label segments with a block they do not belong to and `ExportBlock`, which selects by block, would never export them.  A missing file reads as 0 and constrains nothing, so an existing database opens unchanged (issue #32) |
 | merge of finalized segments | the merged segment is written, fsynced and renamed before the manifest names it, at an identity *below* the manifest's newest, so an uncommitted one is deleted by `recoverOrphans` while the originals it would replace are still named (issue #47) |
 | key filters | saved to `filters.dat` (tmp file, fsync, rename, directory fsync) at close, and the manifest written straight after carries the claim of what they cover: the window's start, the newest segment in it, and the count of segments covered.  Every other manifest commit clears the claim, and on open any doubt -- an adopted orphan, a dropped segment, a different window -- rebuilds from the segments inside the window (issue #44) |
-| block-set file | written to `sets/set-….bset.tmp`, fsynced, renamed, and the set directory fsynced: the rename is the commit.  A `.tmp` left by a crash is deleted on open.  Only after that commit do the shards drop the segments the set holds -- **without a manifest of their own**.  The shard's next manifest commit (its next seal, or its close) is what stops naming them, and the files are deleted only after it.  A crash in between leaves every shard's manifest naming whole, intact segments that the set also holds; on open the shard set drops them again (`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).  Nothing is ever in only one place until the second place is durable |
+| block-set file | written to `sets/set-….bset.tmp`, fsynced, renamed, and the set directory fsynced: the rename is the commit.  A `.tmp` left by a crash is deleted on open.  Only after that commit do the shards drop the segments the set holds, each with a history-manifest commit of its own (two barriers, off the protocol path, sixteen shards at a time), and the files are deleted only after it.  A crash before a shard's drop leaves its history manifest naming whole, intact segments that the set also holds; on open the shard set drops them again (`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).  Nothing is ever in only one place until the second place is durable |
 | one barrier per operation | a seal renames up to three files into the same directory -- the sealed data file, its index, then the manifest -- and fsyncs that directory once, at the manifest commit. One directory fsync commits every name change made in it, and the renames are issued in order, so the manifest can never become durable ahead of the data file it names. Each file's own fsync is still taken before its rename: that is what makes a published name always point at durable contents. Six barriers a seal became four, measured 36 ms to 24.6 ms (issue #33) |
 | operations on a closed store | `Close` drops the sealed segment list but keeps the live map, so reads and writes refuse with `errStoreClosed` rather than running against half a store |
 
@@ -178,12 +184,18 @@ The first three have a regression test in `segstore_test.go`
 - A key written to Dyna keeps a stale copy in Perm. `Get` resolves the
   layer order, so the copy is dead weight rather than a wrong answer,
   but compaction does not reclaim it.
-- `recoverOrphans` adopts any complete data file *above* the manifest's
-  newest segment.  Two paths can leave such a file that duplicates
-  data the manifest already names: a merge of a shard whose every
-  segment was below the watermark (the merged file is then above
+- `recoverOrphans` adopts any complete data file *above* the newest
+  segment the manifests name.  Two paths can leave such a file that
+  duplicates data a manifest already names: a merge or compaction of a
+  store whose every segment was history (the output is then above
   everything), and a shard that dropped its last segment for a block
   set, committed, and crashed before the unlink.  Either way the
-  adopted file holds keys with identical values elsewhere; lookups are
-  right, the next merge or drop folds it away, and the cost is space
-  until then.
+  adopted file holds keys with identical or newer values elsewhere;
+  lookups are right, the next merge, compaction or drop folds it away,
+  and the cost is space until then.
+- The Dyna layer's block advances in memory with every `KV2.Seal` and
+  is persisted only by its own next seal, so a reopened layer can be a
+  few blocks behind: segments the window had rolled past are placed
+  in the active tier again, covered by the rebuilt filters, and handed
+  off again as the block catches up.  Correct, and at worst one
+  window's worth of history compacted a little later.

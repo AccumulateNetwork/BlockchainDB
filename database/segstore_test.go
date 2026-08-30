@@ -175,6 +175,7 @@ func TestSegmentStoreCompact(t *testing.T) {
 	dir := storeDir(t, "s")
 	store, err := NewSegmentStore(dir, true)
 	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{104})
 	vr := NewFastRandom([]byte{104, 104})
@@ -195,13 +196,22 @@ func TestSegmentStoreCompact(t *testing.T) {
 	}
 
 	sizeBefore := dirSize(t, dir)
-	require.Len(t, store.segments, 10, "should have ten sealed segments")
+	require.Len(t, store.sealedSegments(), 10, "should have ten sealed segments")
 
-	meta, err := store.Compact(11)
+	ageOut(t, store) // Compaction works on history: roll the window past them
+	compacted, err := store.CompactHistory()
 	require.NoError(t, err, "compact")
+	require.True(t, compacted)
+	require.Len(t, store.sealedSegments(), 1, "compaction should leave one generation")
+	meta := store.sealedSegments()[0].meta
 	assert.Equal(t, uint64(200), meta.Count, "compacted generation should hold the live keys")
-	require.Len(t, store.segments, 1, "compaction should leave one generation")
 
+	// The old generations were handoffs the active manifest still
+	// named, so their files wait for the next active commit
+	require.NoError(t, store.Put(kr.NextHash(), []byte("after")))
+	_, err = store.SealNext()
+	require.NoError(t, err)
+	store.awaitUnlinks()
 	sizeAfter := dirSize(t, dir)
 	assert.Lessf(t, sizeAfter, sizeBefore/5, "space not reclaimed (%d -> %d)", sizeBefore, sizeAfter)
 
@@ -274,7 +284,7 @@ func TestSegmentStoreSyncIsFileCopy(t *testing.T) {
 
 	// Re-import is a no-op (interrupted syncs resume)
 	require.NoError(t, dst.ImportSegmentFile(paths[2], metas[2]))
-	require.Len(t, dst.segments, 3)
+	require.Len(t, dst.sealedSegments(), 3)
 
 	// A tampered file is rejected
 	tampered := filepath.Join(os.TempDir(), t.Name()+"_tampered.dat")
@@ -325,7 +335,7 @@ func TestSegmentStoreRecovery(t *testing.T) {
 	// Open must adopt the orphaned segment (and rebuild its index)
 	store, err = OpenSegmentStore(dir)
 	require.NoError(t, err, "open must recover the orphaned segment")
-	require.Len(t, store.segments, 1, "orphaned segment should be adopted")
+	require.Len(t, store.sealedSegments(), 1, "orphaned segment should be adopted")
 	for i := range keys {
 		v, err := store.Get(keys[i])
 		require.NoErrorf(t, err, "key %d lost in recovery", i)
@@ -451,7 +461,7 @@ func TestSegmentStoreClosedRejectsOperations(t *testing.T) {
 			require.NoError(t, err)
 		}
 	}
-	sealed := len(store.segments)
+	sealed := len(store.sealedSegments())
 	require.Equal(t, 5, sealed, "expected five sealed segments")
 	require.NoError(t, store.Close())
 
@@ -463,15 +473,15 @@ func TestSegmentStoreClosedRejectsOperations(t *testing.T) {
 	require.ErrorIs(t, err, errStoreClosed, "Seal on a closed store")
 	_, err = store.SealNext()
 	require.ErrorIs(t, err, errStoreClosed, "SealNext on a closed store")
-	_, err = store.Compact(99)
-	require.ErrorIs(t, err, errStoreClosed, "Compact on a closed store")
-	_, err = store.CompactNext()
-	require.ErrorIs(t, err, errStoreClosed, "CompactNext on a closed store")
+	_, err = store.CompactHistory()
+	require.ErrorIs(t, err, errStoreClosed, "CompactHistory on a closed store")
+	_, _, err = store.MergeBelow(99)
+	require.ErrorIs(t, err, errStoreClosed, "MergeBelow on a closed store")
 
 	// and nothing they did may have reached the manifest
 	reopened, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
-	require.Len(t, reopened.segments, sealed, "sealed segments lost")
+	require.Len(t, reopened.sealedSegments(), sealed, "sealed segments lost")
 	for i, key := range keys {
 		got, err := reopened.Get(key)
 		require.NoErrorf(t, err, "key %d lost", i)
@@ -558,8 +568,8 @@ func TestAutoSealDoesNotConsumeBlockHeights(t *testing.T) {
 		_, err = store.SealNext()
 		require.NoError(t, err)
 	}
-	require.Len(t, store.segments, 8)
-	for i, seg := range store.segments {
+	require.Len(t, store.sealedSegments(), 8)
+	for i, seg := range store.sealedSegments() {
 		assert.Equal(t, uint64(0), seg.meta.Height, "auto-seal %d must stay in block 0", i)
 		assert.Equal(t, uint64(i), seg.meta.Seq, "auto-seal %d must take the next sequence", i)
 	}

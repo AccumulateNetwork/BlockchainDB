@@ -26,6 +26,7 @@ func packedFixture(t *testing.T, dir string, seed byte, blocks, perBlock int) (k
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	kvs, err := NewKVShard(dir, 100_000) // High, so only block boundaries seal
 	require.NoError(t, err)
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
 	kr := NewFastRandom([]byte{seed})
 	vr := NewFastRandom([]byte{seed, seed})
 	values = make(map[[32]byte][]byte)
@@ -46,13 +47,11 @@ func packedFixture(t *testing.T, dir string, seed byte, blocks, perBlock int) (k
 // shards are still serving from blocks below height
 func permSegmentsBelow(kvs *KVShard, height uint64) (n int) {
 	for _, sh := range kvs.Shards {
-		sh.PermKV.Mutex.Lock()
-		for _, seg := range sh.PermKV.segments {
+		for _, seg := range sh.PermKV.sealedSegments() {
 			if seg.meta.Height < height {
 				n++
 			}
 		}
-		sh.PermKV.Mutex.Unlock()
 	}
 	return n
 }
@@ -62,6 +61,9 @@ func permSegmentsBelow(kvs *KVShard, height uint64) (n int) {
 // below height
 func permDataFiles(t *testing.T, kvs *KVShard, height uint64) (n, below int) {
 	t.Helper()
+	for _, sh := range kvs.Shards { // Deletion is a goroutine's; let it finish first
+		sh.PermKV.awaitUnlinks()
+	}
 	for i := range kvs.Shards {
 		entries, err := os.ReadDir(filepath.Join(kvs.ShardDir(i), PermDirName))
 		require.NoError(t, err)
@@ -101,6 +103,7 @@ func checkEveryKey(t *testing.T, kvs *KVShard, keys [][32]byte, values map[[32]b
 func TestPackFinalizedLeavesOneFileAndEveryKey(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 181, 8, 100)
+	next := ageOutShards(t, kvs, 8) // Finalisation works on history
 
 	_, err := kvs.MergeFinalized(7)
 	require.NoError(t, err)
@@ -120,9 +123,14 @@ func TestPackFinalizedLeavesOneFileAndEveryKey(t *testing.T) {
 	assert.Equal(t, meta.File, entries[0].Name())
 
 	assert.Equal(t, 0, permSegmentsBelow(kvs, 7), "the shards must stop serving what the set holds")
+	// The drop is a history commit per shard, so the merged segments'
+	// files are gone; what stays is the merge inputs, which the active
+	// manifest still named when the merge replaced them, until each
+	// shard's next active commit
 	files, below := permDataFiles(t, kvs, 7)
-	assert.Equal(t, filesBefore, files, "the dropped files stay until the shards next commit a manifest")
-	assert.Equal(t, belowBefore, below)
+	assert.Less(t, files, filesBefore, "the drop retires the merged segments' files")
+	assert.Less(t, below, belowBefore)
+	assert.Greater(t, below, 0, "the merge inputs wait for the shards' next active commit")
 
 	checkEveryKey(t, kvs, keys, values, "after packing")
 
@@ -138,14 +146,15 @@ func TestPackFinalizedLeavesOneFileAndEveryKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, packed)
 
-	// The next block boundary commits the manifest of every shard that
-	// took a write, which is when that shard's dropped files are retired
+	// The next block boundary commits the active manifest of every
+	// shard that took a write, which is when that shard's merge inputs
+	// are retired
 	for i := 0; i < 200; i++ { // Enough to touch most shards
 		require.NoError(t, kvs.PutPerm(kr.NextHash(), []byte("v")))
 	}
-	require.NoError(t, kvs.SealBlock(9))
-	_, below = permDataFiles(t, kvs, 7)
-	assert.Less(t, below, belowBefore, "the shards' next manifest commit retires the packed files")
+	require.NoError(t, kvs.SealBlock(next))
+	_, belowAfter := permDataFiles(t, kvs, 7)
+	assert.Less(t, belowAfter, below, "the shards' next active commit retires the merge inputs")
 
 	// And a reopen finds it all from the set file
 	require.NoError(t, kvs.Close())
@@ -163,6 +172,7 @@ func TestPackFinalizedLeavesOneFileAndEveryKey(t *testing.T) {
 func TestPackFinalizedCountsFiles(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 183, 6, 2000)
+	next := ageOutShards(t, kvs, 6)
 
 	segs, _ := permDataFiles(t, kvs, 6)
 	_, err := kvs.MergeFinalized(6)
@@ -174,7 +184,7 @@ func TestPackFinalizedCountsFiles(t *testing.T) {
 	for i := 0; i < 2000; i++ { // Touch every shard, so every drop is committed
 		require.NoError(t, kvs.PutPerm(NewFastRandom([]byte{183, byte(i), byte(i >> 8)}).NextHash(), []byte("v")))
 	}
-	require.NoError(t, kvs.SealBlock(7)) // Commit the drops
+	require.NoError(t, kvs.SealBlock(next)) // Retire the merge inputs
 	_, after := permDataFiles(t, kvs, 6)
 	t.Logf("5 blocks x 2000 entries, below the watermark: %d segment files -> %d merged (%d files in all) -> %d left in shards + 1 set file",
 		segs, mergedBelow, merged, after)
@@ -193,6 +203,7 @@ func TestPackFinalizedCountsFiles(t *testing.T) {
 func TestPackFinalizedSurvivesACrashBeforeTheShardsCommit(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 184, 5, 80)
+	next := ageOutShards(t, kvs, 5)
 
 	_, err := kvs.MergeFinalized(5)
 	require.NoError(t, err)
@@ -200,10 +211,11 @@ func TestPackFinalizedSurvivesACrashBeforeTheShardsCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, packed)
 	_, below := permDataFiles(t, kvs, 5)
-	require.Greater(t, below, 0, "the dropped segments' files are still on disk")
+	require.Greater(t, below, 0, "the merge inputs' files are still on disk: the active manifest names them")
 
-	// "Crash": reopen without closing.  The shards' manifests were not
-	// rewritten, so they still name the packed segments.
+	// "Crash": reopen without closing.  The shards' active manifests
+	// were not rewritten since before the merge, so they still name
+	// the merge inputs, whose keys the set also holds.
 	reopened, err := OpenKVShard(dir)
 	require.NoError(t, err)
 	sets := reopened.Sets.Sets()
@@ -217,9 +229,9 @@ func TestPackFinalizedSurvivesACrashBeforeTheShardsCommit(t *testing.T) {
 	for i := 0; i < 200; i++ { // Enough to touch most shards
 		require.NoError(t, reopened.PutPerm(kr.NextHash(), []byte("v")))
 	}
-	require.NoError(t, reopened.SealBlock(6))
+	require.NoError(t, reopened.SealBlock(next))
 	_, belowAfter := permDataFiles(t, reopened, 5)
-	assert.Less(t, belowAfter, below, "the next manifest commit retires the packed files")
+	assert.Less(t, belowAfter, below, "the next active commit retires the packed files")
 
 	// A clean close, then a clean open: still all there
 	require.NoError(t, reopened.Close())
@@ -230,16 +242,23 @@ func TestPackFinalizedSurvivesACrashBeforeTheShardsCommit(t *testing.T) {
 }
 
 // TestPackedKeysStayImmutable
-// The Perm layer refuses a different value for a key it holds.  That
-// check is answered by the shard's key filters first, and they do not
-// cover the keys that have left the segments for a set, so a write the
-// filters cannot place must go on to the sets before it is allowed --
-// including on a store whose filters were rebuilt from scratch on
-// open, from segments that no longer hold the key, which is the case
-// this test exists for.
+// The Perm layer refuses a different value for a key it holds inside
+// the window.  That check is answered by the shard's key filters
+// first, and they do not cover the keys that have left the segments
+// for a set, so a filter whose window reaches a set must be built
+// with the set's keys -- including on a store whose filters were
+// rebuilt from scratch on open, from segments that no longer hold the
+// key, which is the case this test exists for.
+//
+// Only history is packed, so a set lies below the window by
+// construction and a rebuilt filter normally has no set to add.  The
+// window reaches a set when it widens: a shard reopened with a block
+// behind the set's, or SetFilterBlocks raising N, which is what this
+// test uses.
 func TestPackedKeysStayImmutable(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 186, 4, 60)
+	ageOutShards(t, kvs, 4)
 
 	_, err := kvs.MergeFinalized(4)
 	require.NoError(t, err)
@@ -261,10 +280,25 @@ func TestPackedKeysStayImmutable(t *testing.T) {
 	reopened, err := OpenKVShard(dir)
 	require.NoError(t, err)
 	shard := reopened.Shards[ShardIndex(keys[0][:])]
-	require.Equal(t, 0, len(shard.PermKV.segments), "the packed key's shard holds it in no segment now")
+	require.Equal(t, 0, len(shard.PermKV.sealedSegments()), "the packed key's shard holds it in no segment now")
 
 	packedKey := keys[0]
 	other := append([]byte("changed-"), values[packedKey]...)
+
+	// As reopened, the window starts above the set: the packed key is
+	// older than the window, not consulted on write (issue #44), and
+	// the filters do not claim it
+	shard.PermKV.Mutex.RLock()
+	start, ok := shard.PermKV.windowStart()
+	claimed := shard.PermKV.filterTest(packedKey)
+	shard.PermKV.Mutex.RUnlock()
+	require.True(t, ok)
+	require.Greater(t, start, uint64(4), "the set lies below the window")
+	require.False(t, claimed, "a filter must not claim a key below its window")
+
+	// Widen the window until it reaches the set: the rebuilt filters
+	// must take the set's keys, or the packed key could be rewritten
+	require.NoError(t, shard.PermKV.SetFilterBlocks(100))
 
 	// PutPerm: a different value is refused, the same is a no-op
 	err = reopened.PutPerm(packedKey, other)
@@ -288,6 +322,7 @@ func TestPackedKeysStayImmutable(t *testing.T) {
 func TestForEachReachesPackedKeys(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), t.Name())
 	kvs, keys, values := packedFixture(t, dir, 187, 6, 40)
+	ageOutShards(t, kvs, 6)
 
 	// Pack two sets in turn, so the second set is not the first, and
 	// leave block 6 unpacked
@@ -323,8 +358,11 @@ func TestRepeatedPacksKeepDeepEntriesReachable(t *testing.T) {
 	defer os.RemoveAll(dir)
 	kvs, err := NewKVShard(dir, 100_000)
 	require.NoError(t, err)
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
 
-	const sets, setSize, perBlock = 6, 3, 30
+	// A set is N blocks, so that every set rolls the window once and
+	// the set before the window is what each pack finalises
+	const sets, setSize, perBlock = 6, MinFilterBlocks, 30
 	kr := NewFastRandom([]byte{188})
 	vr := NewFastRandom([]byte{188, 188})
 	var keys [][32]byte
@@ -348,7 +386,10 @@ func TestRepeatedPacksKeepDeepEntriesReachable(t *testing.T) {
 			require.NoError(t, err)
 			_, packed, err := kvs.PackFinalized(watermark)
 			require.NoError(t, err)
-			require.Truef(t, packed, "set %d", set)
+			// The first set is still inside the window at the end of
+			// the second; from the third on, each pack finalises the
+			// set the window has just rolled past
+			require.Equalf(t, set >= 1, packed, "set %d: packed=%v", set, packed)
 		}
 	}
 	metas := kvs.Sets.Sets()
@@ -397,6 +438,7 @@ func TestPackedBlocksRefuseAnImport(t *testing.T) {
 		_, err = nodeB.ImportBlock(filepath.Join(exportDir, fmt.Sprintf("block-%08d", h)))
 		require.NoError(t, err)
 	}
+	ageOutShards(t, nodeB, 3)
 	_, err = nodeB.MergeFinalized(4)
 	require.NoError(t, err)
 	_, packed, err := nodeB.PackFinalized(4)
@@ -429,6 +471,7 @@ func TestBlockSetHeaderIsChecked(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(os.TempDir(), t.Name())
 			kvs, _, _ := packedFixture(t, dir, 192, 3, 20)
+			ageOutShards(t, kvs, 3)
 			_, err := kvs.MergeFinalized(3)
 			require.NoError(t, err)
 			meta, packed, err := kvs.PackFinalized(3)

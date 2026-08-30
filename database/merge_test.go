@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,7 @@ func TestMergeBelowKeepsEveryKeyAndCutsFiles(t *testing.T) {
 	dir := storeDir(t, "merge")
 	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{171})
 	const blocks = 20
@@ -36,17 +38,22 @@ func TestMergeBelowKeepsEveryKeyAndCutsFiles(t *testing.T) {
 		_, err = store.Seal(h)
 		require.NoError(t, err)
 	}
-	require.Len(t, store.segments, blocks, "one segment per block before merging")
+	require.Len(t, store.sealedSegments(), blocks, "one segment per block before merging")
+
+	// A merge works on history, so roll the window past every block
+	// (a merge below a watermark still inside the window waits until
+	// the window has passed it)
+	ageOut(t, store)
 
 	// Finalise everything below block 20, leaving the newest alone
 	meta, merged, err := store.MergeBelow(20)
 	require.NoError(t, err)
 	require.True(t, merged, "19 segments below the watermark must merge")
-	assert.Len(t, store.segments, 2, "19 merged into 1, plus the segment at block 20")
+	assert.Len(t, store.sealedSegments(), 2, "19 merged into 1, plus the segment at block 20")
 	assert.Equal(t, uint64(19*perBlock), meta.Count, "the merged segment holds every key below the watermark")
 
 	// The merged segment must order before what was left standing
-	assert.True(t, store.segments[1].meta.after(store.segments[0].meta),
+	assert.True(t, store.sealedSegments()[1].meta.after(store.sealedSegments()[0].meta),
 		"the merged segment must still order before the segments it did not replace")
 
 	// Every key still reads back, from a segment that no longer exists
@@ -56,22 +63,23 @@ func TestMergeBelowKeepsEveryKeyAndCutsFiles(t *testing.T) {
 		assert.Equal(t, values[key], string(v))
 	}
 
-	// The files the merge replaced are gone
+	// And it survives a reopen: the manifest names the merged segment.
+	// The files the merge replaced are gone by then: the active
+	// manifest still named them as handoffs in flight, and the close
+	// is the active commit that stops naming them and deletes them.
+	require.NoError(t, store.Close())
 	segFiles := 0
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	for _, e := range entries {
-		if filepath.Ext(e.Name()) == segDataSuffix {
+		if e.Name() == segLiveName || (strings.HasPrefix(e.Name(), segFilePrefix) && filepath.Ext(e.Name()) == segDataSuffix) {
 			segFiles++
 		}
 	}
-	assert.Equal(t, 3, segFiles, "2 sealed segments plus live.dat")
-
-	// And it survives a reopen: the manifest names the merged segment
-	require.NoError(t, store.Close())
+	assert.Equal(t, 3, segFiles, "2 sealed segments plus live.dat: %v", entries)
 	reopened, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
-	require.Len(t, reopened.segments, 2)
+	require.Len(t, reopened.sealedSegments(), 2)
 	for i, key := range keys {
 		v, err := reopened.Get(key)
 		require.NoErrorf(t, err, "key %d lost across the reopen", i)
@@ -88,6 +96,7 @@ func TestMergeBelowLeavesTheWatermarkAlone(t *testing.T) {
 	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
 	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{172})
 	for h := uint64(1); h <= 10; h++ {
@@ -95,6 +104,7 @@ func TestMergeBelowLeavesTheWatermarkAlone(t *testing.T) {
 		_, err = store.Seal(h)
 		require.NoError(t, err)
 	}
+	ageOut(t, store)
 
 	_, merged, err := store.MergeBelow(6)
 	require.NoError(t, err)
@@ -102,18 +112,29 @@ func TestMergeBelowLeavesTheWatermarkAlone(t *testing.T) {
 
 	// Blocks 6..10 must still be individually present
 	heights := map[uint64]bool{}
-	for _, seg := range store.segments {
+	for _, seg := range store.sealedSegments() {
 		heights[seg.meta.Height] = true
 	}
 	for h := uint64(6); h <= 10; h++ {
 		assert.Truef(t, heights[h], "block %d is at or above the watermark and must not be merged", h)
 	}
-	assert.Len(t, store.segments, 6, "blocks 1-5 merged into one, 6..10 left standing")
+	assert.Len(t, store.sealedSegments(), 6, "blocks 1-5 merged into one, 6..10 left standing")
 
 	// Merging again changes nothing: only one segment is below 6 now
 	_, merged, err = store.MergeBelow(6)
 	require.NoError(t, err)
 	assert.False(t, merged, "a single segment below the watermark is not worth merging")
+}
+
+// ageOutShards
+// Close a run of empty blocks so that every block up to `last` falls
+// below every shard's window and is handed to history -- what
+// finalisation works on.  Returns the next block the set will seal.
+func ageOutShards(t *testing.T, kvs *KVShard, last uint64) (next uint64) {
+	t.Helper()
+	next = last + 3*MinFilterBlocks
+	require.NoError(t, kvs.SealBlock(next))
+	return next + 1
 }
 
 // TestMergeFinalizedAcrossShards
@@ -125,6 +146,7 @@ func TestMergeFinalizedAcrossShards(t *testing.T) {
 
 	kvs, err := NewKVShard(dir, 100_000) // High, so only block boundaries seal
 	require.NoError(t, err)
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{173})
 	vr := NewFastRandom([]byte{173, 173})
@@ -140,10 +162,11 @@ func TestMergeFinalizedAcrossShards(t *testing.T) {
 		}
 		require.NoError(t, kvs.SealBlock(h))
 	}
+	ageOutShards(t, kvs, 8) // A merge works on history: roll the window past the blocks
 
 	before := 0
 	for _, sh := range kvs.Shards {
-		before += len(sh.PermKV.segments)
+		before += len(sh.PermKV.sealedSegments())
 	}
 
 	mergedShards, err := kvs.MergeFinalized(7)
@@ -152,7 +175,7 @@ func TestMergeFinalizedAcrossShards(t *testing.T) {
 
 	after := 0
 	for _, sh := range kvs.Shards {
-		after += len(sh.PermKV.segments)
+		after += len(sh.PermKV.sealedSegments())
 	}
 	assert.Less(t, after, before, "merging must reduce the segment count (%d -> %d)", before, after)
 
@@ -182,6 +205,7 @@ func TestMergeDoesNotDisturbBlockExport(t *testing.T) {
 
 	nodeA, err := NewKVShard(dirA, 100_000)
 	require.NoError(t, err)
+	require.NoError(t, nodeA.SetFilterBlocks(MinFilterBlocks))
 
 	kr := NewFastRandom([]byte{174})
 	vr := NewFastRandom([]byte{174, 174})
@@ -203,7 +227,10 @@ func TestMergeDoesNotDisturbBlockExport(t *testing.T) {
 	}
 
 	// Now finalise the blocks a peer has already taken: both stages, so
-	// blocks 1-4 leave the shards altogether for a block-set file
+	// blocks 1-4 leave the shards altogether for a block-set file.
+	// Finalisation works on history, so first the window rolls past
+	// them, which closes a run of empty blocks.
+	next := ageOutShards(t, nodeA, 6)
 	mergedShards, err := nodeA.MergeFinalized(5)
 	require.NoError(t, err)
 	require.Greater(t, mergedShards, 0, "the merge must have done something for this to test anything")
@@ -219,14 +246,14 @@ func TestMergeDoesNotDisturbBlockExport(t *testing.T) {
 		keys = append(keys, key)
 		values[key] = val
 	}
-	_, err = nodeA.ExportBlock(exportDir, 7, prev)
+	_, err = nodeA.ExportBlock(exportDir, next, prev)
 	require.NoError(t, err)
 
 	// A fresh node syncs from the exported blocks and gets everything
 	nodeB, err := NewKVShard(dirB, 100_000)
 	require.NoError(t, err)
 	var total uint64
-	for h := 1; h <= 7; h++ {
+	for _, h := range []uint64{1, 2, 3, 4, 5, 6, next} {
 		n, err := nodeB.ImportBlock(filepath.Join(exportDir, fmt.Sprintf("block-%08d", h)))
 		require.NoErrorf(t, err, "import block %d after a merge on the exporting node", h)
 		total += n
@@ -251,9 +278,10 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 	dir := storeDir(t, "deep")
 	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
-	const sets = 8    // Eight completed block sets
-	const setSize = 5 // Blocks per set, standing in for N
+	const sets = 8                  // Eight completed block sets
+	const setSize = MinFilterBlocks // Blocks per set: N, so each set rolls the window once
 	const perBlock = 10
 
 	kr := NewFastRandom([]byte{175})
@@ -278,12 +306,15 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 			require.NoError(t, err)
 		}
 		// Finalise every set but the one just written, so each merge
-		// after the first folds in what the previous merge produced
+		// after the first folds in what the previous merge produced.  A
+		// merge works on history -- what the window, N to 2N blocks, has
+		// rolled past -- so the first set has nothing to merge and every
+		// later one merges the set before the one the window still holds.
 		watermark := block - uint64(setSize) + 1
 		if watermark > 1 {
 			_, merged, err := store.MergeBelow(watermark)
 			require.NoErrorf(t, err, "merge after set %d", set)
-			require.Truef(t, merged, "set %d should have merged", set)
+			require.Equalf(t, set >= 1, merged, "set %d: merged=%v", set, merged)
 		}
 	}
 
@@ -312,7 +343,7 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 		require.Equal(t, e.value, string(v))
 	}
 	t.Logf("%d entries over %d blocks, %d merges, %d segments standing",
-		len(all), block, sets-1, len(reopened.segments))
+		len(all), block, sets-1, len(reopened.sealedSegments()))
 	require.NoError(t, reopened.Close())
 }
 
@@ -361,12 +392,12 @@ func TestRejectedImportIsNotAdoptedAfterACrash(t *testing.T) {
 
 	err = dst.ImportSegmentFile(segPath, metas[0])
 	require.Error(t, err, "a conflicting segment must be refused")
-	require.Empty(t, dst.segments, "nothing may be adopted by a refused import")
+	require.Empty(t, dst.sealedSegments(), "nothing may be adopted by a refused import")
 
 	// Reopen without closing: recovery sees whatever the refusal left
 	reopened, err := OpenSegmentStore(dstDir)
 	require.NoError(t, err)
-	assert.Empty(t, reopened.segments,
+	assert.Empty(t, reopened.sealedSegments(),
 		"recovery adopted the segment whose import was refused")
 
 	v, err := reopened.Get(key)

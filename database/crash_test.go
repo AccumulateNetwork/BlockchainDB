@@ -127,6 +127,13 @@ func TestCrashChildProcess(t *testing.T) {
 	for i := start; i < start+100_000; i++ {
 		require.NoError(t, crashPut(kv, i, kr.NextHash(), vr.RandBuff(10, 50)), "child: put")
 		if (i+1)%crashCompressEvery == 0 {
+			// Compaction works on history -- what the window of the last
+			// N to 2N blocks has rolled past -- and a child that lives
+			// for a few hundred puts never seals that many blocks, so
+			// the blocks are made to pass: everything the Dyna layer
+			// has sealed so far becomes history, and the compaction
+			// that follows is under the kill (issue #57)
+			kv.DynaKV.AdvanceBlock(kv.DynaKV.BlockHeight() + 3*MinFilterBlocks)
 			require.NoError(t, kv.Compress(), "child: compress")
 		}
 		if (i+1)%batch != 0 {
@@ -184,6 +191,7 @@ func runCrashRounds(t *testing.T, mode string) {
 	// design notes.)
 	kv, err := NewKV2(dir, crashSealLimit)
 	require.NoError(t, err)
+	require.NoError(t, kv.SetFilterBlocks(MinFilterBlocks)) // So the child can age the Dyna layer
 	require.NoError(t, kv.Close())
 
 	durable := 0
@@ -285,13 +293,15 @@ func crashDiagnose(kv *KV2, dir string, i int, key [32]byte) string {
 		store *SegmentStore
 	}{{"Perm", kv.PermKV}, {"Dyna", kv.DynaKV}} {
 		s := l.store
+		segs := s.sealedSegments()
 		s.Mutex.Lock()
 		_, inLive := s.live[key]
 		inFilter := s.filterTest(key)
-		fmt.Fprintf(&b, "%s: %d segments, live keys %d, records %d, blockHeight %d, filters=%d inLive=%v filterSays=%v\n",
-			l.name, len(s.segments), len(s.live), s.liveRecords, s.blockHeight,
+		fmt.Fprintf(&b, "%s: %d segments (%d active), live keys %d, records %d, blockHeight %d, filters=%d inLive=%v filterSays=%v\n",
+			l.name, len(segs), len(s.active), len(s.live), s.liveRecords, s.blockHeight,
 			len(s.filters), inLive, inFilter)
-		for _, seg := range s.segments {
+		s.Mutex.Unlock()
+		for _, seg := range segs {
 			dbb, found, err := seg.lookup(key)
 			mark := ""
 			if found {
@@ -303,7 +313,6 @@ func crashDiagnose(kv *KV2, dir string, i int, key [32]byte) string {
 			fmt.Fprintf(&b, "   seg (%d,%d) count=%d records=%d file=%s%s\n",
 				seg.meta.Height, seg.meta.Seq, seg.count, seg.records, seg.meta.File, mark)
 		}
-		s.Mutex.Unlock()
 	}
 
 	for _, sub := range []string{PermDirName, DynaDirName} {

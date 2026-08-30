@@ -13,7 +13,8 @@ v2 makes the segment format the *storage* itself.
     live.dat                  records accepted since the last seal
     seg-<block>-<seq>.dat     a sealed, immutable segment (the transport format)
     seg-<block>-<seq>.idx     its index: sorted 48-byte key records + a bloom
-    segments.json             the manifest: segments, counts, hashes
+    segments.json             the active manifest: settings, the active tier's segments
+    history.json              the history manifest: every segment below the window
     filters.dat               the live key filters, saved on close
 
 An index record is `key(32) offset(8) length(8)`. The offset is
@@ -96,32 +97,35 @@ bytes against nothing.
 whole key bin whenever it outgrew its slot. Sealed segments never
 move, so a write costs what it weighs.
 
-**Compaction is crash-atomic (issue #19).** `Compact(height)` writes a
-new generation holding only live keys, fsyncs it, and commits by
-replacing the manifest — one atomic rename. There is no window where
-keys and values disagree. Measured: ten sealed generations of
-overwrites compact to one, ~90% of bytes reclaimed, values unchanged.
+**Compaction is crash-atomic (issue #19).** `CompactHistory` writes a
+new segment holding only the newest record per key of the run it
+replaces, fsyncs it, and commits by replacing the history manifest —
+one atomic rename. There is no window where keys and values disagree.
+Measured: ten sealed generations of overwrites compact to one, ~90% of
+bytes reclaimed, values unchanged.
 
-A crash before that commit is safe but not free. The compacted file
-sits above every height the manifest names, so the recovery rule below
-adopts it as the newest segment rather than deleting it — correct,
-since newest wins and it holds every live key, but the old generation
-it was meant to replace is still on disk. What the crash costs is that
-space, until the next compaction. (An earlier draft of this document
-said the orphan was swept; it is adopted. `TestDynaCompressCrashMidway`
-pins the behaviour.)
+A crash before that commit is safe and costs only the copy. The
+compacted file takes the sequence after the run's newest segment, which
+sits below the active tier, so the recovery rule below deletes it while
+the run it would have replaced is still named and whole
+(`TestDynaCompressCrashMidway`). Only a store with no active segment
+at all — every segment in history — leaves the file above everything
+the manifests name, and then it is adopted as a duplicate that the
+next compaction folds away; that is the shape of issue #52.
 
 ## Crash recovery
 
-The manifest is the commit point for sealing, importing, and
-compaction, and its newest `(block, seq)` decides what to do with a
-data file the manifest does not name:
+The manifests are the commit points — the active manifest for sealing
+and importing, the history manifest for merging, compacting, and
+dropping — and the newest `(block, seq)` either of them names decides
+what to do with a data file neither names:
 
 - **above** the newest `(block, seq)` — a seal or import that reached
   disk but not the manifest. It is complete by construction (fsync
   precedes the rename), so it is adopted, its index rebuilt if missing,
   and the manifest updated.
-- **at or below** — superseded by a committed compaction; deleted.
+- **at or below** — superseded by a committed merge or compaction;
+  deleted.
 - `*.tmp` — never complete; deleted.
 
 The live tail is replayed record by record on open; a torn trailing
@@ -148,9 +152,9 @@ record from a crash mid-write is dropped.
    push, no kfile rewrite, no bin relocation, and no `Stat` per put.
 
 2. **Done** — `SegmentStore` is KV2's Dyna layer too, in mutable mode.
-   `KV2.Compress` is now a seal plus a `Compact`, so the layer's
-   compaction is crash-atomic and `KV.Compress` is off the database's
-   path (#19). The Dyna layer seals on **physical records**, not
+   `KV2.Compress` is now a `CompactHistory` of the layer's history
+   tier, so the layer's compaction is crash-atomic, off the protocol's
+   lock, and `KV.Compress` is off the database's path (#19, #57). The Dyna layer seals on **physical records**, not
    distinct keys: a mutable layer leaves one record per write, so a
    handful of hot state keys rewritten every block would hold the key
    count flat while the tail — replayed in full on every open — grew
@@ -249,9 +253,18 @@ manifest. Either way the crash costs space and nothing else.
 
 Merging happens **within a shard**, never across. That keeps the
 working set small — a shard holds a few hundred entries per set — and
-keeps the merge under the shard's own lock, so shards merge
+keeps the merge to the shard's own files, so shards merge
 independently and in parallel. `KVShard.MergeFinalized` drives it per
 shard and keeps going past a failure, reporting the first error.
+
+Only **history** is merged — the segments the window of the last N to
+2N blocks has rolled past (*Two tiers, two locks*, below). A watermark
+inside the window merges what has left it and no more, and the rest
+follows once the window has passed; the merge lags the watermark by up
+to N blocks, and nothing about correctness needs either to be current.
+With Accumulate's N of 64 and its watermark of `version − 64`, a
+shard holds per-block segments for at most 128 blocks before they are
+merged.
 
 It is not a goroutine this package starts. Only the caller knows its
 block rate and how far back healing may still write, which is what
@@ -323,17 +336,19 @@ memory; slices over 64 KB are binary-searched on disk), and one read of
 the value. Sets are walked newest to oldest; a key the shard's own
 filter says is absent never reaches them.
 
-`KVShard.PackFinalized(height)` builds it: every shard's segments below
-the watermark — expected to be stage one's single merged segment each,
-though it copes with more — into one set, committed by the rename of
-the file and one fsync of the set directory. Then each shard **drops**
-those segments (`SegmentStore.DropBelow`) without writing a manifest:
-the shard's next seal records the drop, and only then are the files
-deleted. That is deliberate. Recording it immediately would cost two
-barriers per shard — ~5.6 s a set, the same cost issue #32 removed from
-the block boundary — for a fact the next seal records for free. A crash
-in between leaves a shard whose manifest still names segments the set
-also holds; on open it drops them again
+`KVShard.PackFinalized(height)` builds it: every shard's history
+segments below the watermark — expected to be stage one's single
+merged segment each, though it copes with more — into one set,
+committed by the rename of the file and one fsync of the set
+directory. The segments are read pinned, so a merge that commits
+meanwhile leaves their files readable until the pack is done. Then
+each shard **drops** those segments (`SegmentStore.DropBelow`), which
+is a history commit of its own: two barriers per shard, off the
+protocol path, run sixteen shards at a time so the barriers overlap.
+It used to ride on the shard's next seal for free, but the seal writes
+the active manifest now and the drop is history's to record. A crash
+before a shard's drop leaves its history manifest naming segments the
+set also holds; on open it drops them again
 (`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).
 
 Measured, the same 20-block set of 40,000 keys: **~30 ms** for the
@@ -497,9 +512,143 @@ it), not the store. The count is what separates "covers nothing" from
 "covers segment (0, 0)", the ambiguity of issue #35; it is kept, and
 `TestKeyFilterEmptyDoesNotCoverSegmentZero` still exercises it.
 
-The Dyna layer runs on the same code with its block never advancing,
-so it has one filter, over everything, rebuilt and right-sized at each
-compaction — the same reach it had, and the same bound.
+The Dyna layer runs on the same code and its block advances with every
+`KV2.Seal`, so its filters roll like Perm's: what is resident is the
+keys of the last N to 2N blocks of state writes, and what has left the
+window is history, which is what makes it compactable off the
+protocol path (*Two tiers, two locks*, below).
+
+### Two tiers, two locks
+
+A store holds two kinds of files with two different owners, and one
+mutex used to cover both. Measured on an 8-node Accumulate network at
+500 tx/s, with the adapter merging below `version − 64` and compacting
+every 128 commits (issue #57):
+
+| block | pause on every node | dynamic layer (one engine) |
+|---|---|---|
+| 400 | 12 s | — |
+| 656 | 13–16 s | 5.9 GB, 292 segments |
+| 784 | 18–19 s | 7.0 GB, 326 |
+| 1,040 | 23–32 s | 9.8 GB, 400 |
+
+About 2.3 s per GB of the dynamic layer, every 128 blocks, growing
+without bound — because `Compress` rewrote the whole layer and
+`MergeBelow` copied the whole run under the store's lock, so every
+commit and every read on the node waited for the copy. Each pause
+seeded a cross-partition backlog and the partitions fell behind.
+
+The invariant now is: **the consensus path only ever reads and writes
+the last 2N blocks, and the pause it can suffer from storage
+maintenance is bounded by the size of those 2N blocks, never by the
+size of the chain.**
+
+**The tiers.** The *active* tier is the live tail plus the sealed
+segments whose oldest block is at or above the window's start — the
+same line the key filters draw, `tierStart`, a pure function of the
+block height and N — and every active segment is covered by the
+filters. *History* is every older segment, plus the packed sets. A
+segment moves from active to history when the window rolls past it
+(`handoffBelowWindow`, from `advanceBlock`), never back, except when
+`SetFilterBlocks` widens the window at creation time. Tier membership
+is derived, not recorded: on open each segment is placed by its oldest
+block, so a crash at any moment changes nothing about where a segment
+belongs.
+
+**The locks**, and who takes which:
+
+| operation | Mutex (active) | History | maint |
+|---|---|---|---|
+| `Put`, `PutIfAbsent` | exclusive | — (see below) | — |
+| `Get` | shared, released | then shared, released | — |
+| `Seal`, `SealNext`, `Sync`, `AdvanceBlock` | exclusive | exclusive, inside Mutex, for an append (the handoff) | — |
+| `MergeBelow`, `CompactHistory` | — | shared to read the list; exclusive for the swap | whole operation |
+| `DropBelow` | — | exclusive for the swap | whole operation |
+| `PackFinalized` (per shard) | — | shared to read the list, pinned | — |
+| `ImportSegmentFile` | exclusive | shared inside Mutex on a filter hit; exclusive inside Mutex if the segment lands in history | — |
+| `ForEach` | shared, released | then shared, released; files pinned first | — |
+| `Close`, `Open`, `SetFilterBlocks` | exclusive | exclusive, inside Mutex | — |
+
+The order is always Mutex → History → the leaf locks (`handoffMu`,
+`retireMu`), and maint → History; nothing ever takes Mutex while
+holding History or maint, so no cycle exists. On the protocol path the
+two are never held together: a `Get` reads the active tier under Mutex,
+releases it, and only then reads history under History. A `Put` whose
+key the filters rule out of the window — a new key — writes under
+Mutex alone; a filter hit the active tier settles is answered under
+Mutex alone; a filter hit it cannot settle releases Mutex, reads
+history under History, and takes Mutex again for the write, starting
+over if the window rolled in between (`epoch`). A history operation
+copies immutable segments with no lock at all, writes its output
+aside, and takes History exclusively for the swap and the history
+manifest commit — two barriers — so the longest a history reader can
+wait is that commit, and a commit or an active read never waits at
+all. `KV2.MergeBelow` and `KV2.Compress` do not take the KV2 lock
+either, and `Open`, which every shard operation calls first, answers
+without a lock on an open store.
+
+**Two manifests.** A commit and a merge each write their own, so
+neither waits for the other and neither manifest grows with the
+other's tier: `segments.json` carries the settings and the active
+tier, `history.json` the history tier, and the store is their union
+(a segment named by both is one segment). The handoff records nothing:
+a segment the window has just rolled past stays named by the active
+manifest until a history commit names it, and only the active commit
+after *that* stops naming it — so at every moment every sealed segment
+is named by at least one manifest on disk, and a crash between any two
+commits is recovered by reading both. The files a history operation
+retires are deleted at once if only the history manifest could have
+named them, and after the next active commit if the active manifest
+still might (`retireAfterActiveCommit`); until then a merge's inputs
+sit beside its output, for one seal. Format version 4.
+
+**The dynamic layer ages.** `KV2.Seal` advances the Dyna layer's block
+too, so its auto-sealed segments carry the block they were sealed in
+and its window rolls with Perm's. A state record last written inside
+the window is active and compaction never reads or rewrites it; one
+that has not been rewritten for 2N blocks is history. `CompactHistory`
+— what `KV2.Compress` calls — rewrites a **run** of history segments
+into one holding the newest record per key of the run: the newest
+segment always, and each older one while it is no larger than
+1/`CompactRatio` (4×, at the default 0.25) of what has gathered behind
+it. A large old segment is therefore rewritten only once a quarter of
+its size has arrived, which is what keeps the bytes rewritten over the
+store's life a constant multiple of the bytes written rather than a
+whole-layer copy per call; between rewrites it holds records the newer
+segments have superseded, bounded by the ratio. A record in history
+superseded only by one still in the window waits until that one has
+rolled out and a run holds both — garbage the compaction cannot yet
+see, bounded by the window. `TestCompressNeverTouchesTheWindow` pins
+both halves. The garbage estimate that used to gate `Compress`
+(`Shadowed`, issue #40) is gone with the whole-layer rewrite it gated.
+
+**Measured.** A `KV2` with N=20, 1,000 blocks of 500 permanent keys
+and a dynamic layer of the size shown, with a state key rewritten ~5
+times on average so ~20% of the layer is live; a writer doing
+`PutPerm` + `PutDyna` + `Seal` every 50 ms and a reader doing `GetPerm`
++ `GetDyna` of recent keys every 2 ms, while `Compress` and then
+`MergeBelow(height − 64)` run once. The longest any of their calls
+took while the maintenance ran, before and after, on one NVMe:
+
+| dyna layer | segments | `Compress` before → after | `MergeBelow` before → after | max Put before → after | max Get before → after |
+|---|---|---|---|---|---|
+| 0.60 GB | 447 | 0.77 s → 0.71 s | 0.34 s → 0.32 s | **1.06 s** → <1 ms | **1.10 s** → 20 ms |
+| 1.20 GB | 894 | 1.83 s → 1.71 s | 0.34 s → 0.33 s | **2.13 s** → <1 ms | **2.17 s** → 24 ms |
+| 2.40 GB | 1,789 | 4.60 s → 4.81 s | 0.33 s → 0.35 s | **4.88 s** → <1 ms | **4.92 s** → 48 ms |
+| 4.81 GB | 3,579 | 11.75 s → 11.09 s | 0.35 s → 0.33 s | **12.09 s** → <1 ms | **12.09 s** → 55 ms |
+
+Before, the pause is the compaction: 2.4 s per GB, the curve of the
+issue's table. After, the compaction takes the same time (it is the same copy, off the lock) and the longest a `Put` waited was under a millisecond in every row; the longest a `Seal` waited was 22, 22, 50 and 56 ms against an idle 15-23 ms, and the longest a `Get` 20, 24, 48 and 55 ms -- the history swap and the disk contention of a multi-GB copy, not the copy itself. Memory is lower too: heap 7/10/16/28 MB before against 6/7/10/14 MB after, and the Dyna layer's resident filters 2.4/4.7/9.4/18.7 MB before against 0.3/0.6/1.1/2.1 MB after, because the filter covers the window rather than the whole layer. The idle maxima — the same
+writer and reader with no maintenance running — were 15–23 ms for a
+`Seal` and under 1 ms for a `Put` or a `Get` in every row.
+
+The deterministic tests are in `tiering_test.go`: hold `History`
+exclusively and a `Put`, `Seal`, `Sync` and `Get` complete; hold
+`Mutex` exclusively and a merge, a compaction and a pack complete; hold
+a merge and a compaction between their copy and their swap
+(`maintenanceHook`) and a `Put`+`Seal` and a `Get` complete within a
+second. Against the old locking the last two fail with "did not
+complete within 1s" and "did not complete within 10s".
 
 ### File descriptors are borrowed, not held
 
@@ -535,9 +684,10 @@ queued on that lock and its hold time grew with the segment walk
 (issue #50).
 
 Readers now take both locks shared. Writers — anything that appends,
-seals, compacts, merges, imports, or closes — still take them
-exclusively, so a reader never sees the live map or the segment list
-mid-change. Three things had to follow:
+seals, imports, or closes — still take them exclusively, so a reader
+never sees the live map or the segment list mid-change; a merge or a
+compaction takes neither (*Two tiers, two locks*). Three things had to
+follow:
 
 - **The counters are atomic.** A plain increment under a shared lock
   is a data race.
@@ -581,12 +731,13 @@ profile). That is the segment count, which block-set packing collapses
 callback that called `Get` deadlocked and any callback blocked every
 other reader and writer for as long as it ran (issue #31).
 
-It now copies the live tail's values and the segment list under the
-lock, releases it, and calls back with nothing held. What the callback
-sees is the store as it stood when iteration began. A compaction is
-free to commit underneath it; the files it retires are unlinked when
-the last iteration finishes rather than immediately, so the reads stay
-valid (`TestForEachSurvivesConcurrentCompaction`).
+It now copies the live tail's values and the segment lists — each tier
+under its own lock, one after the other — releases them, and calls back
+with nothing held. What the callback sees is the store as it stood when
+iteration began. A compaction is free to commit underneath it; the
+files it retires are unlinked when the last iteration finishes rather
+than immediately, so the reads stay valid
+(`TestForEachSurvivesConcurrentCompaction`).
 
 Sealing is also still where the Perm layer's time goes — about 60% of
 it at a 25,000-key block, of which the largest remaining piece is the

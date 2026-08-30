@@ -46,7 +46,7 @@ import (
 // is a windowed guarantee, a key written in the last N to 2N blocks
 // cannot be overwritten and older history is not consulted, because
 // the check is there for replay safety and a Perm key is the hash of
-// its value (SegmentStore.lookup).  A READ goes on below the window
+// its value (SegmentStore.Put).  A READ goes on below the window
 // and into the packed sets, each of which carries a filter of its own.
 //
 // The failure modes are still not symmetric.  A filter claiming a key it
@@ -113,9 +113,8 @@ func (m SegmentMeta) first() uint64 {
 // The starts of the filters live at block height t with roll period n:
 // the filter that began at the last multiple of n, and the one before
 // it, oldest first.  There is no "before" until the first roll, so a
-// store's first n blocks have one filter -- and a store whose block
-// never advances (the Dyna layer) keeps that one filter forever, over
-// everything, bounded by its own compaction.
+// store's first n blocks have one filter.  The oldest start is also
+// where the active tier ends and history begins (tierStart).
 func filterStarts(t, n uint64) (starts []uint64) {
 	current := t / n * n
 	if current >= n {
@@ -164,18 +163,18 @@ func (s *SegmentStore) windowStart() (start uint64, ok bool) {
 	return s.filters[0].start, true
 }
 
-// covered reports whether every block a segment holds lies inside the
-// window, so that the filters answer for it.  The caller must hold the
-// Mutex.
-func (s *SegmentStore) covered(seg *segment) bool {
-	start, ok := s.windowStart()
-	return ok && seg.meta.first() >= start
-}
-
 // SetFilterBlocks
 // Set the roll period N and record it in the manifest.  The live
 // filters are rebuilt for the new schedule, so this is meant to be
 // called when the store is created, before it holds much.
+//
+// N is also where the tiers divide (tierStart), so the segments are
+// re-tiered for it: a larger N pulls the newest history back into the
+// active tier, where the rebuilt filters must cover it -- a filter
+// claiming a block range while a segment inside that range sat in
+// history, uncovered, would answer "absent" for keys it never saw --
+// and a smaller N hands the oldest active segments to history as a
+// roll would.  Not the protocol path: it takes both locks.
 func (s *SegmentStore) SetFilterBlocks(n uint64) (err error) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
@@ -189,6 +188,44 @@ func (s *SegmentStore) SetFilterBlocks(n uint64) (err error) {
 		return nil
 	}
 	s.FilterBlocks = n
+	start := s.tierStart()
+	s.History.Lock()
+	back := len(s.history)
+	for back > 0 && s.history[back-1].meta.first() >= start {
+		back--
+	}
+	if back < len(s.history) {
+		pulled := s.history[back:]
+		s.active = append(append([]*segment(nil), pulled...), s.active...)
+		s.history = append([]*segment(nil), s.history[:back]...)
+		if back > 0 {
+			s.historyNewest = s.history[back-1].meta
+		} else {
+			s.historyNewest, s.historyAny = SegmentMeta{}, false
+		}
+		// A segment pulled back is active again and the active manifest
+		// names it as such; any handoff entry it still had would name
+		// it a second time now and, once it is handed off again, leave
+		// a stale entry behind
+		s.handoffMu.Lock()
+		kept := s.handoffs[:0]
+		for _, h := range s.handoffs {
+			back := false
+			for _, seg := range pulled {
+				if h.seg == seg {
+					back = true
+				}
+			}
+			if !back {
+				kept = append(kept, h)
+			}
+		}
+		s.handoffs = kept
+		s.handoffMu.Unlock()
+		s.epoch++
+	}
+	s.History.Unlock()
+	s.handoffBelowWindow()
 	if err = s.rebuildKeyFilters(); err != nil {
 		return err
 	}
@@ -204,16 +241,18 @@ func checkFilterBlocks(n uint64) error {
 }
 
 // advanceBlock
-// Move the live tail on to a later block, and roll the filters to match.
-// Every change to blockHeight goes through here so that no path can
-// advance the block and leave the window behind.  The caller must hold
-// the Mutex.
+// Move the live tail on to a later block, roll the filters to match,
+// and hand the segments the window has left behind to history.  Every
+// change to blockHeight goes through here so that no path can advance
+// the block and leave the window -- or the tiers -- behind.  The
+// caller must hold the Mutex.
 func (s *SegmentStore) advanceBlock(height uint64) {
 	if height <= s.blockHeight {
 		return
 	}
 	s.blockHeight = height
 	s.rollKeyFilters()
+	s.handoffBelowWindow()
 }
 
 // rollKeyFilters
@@ -299,7 +338,7 @@ func (s *SegmentStore) rollKeyFilters() {
 // attachCold adds them.
 func (s *SegmentStore) buildKeyFilter(start, expected uint64) (f *keyFilter, err error) {
 	var held uint64
-	for _, seg := range s.segments {
+	for _, seg := range s.active {
 		if seg.meta.first() >= start {
 			held += uint64(seg.count)
 		}
@@ -309,7 +348,7 @@ func (s *SegmentStore) buildKeyFilter(start, expected uint64) (f *keyFilter, err
 		expected = held
 	}
 	f = &keyFilter{start: start, keys: s.newKeyFilter(expected)}
-	for _, seg := range s.segments {
+	for _, seg := range s.active { // Only the active tier can lie at or above a filter's start
 		if seg.meta.first() >= start {
 			if err = s.addSegmentKeys(f.keys, seg); err != nil {
 				return nil, err
@@ -377,7 +416,7 @@ func (s *SegmentStore) currentFilterClaim() (c filterClaim, ok bool) {
 		return c, false
 	}
 	c.Start = start
-	for _, seg := range s.segments {
+	for _, seg := range s.active {
 		if seg.meta.first() < start {
 			continue
 		}

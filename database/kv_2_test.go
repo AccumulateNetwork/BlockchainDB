@@ -166,7 +166,7 @@ func TestKV2BlockSealAfterAutoSeals(t *testing.T) {
 		_, err = kv.PutPerm(keys[i], []byte("v"))
 		require.NoError(t, err)
 	}
-	require.Greater(t, len(kv.PermKV.segments), 1, "the tail must have auto-sealed for this to test anything")
+	require.Greater(t, len(kv.PermKV.sealedSegments()), 1, "the tail must have auto-sealed for this to test anything")
 
 	_, err = kv.Seal(1)
 	require.NoError(t, err, "the first block boundary must be sealable after auto-seals")
