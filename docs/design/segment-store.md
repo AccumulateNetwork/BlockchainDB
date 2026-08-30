@@ -672,6 +672,46 @@ keeps reading after the path is unlinked. A reader can therefore hold
 a segment open across a compaction that retires and deletes it, which
 is what lets iteration run without the store's lock.
 
+### Merges stream; nothing is held per key
+
+Compaction, the per-shard merge and set packing all used to resolve a
+merge by building maps: one of every key in the run to pick the newest
+copy, one to remember where each landed, and a slice of the keys to
+sort. That is O(distinct keys), and a dynamic layer's keys are mostly
+distinct — every transaction's status is a key of its own. On an
+8-node Accumulate network at 500 tx/s, one compaction of a 5.3 GB
+dynamic layer held **2.0 GB** of those maps on a node with a 2.5 GB
+limit; the garbage collector took 76% of the CPU trying to stay under
+it and the partition wedged (issue #59). The maps had existed before
+the lock split (#57); then the node stopped allocating while compaction
+held the lock, and the pause hid the memory.
+
+Every sealed segment's index is sorted by key, so a merge is a k-way
+merge of sorted runs. `mergeIndexes` holds one 48 KB read cursor per
+input, always takes the smallest key, and where the same key appears in
+more than one input keeps the newest; a repeated key's older copies sit
+at the top of the heap right behind the winner and are retired with it.
+Two passes: the first only counts distinct keys, because the data
+header, the index header and the bloom filter are written before the
+records — and an immutable segment's hash covers its header, so it
+cannot be patched afterwards. The second streams: `CompactHistory`
+reads each winner's value and appends it; `MergeBelow` copies bodies
+verbatim and shifts each entry by where its body landed; a block set
+writes the whole file front to back — header, directory, every shard's
+index through the merge (filling the one bloom as it goes), the bloom,
+then the bodies.
+
+Measured, one million records over 100 segments, ~900,000 distinct
+keys, peak heap growth during `CompactHistory`:
+
+| | peak heap |
+|---|---|
+| maps (before) | 453 MB |
+| streaming (after) | under 50 MB, ~5 MB of it cursor buffers |
+
+`TestCompactionMemoryIsBoundedByInputs` pins it, and fails against the
+map-based code by that margin.
+
 ### Reads share the lock; the file pool is sharded
 
 Every read used to take the store's mutex exclusively, and `KV2.Get`

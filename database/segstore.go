@@ -295,16 +295,22 @@ func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
 // where the body landed, and a reader adds that base instead of this
 // one.  Nothing in an index is rewritten when it is moved.
 func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
+	value = make([]byte, dbb.Length)
+	return value, s.readValue(*dbb, value)
+}
+
+// readValue reads a value into buf, which must be dbb.Length long: for
+// a caller that reads many values in a row and does not want an
+// allocation per value.  The offset is body-relative, as every index
+// entry's is.
+func (s *segment) readValue(dbb DBBKey, buf []byte) (err error) {
 	data, release, err := s.data()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer release()
-	value = make([]byte, dbb.Length)
-	if _, err = data.ReadAt(value, segDataHdrSize+int64(dbb.Offset)); err != nil {
-		return nil, err
-	}
-	return value, nil
+	_, err = data.ReadAt(buf, segDataHdrSize+int64(dbb.Offset))
+	return err
 }
 
 // SegmentStore
@@ -2356,12 +2362,8 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	// to reclaim; compactionRun already refuses runs shorter than two,
 	// so anything here has at least two segments to fold together.
 
-	winners, keys, err := s.mergeInputs(run)
-	if err != nil {
-		return false, err
-	}
 	last := run[len(run)-1].meta
-	meta, seg, err := s.writeMergedSegment(winners, keys, last.Height, last.Seq+1)
+	meta, seg, err := s.writeMergedRun(run, last.Height, last.Seq+1)
 	if err != nil {
 		return false, err
 	}
@@ -2426,18 +2428,36 @@ func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok boo
 // what the protocol path can do meanwhile.  Nil except under test.
 var maintenanceHook func()
 
-// writeMergedSegment
-// Write the resolved keys and values of a merge into a new sealed
-// segment at (height, seq), build its index, and open it.  No lock is
-// needed -- the inputs are immutable -- and the caller is responsible
-// for committing it into the segment list.
+// writeMergedRun
+// Write a run of segments into one new sealed segment at (height, seq)
+// holding the newest value for every key in the run, build its index,
+// and open it.  No lock is needed -- the inputs are immutable -- and
+// the caller is responsible for committing it into the segment list.
+//
+// Two passes over the inputs' sorted indexes, both streaming
+// (mergeIndexes).  The first only counts distinct keys, which is what
+// the data header, the index header and the bloom filter need to be
+// written up front -- and an immutable segment's hash covers its
+// header, so the header cannot be patched in afterwards.  The second
+// emits each winner in key order: its value is read from whichever
+// input holds it and appended to the data file, and its index record
+// goes straight to the index writer.  Nothing is held per key.
+//
+// The values are read back one at a time and in key order, which is
+// random order within each input's data file; that was already so, and
+// a merge that reclaims space has to touch every surviving value.  What
+// changed is that the keys are no longer all in memory at once (issue
+// #59).
 //
 // The segment is complete and durable when this returns; it is simply
 // not yet named by the manifest, which is what makes the commit that
 // follows the only thing that decides whether the merge happened.
-func (s *SegmentStore) writeMergedSegment(
-	winners map[[32]byte]mergeInput, keys [][32]byte, height, seq uint64,
-) (meta SegmentMeta, merged *segment, err error) {
+func (s *SegmentStore) writeMergedRun(run []*segment, height, seq uint64) (meta SegmentMeta, merged *segment, err error) {
+	count, err := mergeIndexes(run, nil)
+	if err != nil {
+		return meta, nil, err
+	}
+
 	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 	tmpPath := filepath.Join(s.Directory, segCompactName+segTmpSuffix)
@@ -2462,32 +2482,43 @@ func (s *SegmentStore) writeMergedSegment(
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
+	binary.BigEndian.PutUint64(header[16:], count)
 	if _, err = out.Write(header[:]); err != nil {
 		return meta, nil, err
 	}
 
-	// Record where each value lands, so the index needs no read-back
-	entries := make(map[[32]byte]*DBBKey, len(keys))
-	offset := uint64(segDataHdrSize)
+	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	iw, err := newIndexWriter(indexPath, count)
+	if err != nil {
+		return meta, nil, err
+	}
+	defer iw.abort()
 
+	body := uint64(0) // Bytes of records written so far: the next value's body-relative offset
 	var recHdr [segRecHdrSize]byte
-	for _, key := range keys {
-		w := winners[key]
-		value, err := w.seg.value(w.dbb)
-		if err != nil {
-			return meta, nil, err
+	value := make([]byte, 0, 4096)
+	_, err = mergeIndexes(run, func(src int, key [32]byte, dbb DBBKey) error {
+		if uint64(cap(value)) < dbb.Length {
+			value = make([]byte, dbb.Length)
+		}
+		value = value[:dbb.Length]
+		if err := run[src].readValue(dbb, value); err != nil {
+			return err
 		}
 		copy(recHdr[:32], key[:])
-		binary.BigEndian.PutUint64(recHdr[32:], uint64(len(value)))
-		if _, err = out.Write(recHdr[:]); err != nil {
-			return meta, nil, err
+		binary.BigEndian.PutUint64(recHdr[32:], dbb.Length)
+		if _, err := out.Write(recHdr[:]); err != nil {
+			return err
 		}
-		if _, err = out.Write(value); err != nil {
-			return meta, nil, err
+		if _, err := out.Write(value); err != nil {
+			return err
 		}
-		entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
-		offset += segRecHdrSize + uint64(len(value))
+		rel := DBBKey{Offset: body + segRecHdrSize, Length: dbb.Length}
+		body += segRecHdrSize + dbb.Length
+		return iw.write(key, rel)
+	})
+	if err != nil {
+		return meta, nil, err
 	}
 	if err = bw.Flush(); err != nil {
 		return meta, nil, err
@@ -2504,12 +2535,11 @@ func (s *SegmentStore) writeMergedSegment(
 		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
-	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = writeIndexFile(indexPath, keys, entries); err != nil {
+	if err = iw.finish(); err != nil {
 		return meta, nil, err
 	}
 
-	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(keys)), Hash: ""}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: count}
 	if h != nil {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
@@ -2576,70 +2606,6 @@ func layoutBodies(segs []*segment) (sizes []int64, bases []uint64, total uint64,
 	return sizes, bases, total, nil
 }
 
-// shiftedIndex
-// The index records of several segments as they read once their bodies
-// are laid end to end: each entry's offset moved by where its segment's
-// body landed, one entry per key, sorted.  Returns raw 48-byte records,
-// relative to the combined body, which is the form an index file and a
-// block-set file both store.
-//
-// This is the whole per-key cost of merging: the index is 48 bytes a
-// key and already sorted within each source, so the work is a read of
-// each index, an add per entry, and a sort of a few hundred records.
-// No value is touched.  With ONE source there is not even the add: its
-// index is already relative to its body, and its body is the whole
-// result, so the records are copied verbatim.
-//
-// A key that appears in two sources -- possible in the Perm layer only
-// through an import, which permits an identical value and rejects a
-// differing one -- keeps the NEWEST source's entry.  The sources are
-// taken newest first so that a stable sort leaves that entry first
-// among equals, and the older ones are dropped.
-func shiftedIndex(segs []*segment, bases []uint64) (records []byte, err error) {
-	var total int64
-	for _, seg := range segs {
-		total += seg.count
-	}
-	records = make([]byte, 0, total*DBKeyFullSize)
-	for i := len(segs) - 1; i >= 0; i-- {
-		seg := segs[i]
-		shift := bases[i]
-		start := len(records)
-		records = records[:start+int(seg.count)*DBKeyFullSize]
-		index, release, err := seg.index()
-		if err != nil {
-			return nil, err
-		}
-		_, err = index.ReadAt(records[start:], segIndexHdrSize)
-		release()
-		if err != nil {
-			return nil, err
-		}
-		if shift == 0 {
-			continue // Verbatim: the body sits where the index says
-		}
-		for pos := start; pos < len(records); pos += DBKeyFullSize {
-			off := binary.BigEndian.Uint64(records[pos+32:])
-			binary.BigEndian.PutUint64(records[pos+32:], off+shift)
-		}
-	}
-	if len(segs) == 1 {
-		return records, nil // One source: already sorted and unique
-	}
-	sort.Stable(recordSort(records))
-	w := 0
-	for r := 0; r < len(records); r += DBKeyFullSize {
-		if w > 0 && bytes.Equal(records[w-DBKeyFullSize:w-DBKeyFullSize+32], records[r:r+32]) {
-			continue // An older copy of the key just kept
-		}
-		if w != r {
-			copy(records[w:w+DBKeyFullSize], records[r:r+DBKeyFullSize])
-		}
-		w += DBKeyFullSize
-	}
-	return records[:w], nil
-}
-
 // concatSegments
 // Build one segment from several by COPYING their bodies end to end
 // and shifting their index offsets, rather than reading every value
@@ -2673,7 +2639,9 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 	if err != nil {
 		return meta, nil, err
 	}
-	records, err := shiftedIndex(segs, bases)
+	// Count first, so the index header and bloom can be written before
+	// the records stream through (issue #59)
+	count, err := mergeIndexes(segs, nil)
 	if err != nil {
 		return meta, nil, err
 	}
@@ -2733,12 +2701,24 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 	}
 	// The manifest commit's directory fsync covers this rename
 
+	// The index: each input's entries shifted by where its body landed,
+	// merged in key order, newest winning a repeated key, streamed
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = writeIndexRecords(indexPath, records); err != nil {
+	iw, err := newIndexWriter(indexPath, count)
+	if err != nil {
+		return meta, nil, err
+	}
+	defer iw.abort()
+	if _, err = mergeIndexes(segs, func(src int, key [32]byte, dbb DBBKey) error {
+		return iw.write(key, DBBKey{Offset: dbb.Offset + bases[src], Length: dbb.Length})
+	}); err != nil {
+		return meta, nil, err
+	}
+	if err = iw.finish(); err != nil {
 		return meta, nil, err
 	}
 
-	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(records) / DBKeyFullSize)}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: count}
 	if h != nil {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
@@ -2910,57 +2890,6 @@ func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
 		s.releaseFromHistory(seg)
 	}
 	return n, nil
-}
-
-// mergeInput names where a key's surviving value lives
-type mergeInput struct {
-	seg *segment
-	dbb *DBBKey
-}
-
-// mergeInputs
-// Resolve what a merge of segs should write: one entry per key, taking
-// the newest where a key appears more than once, and the keys sorted so
-// the output is a sorted run.
-//
-// Newest-wins matters even in the Perm layer, where a key is written
-// once and never overwritten: adopting a peer's segment can introduce a
-// second copy of a key the store already holds, because
-// checkNoConflicts rejects a DIFFERING value and permits an identical
-// one.  The copies agree, so which one survives does not matter -- but
-// the merge still has to emit only one.
-//
-// No lock: the segments are immutable and the caller holds them.
-func (s *SegmentStore) mergeInputs(segs []*segment) (winners map[[32]byte]mergeInput, keys [][32]byte, err error) {
-	winners = make(map[[32]byte]mergeInput)
-	for i := len(segs) - 1; i >= 0; i-- { // Newest first, so it wins
-		seg := segs[i]
-		entries := make([]byte, seg.count*DBKeyFullSize)
-		index, release, err := seg.index()
-		if err != nil {
-			return nil, nil, err
-		}
-		_, err = index.ReadAt(entries, segIndexHdrSize)
-		release()
-		if err != nil {
-			return nil, nil, err
-		}
-		for pos := 0; pos+DBKeyFullSize <= len(entries); pos += DBKeyFullSize {
-			key, dbb, err := GetDBBKey(entries[pos : pos+DBKeyFullSize])
-			if err != nil {
-				return nil, nil, err
-			}
-			if _, seen := winners[key]; !seen {
-				winners[key] = mergeInput{seg, dbb}
-			}
-		}
-	}
-	keys = make([][32]byte, 0, len(winners))
-	for key := range winners {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-	return winners, keys, nil
 }
 
 // SegmentPaths
