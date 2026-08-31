@@ -1359,6 +1359,11 @@ func (s *SegmentStore) writeManifest() (err error) {
 	if err = commitJSON(s.Directory, segManifestName, &m); err != nil {
 		return err
 	}
+	anames := make([]string, 0, len(m.Segments))
+	for _, sm := range m.Segments {
+		anames = append(anames, sm.File)
+	}
+	auditUnlink(s.Directory, "ACTIVE-COMMIT["+strings.Join(anames, ",")+"]")
 
 	// Committed.  The handoffs history has recorded are named by neither
 	// this manifest nor any later one, and the files history left for
@@ -1400,6 +1405,11 @@ func (s *SegmentStore) writeHistoryManifest() (err error) {
 	if err = commitJSON(s.Directory, segHistoryName, &m); err != nil {
 		return err
 	}
+	hnames := make([]string, 0, len(m.Segments))
+	for _, sm := range m.Segments {
+		hnames = append(hnames, sm.File)
+	}
+	auditUnlink(s.Directory, "HISTORY-COMMIT["+strings.Join(hnames, ",")+"]")
 	s.handoffMu.Lock()
 	for i := range s.handoffs {
 		s.handoffs[i].recorded = true
