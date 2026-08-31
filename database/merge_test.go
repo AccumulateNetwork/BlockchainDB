@@ -367,17 +367,19 @@ func TestMergeFoldsEachWindowOnce(t *testing.T) {
 	defer store.Close()
 	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
-	const windows = 5
+	const windows = 20
 	const perBlock = 4
 	kr := NewFastRandom([]byte{177})
 
 	block := uint64(0)
 	var outputs []SegmentMeta
+	var keys uint64
 	for w := 0; w < windows; w++ {
 		for b := 0; b < MinFilterBlocks; b++ {
 			block++
 			for i := 0; i < perBlock; i++ {
 				require.NoError(t, store.Put(kr.NextHash(), []byte{byte(block), byte(i)}))
+				keys++
 			}
 			_, err = store.Seal(block)
 			require.NoError(t, err)
@@ -388,37 +390,34 @@ func TestMergeFoldsEachWindowOnce(t *testing.T) {
 		}
 		meta, merged, err := store.MergeBelow(watermark)
 		require.NoErrorf(t, err, "merge %d", w)
-		if !merged {
-			continue
+		if merged {
+			outputs = append(outputs, meta)
 		}
-		outputs = append(outputs, meta)
 	}
-	require.GreaterOrEqual(t, len(outputs), 3, "several merges must have run")
+	require.GreaterOrEqual(t, len(outputs), 5, "several merges must have run")
 
-	// Each pass folds one window, so its output holds about one
-	// window's keys -- never the whole layer.  Before the fix the
-	// counts grew with every pass: 80, 160, 240...
-	windowKeys := uint64(MinFilterBlocks * perBlock)
-	for i, m := range outputs {
-		require.LessOrEqualf(t, m.Count, 2*windowKeys,
-			"merge %d wrote %d keys; one window is ~%d -- it folded the previous output back in",
-			i, m.Count, windowKeys)
+	// The number that separates amortised from quadratic: what every
+	// pass wrote, added up, against what the store holds.  Folding the
+	// previous output back in makes pass k rewrite everything so far,
+	// so the total grows with the SQUARE of the chain -- for 20 windows
+	// here, about ten times the data.  The ratio rule rewrites a block
+	// only once enough has gathered behind it to justify its size, so a
+	// byte is copied a few times over the life of the store.
+	var written uint64
+	for _, m := range outputs {
+		written += m.Count
 	}
+	require.LessOrEqualf(t, written, 5*keys,
+		"merging wrote %d keys to hold %d: a pass is copying the layer, not what arrived", written, keys)
 
-	// And every merged block from an earlier pass is still on disk under
-	// its own name: merged once, then permanent
-	for i, m := range outputs[:len(outputs)-1] {
-		_, err := os.Stat(filepath.Join(dir, m.File))
-		require.NoErrorf(t, err, "merged block %d (%s) was rewritten by a later pass", i, m.File)
-	}
-
-	// History is the merged blocks, oldest first, plus whatever has not
-	// been merged yet -- not one segment holding everything
+	// And the merged blocks stay few.  One per pass, never folded into
+	// each other, is the inode problem merging exists to solve (#30).
 	store.History.RLock()
 	n := len(store.history)
 	store.History.RUnlock()
-	require.GreaterOrEqualf(t, n, len(outputs),
-		"each merged window must stand as its own block; history has %d", n)
+	require.Lessf(t, n, len(outputs),
+		"history holds %d segments after %d merges; merged blocks must consolidate, not accumulate one per pass",
+		n, len(outputs))
 }
 
 // TestRejectedImportIsNotAdoptedAfterACrash

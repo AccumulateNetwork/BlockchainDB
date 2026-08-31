@@ -112,11 +112,16 @@ window (MinFilterBlocks).
   offsets so an index survives its body being placed in a different
   file behind a different base; nothing in an index or a body is ever
   rewritten (#37, #47).
-- **A finished window of perm data merges exactly once**, into one
-  merged block (per shard).  Merged blocks are permanent: they are
-  never re-merged, never rewritten, never moved.  Merge cost is
-  therefore O(window) per window, and lifetime merge cost is linear in
-  the data — never quadratic (#63).
+- **A finished window of perm data is merged into a merged block**,
+  per shard, and a merged block is folded again only when enough new
+  data has gathered behind it to justify its size — the same
+  amortisation the dynamic layer compacts by (1.5).  That is the
+  middle of two failures: folding every pass re-copies the whole layer
+  each time, which is quadratic in the life of the chain (#63); never
+  folding a merged block again leaves one per pass forever, which is
+  the file-count problem merging exists to solve (#30).  Under the
+  ratio a byte is copied a few times over the store's life, and the
+  merged blocks stay few.
 - **Deep reads are explicit** (`GetDeep`): they walk merged blocks
   newest-first, one filter probe per block, binary-searching only a
   block whose filter claims the key.  The protocol path never takes
@@ -342,10 +347,11 @@ run is still in place and discards its output if not.
   set instead of holding frozen garbage forever (#65).
 - **Perm window merge** — `MergeBelow` → `concatSegments`: byte-
   verbatim body copies, indexes shifted by their body's base, one
-  identity after the run's newest (1.4).  The run starts after the
-  merged blocks already standing — a merged block carries `Span > 0`
-  and is merged once, then permanent — so a pass folds the newly
-  finished window and nothing else (#63).
+  identity after the run's newest (1.4).  The run is chosen by the
+  same rule compaction uses (`compactionRunWithin`): the newest suffix
+  below the watermark, reaching one block further back only when what
+  has gathered behind it is worth its size, inside one pass's budget
+  (#63).
 - **Pack tier** — `KVShard.PackFinalized` + `DropBelow`
   (`kv_shard.go`, `blockset.go`): builds a `.bset` from only the
   segments since the previous set (64 B header, 512-entry directory,
