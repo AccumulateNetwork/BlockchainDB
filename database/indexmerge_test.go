@@ -175,3 +175,183 @@ func TestMergeIndexesKeepsTheNewestCopy(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, n, n2)
 }
+
+// TestCompactionPassIsBounded
+// One compaction pass must not grow with history (issue #59: the
+// unbounded pass reached 12-19 s after four hours and was still
+// growing).  compactionRun caps a run at CompactPassRecords; when the
+// newest suffix cannot fold under the budget, it falls back to the
+// newest adjacent pair that fits, so consolidation advances one
+// bounded step per pass instead of stopping or ballooning.
+func TestCompactionPassIsBounded(t *testing.T) {
+	mk := func(records ...int64) (h []*segment) {
+		for _, r := range records {
+			h = append(h, &segment{records: r})
+		}
+		return h
+	}
+	old := CompactPassRecords
+	defer func() { CompactPassRecords = old }()
+	CompactPassRecords = 1000
+
+	// Suffix folds while ratio holds and the budget allows
+	run, at := compactionRun(mk(5000, 300, 200, 100), DefaultCompactRatio)
+	require.Len(t, run, 3, "the three small ones fold; 5000 is over the budget")
+	require.Equal(t, 1, at)
+	var total int64
+	for _, s := range run {
+		total += s.records
+	}
+	require.LessOrEqual(t, uint64(total), CompactPassRecords)
+
+	// Ratio still gates: a big segment with little behind it stays put
+	run, _ = compactionRun(mk(800, 10), DefaultCompactRatio)
+	require.Nil(t, run, "10 records behind 800 is not worth rewriting 800")
+
+	// Pair fallback: every suffix is over budget, but an adjacent pair
+	// deeper in fits -- consolidation advances instead of stopping
+	run, at = compactionRun(mk(400, 500, 2000), DefaultCompactRatio)
+	require.Len(t, run, 2, "the (400,500) pair fits the budget")
+	require.Equal(t, 0, at)
+	require.Equal(t, int64(400), run[0].records)
+
+	// Nothing fits: two giants and nothing else
+	run, _ = compactionRun(mk(2000, 3000), DefaultCompactRatio)
+	require.Nil(t, run)
+}
+
+// TestCompactHistoryFoldsANonSuffixRun
+// The budget hands CompactHistory runs that exclude an over-budget
+// segment at the head of history.  The swap must replace exactly the
+// chosen run, in place, leave the big segment untouched, and every key
+// must survive with its newest value.
+func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {
+	dir := storeDir(t, "midrun")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	kr := NewFastRandom([]byte{212})
+	var keys [][32]byte
+	val := func(i int) []byte { return []byte{byte(i), byte(i >> 8), 7} }
+	seal := func(n int) { // n records, one segment
+		for j := 0; j < n; j++ {
+			k := kr.NextHash()
+			keys = append(keys, k)
+			require.NoError(t, store.Put(k, val(len(keys)-1)))
+		}
+		_, err := store.SealNext()
+		require.NoError(t, err)
+	}
+	seal(900)
+	seal(300)
+	seal(300)
+	// Roll the window so all three segments become history
+	for b := uint64(1); b <= 3*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	require.Len(t, store.history, 3)
+
+	old := CompactPassRecords
+	defer func() { CompactPassRecords = old }()
+	CompactPassRecords = 700 // The 900-record segment can never be in a run
+
+	compacted, err := store.CompactHistory()
+	require.NoError(t, err)
+	require.True(t, compacted, "the two 300s fold under the budget")
+	require.Len(t, store.history, 2)
+	require.Equal(t, int64(900), store.history[0].records, "the over-budget segment stands untouched")
+
+	// A second pass has nothing it may touch: the survivors' pair is
+	// over the budget
+	compacted, err = store.CompactHistory()
+	require.NoError(t, err)
+	require.False(t, compacted)
+
+	for i, k := range keys {
+		v, err := store.Get(k)
+		require.NoErrorf(t, err, "key %d lost", i)
+		require.Equal(t, val(i), v, "key %d value", i)
+	}
+	// And it survives a reopen: the swap committed a consistent manifest
+	require.NoError(t, store.Close())
+	re, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	for i, k := range keys {
+		v, err := re.Get(k)
+		require.NoErrorf(t, err, "key %d lost across reopen", i)
+		require.Equal(t, val(i), v)
+	}
+	require.NoError(t, re.Close())
+}
+
+// TestSealPromotesAShadowedTail
+// Sealing used to rewrite a mutable tail that held overwrites -- one
+// pread per record, under the store lock, inside the Put that tipped
+// SealLimit: 10-15 s pauses every few blocks at a 100k-record tail
+// (issue #60).  A seal now promotes the file as it stands: the sealed
+// segment keeps the shadowed bytes (records > count), the index built
+// from the live map lands every lookup on the newest copy, and
+// reclamation belongs to CompactHistory, off the protocol lock.
+func TestSealPromotesAShadowedTail(t *testing.T) {
+	dir := storeDir(t, "shadowseal")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+
+	kr := NewFastRandom([]byte{213})
+	keys := make([][32]byte, 500)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, store.Put(keys[i], []byte{1, byte(i), byte(i >> 8)}))
+	}
+	for i := range keys { // Overwrite every key: half the tail is shadowed
+		require.NoError(t, store.Put(keys[i], []byte{2, byte(i), byte(i >> 8)}))
+	}
+	_, err = store.SealNext()
+	require.NoError(t, err)
+
+	segs := store.sealedSegments()
+	require.Len(t, segs, 1)
+	seg := segs[0]
+	require.Equal(t, int64(500), seg.count, "one index entry per distinct key")
+	require.Equal(t, int64(1000), seg.records, "the shadowed records ride along; reclamation is compaction's job, not the seal's")
+
+	for i, k := range keys {
+		v, err := store.Get(k)
+		require.NoErrorf(t, err, "key %d", i)
+		require.Equal(t, []byte{2, byte(i), byte(i >> 8)}, v, "key %d must read its newest copy", i)
+	}
+
+	// And compaction, not the seal, reclaims the dead bytes
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+	for b := uint64(1); b <= 3*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	// One segment cannot fold; give it a sibling worth folding -- the
+	// ratio gate rightly refuses to rewrite 1,000 records to reclaim
+	// one, so overwrite every key again: 500 records, half the older
+	// segment, over the quarter the ratio asks
+	for i := range keys {
+		require.NoError(t, store.Put(keys[i], []byte{3, byte(i), byte(i >> 8)}))
+	}
+	_, err = store.SealNext()
+	require.NoError(t, err)
+	for b := uint64(3*MinFilterBlocks + 1); b <= 6*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	compacted, err := store.CompactHistory()
+	require.NoError(t, err)
+	require.True(t, compacted)
+	segs = store.sealedSegments()
+	require.Equal(t, segs[0].count, segs[0].records, "compaction dropped the shadowed copies")
+	for i, k := range keys {
+		v, err := store.Get(k)
+		require.NoErrorf(t, err, "key %d after compaction", i)
+		require.Equal(t, []byte{3, byte(i), byte(i >> 8)}, v)
+	}
+}

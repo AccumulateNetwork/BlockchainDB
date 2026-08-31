@@ -26,7 +26,11 @@ files*, below). For a segment file on its own the base is the header
 length.
 
 Writes append to the live tail. `Seal(height)` turns the tail into an
-immutable segment; nothing already written is ever moved or rewritten.
+immutable segment; nothing already written is ever moved or rewritten —
+including a mutable tail's overwritten records, which stay in the
+sealed file as dead bytes until compaction reclaims them. The seal
+itself is a flush, one fsync and a rename, whatever `SealLimit` is:
+its cost is a constant, not `SealLimit × record size` (issue #60).
 
 A segment is identified by **(block, seq)**, not by block alone. The
 block is globally agreed, which is what lets a peer decide whether it

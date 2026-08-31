@@ -2039,17 +2039,27 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 
-	var sl sealed
-	if uint64(len(s.live)) == s.liveRecords {
-		// No shadowed records: promote the live file as it stands
-		if sl, err = s.promoteLiveFile(dataPath); err != nil {
-			return meta, err
-		}
-	} else {
-		// Shadowed records present (overwrites): write a compacted copy
-		if sl, err = s.rewriteLiveFile(dataPath); err != nil {
-			return meta, err
-		}
+	// The live file is promoted as it stands -- an fsync and a rename,
+	// never a rewrite.  A mutable tail holds shadowed records
+	// (overwrites), and sealing used to rewrite it to drop them: one
+	// pread per record, under the store lock, inside the Put that
+	// tipped SealLimit.  At 100,000 records that was a ~98 MB tail read
+	// back a syscall at a time every few blocks, and every node paused
+	// 10-15 s while 71 goroutines queued on the lock (issue #60).
+	//
+	// Nothing needs the rewrite.  The index is built from s.live, which
+	// already holds the newest offset for every key, so lookups land on
+	// the newest copy; the shadowed bytes ride along dead until
+	// CompactHistory -- whose job reclamation is, off this lock -- folds
+	// them away.  The seal's cost is the flush of what the tail's own
+	// buffer holds, one fsync, and a rename: bounded by a constant, not
+	// by SealLimit, which is the #57 invariant applied to the innermost
+	// part of the active tier.  (An immutable tail never shadows -- a
+	// duplicate put is refused or a no-op -- so the Perm layer loses
+	// nothing it ever had.)
+	sl, err := s.promoteLiveFile(dataPath)
+	if err != nil {
+		return meta, err
 	}
 
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
@@ -2174,97 +2184,6 @@ func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
 	return sl, nil
 }
 
-// rewriteLiveFile
-// Write the live tail's newest record per key to a new sealed segment,
-// dropping records shadowed by later writes
-func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
-	keys := make([][32]byte, 0, len(s.live))
-	for key := range s.live {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-
-	tmpPath := dataPath + segTmpSuffix
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return sl, err
-	}
-	defer func() {
-		if f != nil {
-			f.Close()
-			os.Remove(tmpPath)
-		}
-	}()
-
-	bw := bufio.NewWriterSize(f, segWriteBuffer)
-	var h hash.Hash
-	var out io.Writer = bw
-	if !s.Mutable { // Immutable segments are transported; a peer verifies this
-		h = sha256.New()
-		out = io.MultiWriter(bw, h)
-	}
-	var header [segDataHdrSize]byte
-	binary.BigEndian.PutUint32(header[:], segmentMagic)
-	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
-	if _, err = out.Write(header[:]); err != nil {
-		return sl, err
-	}
-
-	// Record where each value lands, so the index needs no read-back
-	sl.order, sl.entries = keys, make(map[[32]byte]*DBBKey, len(keys))
-	offset := uint64(segDataHdrSize)
-
-	var recHdr [segRecHdrSize]byte
-	value := make([]byte, 0, 1024)
-	for _, key := range keys {
-		dbb := s.live[key]
-		if uint64(cap(value)) < dbb.Length {
-			value = make([]byte, dbb.Length)
-		}
-		value = value[:dbb.Length]
-		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return sl, err
-		}
-		copy(recHdr[:32], key[:])
-		binary.BigEndian.PutUint64(recHdr[32:], dbb.Length)
-		if _, err = out.Write(recHdr[:]); err != nil {
-			return sl, err
-		}
-		if _, err = out.Write(value); err != nil {
-			return sl, err
-		}
-		sl.entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: dbb.Length}
-		offset += segRecHdrSize + dbb.Length
-	}
-	if err = bw.Flush(); err != nil {
-		return sl, err
-	}
-	if err = f.Sync(); err != nil {
-		return sl, err
-	}
-	if err = f.Close(); err != nil {
-		f = nil
-		return sl, err
-	}
-	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
-		return sl, err
-	}
-	// The manifest commit's directory fsync covers this rename
-
-	// The old live file is superseded by the sealed segment
-	if s.liveFile.File != nil {
-		s.liveFile.File.Close()
-		s.liveFile.File = nil
-	}
-	os.Remove(s.liveFile.Filename)
-	if h != nil {
-		sl.hash = fmt.Sprintf("%x", h.Sum(nil))
-	}
-	return sl, nil
-}
-
 // DefaultCompactRatio
 // How much newer data must have gathered behind a history segment, as
 // a share of that segment's size, before a compaction rewrites it to
@@ -2290,29 +2209,65 @@ const DefaultCompactRatio = 0.25
 // reverse.
 var CompactRatio = DefaultCompactRatio
 
+// CompactPassRecords bounds one compaction pass: a run is chosen so
+// that its inputs hold at most this many physical records, whatever
+// has accumulated.  The default, 4Mi records, is roughly half a
+// gigabyte of Accumulate's dynamic records -- a pass of a few seconds
+// on NVMe -- so however large history grows, one pass costs about
+// that, and the maint lock it holds never delays the per-shard merges
+// behind it by more (issue #59; the unbounded pass measured 12-19 s
+// after four hours at 500 tx/s and was still growing).
+//
+// The price of the bound is that a segment which grows to the budget
+// is no longer folded INTO -- garbage that lands in it after that
+// waits for the cross-shard consolidation (#47's daily tier) rather
+// than for this loop.  Bounded latency for bounded reclamation reach:
+// the budget trades the second for the first, and the default keeps a
+// segment's frozen garbage under CompactRatio of its size at the
+// moment it froze.
+var CompactPassRecords uint64 = 4 << 20
+
 // compactionRun
-// The suffix of history worth compacting into one segment: the newest
-// segment, and each older one in turn while it is no larger than
-// 1/ratio times what has gathered behind it.  A run shorter than two
-// is nothing to do.  Sized by physical record count, which every
-// segment holds in memory, so choosing costs no I/O.
-func compactionRun(history []*segment, ratio float64) (run []*segment) {
+// The run of history worth compacting into one segment, and where it
+// sits.  First choice: the newest suffix, taking each older segment in
+// turn while it is no larger than 1/ratio times what has gathered
+// behind it AND the run stays inside CompactPassRecords.  If that
+// yields nothing (the next segment is too big for the budget), fall
+// back to the newest ADJACENT PAIR that fits the budget, so
+// consolidation still advances -- bounded, one pair per pass -- rather
+// than stopping the moment any segment outgrows the budget.  A run
+// shorter than two is nothing to do.  Sized by physical record count,
+// which every segment holds in memory, so choosing costs no I/O.
+func compactionRun(history []*segment, ratio float64) (run []*segment, at int) {
 	n := len(history)
 	if n == 0 {
-		return nil
+		return nil, 0
 	}
-	var behind float64
+	budget := CompactPassRecords
+	var behind uint64
 	i := n - 1
 	for ; i >= 0; i-- {
-		if i < n-1 && float64(history[i].records)*ratio > behind {
-			break // Too big for what has gathered behind it, and so is everything older
+		r := uint64(history[i].records)
+		if i < n-1 && (float64(r)*ratio > float64(behind) || behind+r > budget) {
+			break // Too big for what gathered behind it, or for one pass
 		}
-		behind += float64(history[i].records)
+		behind += r
 	}
-	if run = history[i+1:]; len(run) < 2 {
-		return nil
+	if run = history[i+1:]; len(run) >= 2 {
+		return run, i + 1
 	}
-	return run
+	// Pair fallback: the newest adjacent pair that fits one pass AND
+	// satisfies the same worth-it rule -- the newer member must be at
+	// least ratio of the older, or the fold rewrites much to reclaim
+	// little.  Without that gate the fallback would fold what the ratio
+	// had just declined.
+	for j := n - 2; j >= 0; j-- {
+		older, newer := uint64(history[j].records), uint64(history[j+1].records)
+		if older+newer <= budget && float64(older)*ratio <= float64(newer) {
+			return history[j : j+2], j
+		}
+	}
+	return nil, 0
 }
 
 // CompactHistory
@@ -2352,8 +2307,7 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 		s.History.RUnlock()
 		return false, err
 	}
-	run := compactionRun(s.history, CompactRatio)
-	at := len(s.history) - len(run) // Where the run sits: history's newest suffix
+	run, at := compactionRun(s.history, CompactRatio)
 	s.History.RUnlock()
 	if run == nil {
 		return false, nil
