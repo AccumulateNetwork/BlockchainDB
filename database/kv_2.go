@@ -228,9 +228,12 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 // Get
 // Get a value from the KV2.  Checks the DynaKV first, then the PermKV.
 //
-// Windowed, like every protocol read (spec 1.3): each layer answers
-// from its window, and a key neither window holds is absent.  Deep
-// history is GetDeep's, explicitly.
+// The two layers answer over different horizons (spec 1.3, 1.5).  The
+// Dyna layer answers from anywhere it holds the key: dynamic values
+// are state, and state does not expire.  The Perm layer answers from
+// its window; permanent data below it is reached explicitly, by
+// GetDeep, because that is the layer that grows without limit and the
+// per-miss history probing was costing 23% of a validator's CPU.
 func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()

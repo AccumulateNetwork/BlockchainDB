@@ -75,7 +75,7 @@ func TestDynaCompressReclaims(t *testing.T) {
 	assert.Len(t, kv2.DynaKV.sealedSegments(), 1, "compaction should leave one generation")
 
 	for i := range keys {
-		v, err := kv2.GetDeep(keys[i])
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d after compress", i)
 		assert.Equalf(t, latest[i], v, "key %d after compress", i)
 	}
@@ -92,7 +92,7 @@ func TestDynaCompressReclaims(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, reopened.Open())
 	for i := range keys {
-		v, err := reopened.GetDeep(keys[i])
+		v, err := reopened.Get(keys[i])
 		require.NoErrorf(t, err, "key %d after compress+reopen", i)
 		assert.Equalf(t, latest[i], v, "key %d after compress+reopen", i)
 	}
@@ -127,7 +127,7 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 	assert.Empty(t, kv2.DynaKV.sealedSegments(),
 		"nothing was overwritten: Compress must not seal a generation in order to rewrite it")
 	for i := range keys {
-		v, err := kv2.GetDeep(keys[i])
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d after a no-op compress", i)
 		assert.Equal(t, values[i], v)
 	}
@@ -154,7 +154,7 @@ func TestDynaCompressIsIdempotent(t *testing.T) {
 	assert.Equal(t, first, kv2.DynaKV.sealedSegments()[0].meta, "nothing to reclaim: the generation should stand as it is")
 
 	for i := range keys {
-		v, err := kv2.GetDeep(keys[i])
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d", i)
 		assert.Equal(t, values[i], v)
 	}
@@ -270,7 +270,7 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	assert.True(t, errors.Is(err, os.ErrNotExist), "an uncommitted compaction below the newest segment is swept")
 
 	for i := range keys {
-		v, err := store.GetDeep(keys[i])
+		v, err := store.Get(keys[i])
 		require.NoErrorf(t, err, "key %d lost by a crash mid-compaction", i)
 		assert.Equalf(t, latest[i], v, "key %d wrong after a crash mid-compaction", i)
 	}
@@ -281,7 +281,7 @@ func TestDynaCompressCrashMidway(t *testing.T) {
 	require.True(t, compacted)
 	require.Len(t, store.sealedSegments(), 2, "one compacted history segment plus the active one")
 	for i := range keys {
-		v, err := store.GetDeep(keys[i])
+		v, err := store.Get(keys[i])
 		require.NoErrorf(t, err, "key %d after recompaction", i)
 		assert.Equal(t, latest[i], v)
 	}
@@ -424,7 +424,7 @@ func TestCompressNeverTouchesTheWindow(t *testing.T) {
 	assert.Equal(t, int64(len(keys)), hist.count, "history keeps one record per key")
 
 	for i := range keys {
-		v, err := kv2.GetDeep(keys[i])
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d", i)
 		assert.Equal(t, values[i], v, "key %d resolved to the wrong generation", i)
 	}
@@ -440,7 +440,7 @@ func TestCompressNeverTouchesTheWindow(t *testing.T) {
 	assert.Equal(t, int64(len(keys)), hist.count)
 	assert.Equal(t, hist.count, hist.records, "one record per key: the superseded copies are gone")
 	for i := range keys {
-		v, err := kv2.GetDeep(keys[i])
+		v, err := kv2.Get(keys[i])
 		require.NoErrorf(t, err, "key %d", i)
 		assert.Equal(t, values[i], v)
 	}

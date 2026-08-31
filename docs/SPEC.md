@@ -87,14 +87,23 @@ window (MinFilterBlocks).
   the hash of its value, so "same key, different value" beyond the
   window would be a hash collision.  This is what makes a permanent
   write O(1) forever (#44).
-- **Reads are windowed too.**  The window is the whole of the
-  protocol's horizon: a key the filters deny is absent, and the
-  protocol path does not search deep history — outside the last N to
-  2N blocks, we assume it isn't there.  Reaching below the window is
-  an explicit, separate operation (1.4) for export and query APIs,
-  never the consensus path.  Per-segment history probing on every
-  miss is the decay curve this rule forbids: measured at 23% of a
-  validator's CPU at block ~245 and growing with the segment count.
+- **Permanent reads are windowed too.**  For the Perm layer the
+  window is the whole of the protocol's horizon: a key the filters
+  deny is absent, and the protocol path does not search deep
+  permanent history — outside the last N to 2N blocks, we assume it
+  isn't there.  Reaching below the window is an explicit, separate
+  operation (1.4) for export and query APIs, never the consensus
+  path.  Per-segment history probing on every miss is the decay curve
+  this rule forbids: measured at 23% of a validator's CPU at block
+  ~245 and growing with the segment count.
+- **Dynamic reads are not windowed.**  A dynamic key is state — the
+  BPT above all — and state must resolve wherever it last landed,
+  however long ago that was.  The Dyna layer therefore searches its
+  history on a miss.  That is affordable precisely because dynamic
+  keys are rare and the layer grows slowly (1.5); if the dynamic
+  layer ever stopped being small, this is the rule that would start
+  to cost, and the answer would be to fix its size, not to window the
+  read.
 
 ### 1.4 The permanent layer
 

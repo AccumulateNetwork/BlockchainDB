@@ -1541,17 +1541,25 @@ func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 	if err != nil || found {
 		return value, err
 	}
-	// The window is the whole of the protocol's horizon: a key the
-	// filters deny is ABSENT, and history is not consulted (spec 1.3).
-	// Probing history cost one resident bloom test per history segment
-	// on every miss -- measured at 23% of a validator's CPU (11% in
-	// Bloom.Test alone) at block ~245, and growing with the segment
-	// count, which is the curve issues #9, #30 and #50 each moved
-	// somewhere else.  inWindow is false only when filters exist and
-	// answered; a store without filters still walks, which is correct
-	// and bounded by the rebuild rule (keyfilter.go).  Reads below the
-	// window are explicit: GetDeep.
-	if !inWindow {
+	// In an IMMUTABLE store the window is the whole of the protocol's
+	// horizon: a key the filters deny is ABSENT, and history is not
+	// consulted (spec 1.3).  Probing history cost one resident bloom
+	// test per history segment on every miss -- measured at 23% of a
+	// validator's CPU (11% in Bloom.Test alone) at block ~245, and
+	// growing with the segment count, which is the curve issues #9,
+	// #30 and #50 each moved somewhere else.  Permanent data is what
+	// grows without limit, and reaching into it is explicit: GetDeep.
+	//
+	// A MUTABLE store does not stop: dynamic keys are state -- the BPT
+	// above all -- and state must resolve wherever it last landed,
+	// however long ago it was written.  The walk is affordable because
+	// the dynamic layer is small and grows slowly (spec 1.5), and
+	// compaction keeps its history to a few segments.
+	//
+	// inWindow is false only when filters exist and answered; a store
+	// without filters walks, which is correct and bounded by the
+	// rebuild rule (keyfilter.go).
+	if !inWindow && !s.Mutable {
 		return nil, errNotFound
 	}
 	return s.lookupHistory(key, inWindow)

@@ -113,7 +113,7 @@ func TestCompactionMemoryIsBoundedByInputs(t *testing.T) {
 
 	// And it merged correctly: every recently written key still reads
 	for i, k := range recent {
-		_, err := kv.GetDeep(k)
+		_, err := kv.GetDyna(k)
 		require.NoErrorf(t, err, "key %d lost by the compaction", i)
 	}
 }
@@ -304,45 +304,62 @@ func TestCompactionRefusesATakenIdentity(t *testing.T) {
 	require.NoError(t, re.Close())
 }
 
-// TestReadsStopAtTheWindow
-// The window is the whole of the protocol's horizon (spec 1.3): a key
-// the filters deny is absent, and Get must not probe history for it --
-// per-segment probing on every miss measured 23% of a validator's CPU
-// and grew with the history segment count.  Reading below the window
-// is GetDeep, explicitly.
-func TestReadsStopAtTheWindow(t *testing.T) {
-	dir := storeDir(t, "windowread")
-	store, err := NewSegmentStore(dir, true)
-	require.NoError(t, err)
-	defer store.Close()
-	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+// TestPermReadsStopAtTheWindowAndDynaReadsDoNot
+// The two layers have different horizons (spec 1.3).  A PERMANENT key
+// below the window is absent to the protocol read: permanent data is
+// what grows without limit, and probing its history per segment on
+// every miss measured 23% of a validator's CPU, growing with the
+// segment count.  A DYNAMIC key is state -- the BPT above all -- and
+// must resolve wherever it last landed, however old; the dynamic
+// layer is small, so the walk is affordable.
+func TestPermReadsStopAtTheWindowAndDynaReadsDoNot(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mutable    bool
+		wantWindow bool // A key below the window must still read
+	}{
+		{"perm stops at the window", false, false},
+		{"dyna reads any age", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := storeDir(t, "windowread")
+			store, err := NewSegmentStore(dir, tc.mutable)
+			require.NoError(t, err)
+			defer store.Close()
+			require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
 
-	kr := NewFastRandom([]byte{216})
-	old := kr.NextHash()
-	require.NoError(t, store.Put(old, []byte{1}))
-	_, err = store.Seal(1)
-	require.NoError(t, err)
+			kr := NewFastRandom([]byte{216})
+			old := kr.NextHash()
+			require.NoError(t, store.Put(old, []byte{1}))
+			_, err = store.Seal(1)
+			require.NoError(t, err)
 
-	// Roll far past the window: `old` leaves the filters' horizon
-	for b := uint64(2); b <= 3*MinFilterBlocks; b++ {
-		_, err = store.Seal(b)
-		require.NoError(t, err)
+			// Roll far past the window: `old` leaves the filters' horizon
+			for b := uint64(2); b <= 3*MinFilterBlocks; b++ {
+				_, err = store.Seal(b)
+				require.NoError(t, err)
+			}
+			recent := kr.NextHash()
+			require.NoError(t, store.Put(recent, []byte{2}))
+
+			v, err := store.Get(recent) // Inside the window: found either way
+			require.NoError(t, err)
+			require.Equal(t, []byte{2}, v)
+
+			v, err = store.Get(old)
+			if tc.wantWindow {
+				require.NoError(t, err, "a dynamic key must resolve at any age")
+				require.Equal(t, []byte{1}, v)
+			} else {
+				require.ErrorIs(t, err, errNotFound,
+					"outside 2N a permanent key is assumed absent")
+			}
+			// The deep read reaches it in either store
+			v, err = store.GetDeep(old)
+			require.NoError(t, err, "GetDeep is the explicit path below the window")
+			require.Equal(t, []byte{1}, v)
+		})
 	}
-	recent := kr.NextHash()
-	require.NoError(t, store.Put(recent, []byte{2}))
-
-	// Inside the window: found, either way
-	v, err := store.Get(recent)
-	require.NoError(t, err)
-	require.Equal(t, []byte{2}, v)
-
-	// Outside the window: the protocol read answers absent without a
-	// walk; the deep read still finds it
-	_, err = store.Get(old)
-	require.ErrorIs(t, err, errNotFound, "outside 2N the protocol assumes absent")
-	v, err = store.GetDeep(old)
-	require.NoError(t, err, "GetDeep is the explicit path below the window")
-	require.Equal(t, []byte{1}, v)
 }
 
 // TestSealRemintsATakenIdentity
