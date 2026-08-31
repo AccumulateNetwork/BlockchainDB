@@ -37,10 +37,16 @@ const DynaDirName = "dyna"
 // peer syncs them by copying files.  The Dyna layer lets the newer write shadow the older,
 // so its sealed segments overlap and Compress reclaims what the shadowing left behind.
 //
-// ToDo: Because KV2 can be used as a shard in a sharded database, and because the PermKV values don't
-// change and that database does not benefit from sharding, then KV2 might ought to accept a
-// *SegmentStore for the PermKV. That way, only the DynaKV is really sharded, while all the permanent
-// key/values are kept in one store.
+// BOTH layers are sharded when a KV2 is used as a shard (KVShard).  It
+// was once proposed to un-shard the Perm layer, on the grounds that
+// immutable values accumulate no garbage and so gain nothing from
+// sharding.  That reasoning covers compaction only.  Sharding buys the
+// Perm layer what it buys any layer on the write path: parallel
+// ingest -- one lock, one live tail and one seal per shard instead of
+// one for the whole node -- and permanent keys are content-addressed,
+// so they balance across shards essentially perfectly.  Permanent data
+// is also the larger and faster-growing half, which makes it the half
+// that most needs the parallelism (spec 1.9).
 
 type KV2 struct {
 	// Mutex is the protocol's lock at this level: Put, PutPerm, PutDyna
