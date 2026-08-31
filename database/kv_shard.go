@@ -524,6 +524,40 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 // packDropWorkers is how many shards PackFinalized drops at once
 const packDropWorkers = 16
 
+// Stats
+// The two layers' counters, summed over every shard: what a sharded
+// database did, in the shape one store reports it (StoreStats).  A
+// caller watching a node has one database, not 512, and the per-shard
+// split is an implementation detail of routing -- so the sum is the
+// number that answers "is the immutability check earning its keep",
+// "what are the filters buying".  Taken without any lock, like the
+// per-store snapshot it is built from.
+func (k *KVShard) Stats() (perm, dyna StoreStats) {
+	add := func(dst *StoreStats, s StoreStats) {
+		dst.PutTotal += s.PutTotal
+		dst.PutNew += s.PutNew
+		dst.PutDuplicate += s.PutDuplicate
+		dst.PutConflict += s.PutConflict
+		dst.LookupTotal += s.LookupTotal
+		dst.FilterAbsent += s.FilterAbsent
+		dst.FilterWalked += s.FilterWalked
+		dst.FilterMisled += s.FilterMisled
+		dst.LiveHit += s.LiveHit
+	}
+	for _, shard := range k.Shards {
+		if shard == nil {
+			continue
+		}
+		if shard.PermKV != nil {
+			add(&perm, shard.PermKV.Stats())
+		}
+		if shard.DynaKV != nil {
+			add(&dyna, shard.DynaKV.Stats())
+		}
+	}
+	return perm, dyna
+}
+
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {

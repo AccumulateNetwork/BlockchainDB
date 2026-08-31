@@ -10,6 +10,7 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestKVShard(t *testing.T) {
@@ -295,4 +296,42 @@ func TestBuildBig2(t *testing.T) {
 	fmt.Printf("wps %8.3f %s\n", wps, tpw)
 	cntWrites++
 
+}
+
+// TestShardStatsSumTheShards
+// A caller watching a node has one database, not 512: KVShard.Stats
+// reports what the two layers did across every shard, in the shape one
+// store reports it.  Wired for the Accumulate adapter's move to the
+// sharded store (issue #62).
+func TestShardStatsSumTheShards(t *testing.T) {
+	dir := storeDir(t, "shardstats")
+	kvs, err := NewKVShard(dir, 1000)
+	require.NoError(t, err)
+	defer kvs.Close()
+
+	kr := NewFastRandom([]byte{178})
+	keys := make([][32]byte, 200)
+	for i := range keys {
+		keys[i] = kr.NextHash()
+		require.NoError(t, kvs.PutPerm(keys[i], []byte{byte(i)}))
+	}
+	for i := range keys { // Every one a duplicate: same key, same value
+		require.NoError(t, kvs.PutPerm(keys[i], []byte{byte(i)}))
+	}
+	for i := 0; i < 50; i++ {
+		require.NoError(t, kvs.PutDyna(kr.NextHash(), []byte{9}))
+	}
+
+	perm, dyna := kvs.Stats()
+	require.Equal(t, uint64(len(keys)*2), perm.PutTotal, "every permanent write is counted once")
+	require.Equal(t, uint64(len(keys)), perm.PutNew)
+	require.Equal(t, uint64(len(keys)), perm.PutDuplicate, "the second pass was all duplicates")
+	require.Equal(t, uint64(50), dyna.PutTotal, "the dynamic layer is counted apart")
+
+	// The sum is the shards' sum, not one shard's
+	var byShard uint64
+	for _, shard := range kvs.Shards {
+		byShard += shard.PermKV.Stats().PutTotal
+	}
+	require.Equal(t, byShard, perm.PutTotal)
 }
