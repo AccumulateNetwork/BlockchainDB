@@ -2897,6 +2897,19 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 // to lag behind the window, and so is the merge behind the watermark;
 // nothing about correctness needs either to be current (issue #47).
 //
+// A MERGED BLOCK IS MERGED ONCE.  What this folds is the segments that
+// have arrived since the last merged block -- the newly finished
+// window -- and never the merged blocks themselves, which are
+// permanent: entries are file:offset:length and never move, so the
+// cost of a merge is the size of one window forever, and the lifetime
+// cost is linear in the data (spec 1.4).  Folding the previous output
+// back in made each pass copy the whole permanent layer accumulated so
+// far -- O(chain^2) over a store's life, and a single pass growing
+// without limit: ~10 GB per pass after four hours at 500 tx/s, every
+// 128 commits, competing with the protocol path for the device
+// (issue #63).  A deep read walks the merged blocks newest-first by
+// their filters; that is what they are for.
+//
 // The copy takes no store lock.  Sealed segments are immutable and the
 // pool hands out descriptors for pread, so the run is read and the
 // merged file written aside while commits and reads carry on; History
@@ -2928,18 +2941,30 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 		}
 		n++
 	}
-	run := append([]*segment(nil), s.history[:n]...)
+	// A merged block is FINISHED: it is merged once and never again
+	// (spec 1.4).  Skip the merged blocks at the front of that prefix
+	// and fold only what has arrived since -- the newly finished
+	// window.  Folding them back in is what made a pass copy the whole
+	// permanent layer, once per pass, growing with the chain: lifetime
+	// O(chain^2) IO for a job whose whole purpose is to be O(window).
+	// A merged block is the one thing that reaches over several blocks,
+	// so Span says so; a sealed block has Span 0 (issue #63).
+	first := 0
+	for first < n && s.history[first].meta.Span > 0 {
+		first++
+	}
+	run := append([]*segment(nil), s.history[first:n]...)
 	s.History.RUnlock()
-	if n < 2 {
+	if len(run) < 2 {
 		return meta, false, nil // Nothing to gain from merging one segment
 	}
 
 	// The merged segment takes the sequence after the newest it
 	// replaces.  That is free and correctly ordered: everything merged
 	// is at or below (H, S), and the first segment left standing is in
-	// a block above H, because the run is exactly the segments below
+	// a block above H, because the run ends at the last segment below
 	// `height` and the remainder is exactly those at or above it.
-	last := run[n-1].meta
+	last := run[len(run)-1].meta
 	outHeight, outSeq := last.Height, last.Seq+1
 
 	meta, seg, err := s.concatSegments(run, outHeight, outSeq)
@@ -2963,7 +2988,7 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 		maintenanceHook()
 	}
 
-	merged, err = s.swapHistory(run, seg, 0)
+	merged, err = s.swapHistory(run, seg, first)
 	return meta, merged, err
 }
 
