@@ -37,10 +37,24 @@ generic read resolves Dyna first: a permanent key overwritten with a
 different value has *become* dynamic, and the dynamic copy is the
 truth (the stale Perm copy is dead weight, never a wrong answer).
 
-### 1.2 The latency rule (governing invariant)
+### 1.2 The latency rule (governing aspiration)
 
-> **No protocol-path operation — Put, Get, Seal, commit — may have a
-> cost that grows with the age or size of the store.  Forever.**
+> **Latency is minimized forever: no protocol-path operation — Put,
+> Get, Seal, commit — may have a cost that degrades toward linear in
+> the age or size of the store.**
+
+This rule is aspirational in the honest sense: no database grows
+without bound with zero decline in performance, and pretending
+otherwise just hides where the decline lives.  The rule names the
+decline we accept and forbids the rest.  Acceptable: costs that grow
+no worse than logarithmically with total data — a deeper filter walk,
+one more level in a levelled structure, a longer binary search.
+Unacceptable: any protocol-path cost proportional to the age of the
+store — a walk over every segment ever sealed, a pass that rewrites
+everything accumulated, memory resident for every key ever written.
+When a design choice must place a cost somewhere, it goes on the
+rarely-taken path (a deep historical miss), never on the per-write or
+per-commit path.
 
 Every other rule in this section serves this one.  Corollaries:
 
@@ -342,6 +356,7 @@ The current gaps between Section 1 and the code, in one place:
 | #47 | 1.4 pack cadence | Daily cross-shard tier not yet scheduled |
 | #52 | 1.8 recovery | recoverOrphans can adopt a duplicate of named data |
 | #54 | 1.3 filter sizing | Filters sized from all-time max, not recent demand |
+| #67 | 1.7 exclusive publish | ImportSegmentFile publishes by rename, not by claim |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.
