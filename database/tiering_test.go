@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -531,4 +532,70 @@ func TestReopenRaisesTheBlockToTheNewestSegment(t *testing.T) {
 	_, err = reopened.SealNext()
 	require.NoError(t, err, "the store must be able to seal again after adopting a segment above its recorded block")
 	require.NoError(t, reopened.Close())
+}
+
+// TestPutsRunConcurrentlyAcrossLayers
+// KV2.Put took the shard's lock exclusively and held it across both
+// layers' lookups -- including a walk into history on a filter hit --
+// so one put's worst case stopped every other put and get on the
+// shard: the head-of-line blocking the layer below was built to avoid
+// (issue #66).  The lock is shared now; it excludes only what needs
+// both layers to hold still (Seal, Close).
+func TestPutsRunConcurrentlyAcrossLayers(t *testing.T) {
+	dir := storeDir(t, "concurrentput")
+	kv, err := NewKV2(dir, 100_000)
+	require.NoError(t, err)
+	defer kv.Close()
+	require.NoError(t, kv.SetFilterBlocks(MinFilterBlocks))
+
+	const writers, each = 8, 300
+	kr := NewFastRandom([]byte{182})
+	keys := make([][][32]byte, writers)
+	for w := range keys {
+		keys[w] = make([][32]byte, each)
+		for i := range keys[w] {
+			keys[w][i] = kr.NextHash()
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i, k := range keys[w] {
+				if _, err := kv.Put(k, []byte{byte(w), byte(i)}); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	// Every write landed, and the counters -- bumped concurrently --
+	// counted every one of them
+	for w := range keys {
+		for i, k := range keys[w] {
+			v, err := kv.Get(k)
+			require.NoErrorf(t, err, "writer %d key %d", w, i)
+			require.Equal(t, []byte{byte(w), byte(i)}, v)
+		}
+	}
+	_, perm := kv.Writes()
+	require.Equal(t, writers*each, perm, "every permanent write must be counted exactly once")
+
+	// A seal still excludes writers: it takes the lock exclusively
+	_, err = kv.Seal(1)
+	require.NoError(t, err)
+	for w := range keys {
+		v, err := kv.Get(keys[w][0])
+		require.NoError(t, err)
+		require.Equal(t, []byte{byte(w), 0}, v)
+	}
 }

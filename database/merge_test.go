@@ -491,3 +491,49 @@ func TestRejectedImportIsNotAdoptedAfterACrash(t *testing.T) {
 	require.NoError(t, reopened.Close())
 	require.NoError(t, src.Close())
 }
+
+// TestImportRefusesToReplaceAFileAtItsIdentity
+// No publish may replace an existing segment file (spec 1.7).  Seals
+// and merge outputs claim their names exclusively; the import path was
+// still renaming over whatever stood there.  Its identity checks
+// consult the segments the MANIFESTS name, and a complete file can sit
+// at an identity without being named -- an earlier seal or import that
+// reached disk and not its commit -- so a rename could destroy a
+// committed-by-construction file quietly (issue #67).
+func TestImportRefusesToReplaceAFileAtItsIdentity(t *testing.T) {
+	dir := storeDir(t, "importclaim")
+	src, err := NewSegmentStore(dir+"-src", false)
+	require.NoError(t, err)
+	defer src.Close()
+
+	kr := NewFastRandom([]byte{181})
+	for i := 0; i < 20; i++ {
+		require.NoError(t, src.Put(kr.NextHash(), []byte{byte(i)}))
+	}
+	meta, err := src.Seal(7)
+	require.NoError(t, err)
+	exported := filepath.Join(dir+"-src", meta.File)
+
+	dst, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	// An orphan at the identity the import would take: complete, and
+	// named by no manifest, exactly as an interrupted seal leaves one
+	squatter := filepath.Join(dir, meta.File)
+	require.NoError(t, os.WriteFile(squatter, []byte("an earlier segment, uncommitted"), 0o644))
+
+	err = dst.ImportSegmentFile(exported, meta)
+	require.Error(t, err, "the import must refuse an identity that is taken")
+	require.Contains(t, err.Error(), "already exists")
+
+	// And it left the file alone
+	got, err := os.ReadFile(squatter)
+	require.NoError(t, err)
+	require.Equal(t, "an earlier segment, uncommitted", string(got),
+		"the file standing at that identity must be untouched")
+
+	// With the identity free, the same import succeeds
+	require.NoError(t, os.Remove(squatter))
+	require.NoError(t, dst.ImportSegmentFile(exported, meta))
+}
