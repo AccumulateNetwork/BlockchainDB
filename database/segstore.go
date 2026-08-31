@@ -3139,23 +3139,29 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 		}
 		n++
 	}
-	// A merged block is FINISHED: it is merged once and never again
-	// (spec 1.4).  Skip the merged blocks at the front of that prefix
-	// and fold only what has arrived since -- the newly finished
-	// window.  Folding them back in is what made a pass copy the whole
-	// permanent layer, once per pass, growing with the chain: lifetime
-	// O(chain^2) IO for a job whose whole purpose is to be O(window).
-	// A merged block is the one thing that reaches over several blocks,
-	// so Span says so; a sealed block has Span 0 (issue #63).
-	first := 0
-	for first < n && s.history[first].meta.Span > 0 {
-		first++
+	// Which of them to fold is the same question compaction answers,
+	// and the same rule answers it: take the newest suffix, and reach
+	// one segment further back only when what has gathered behind it is
+	// worth its size (CompactRatio), inside one pass's budget.
+	//
+	// Folding the WHOLE prefix every time -- which is what this did --
+	// re-copied the previous merge's output on every pass, so a pass
+	// copied the entire permanent layer accumulated so far: O(chain^2)
+	// over a store's life (issue #63).  Never folding a merged block
+	// again is the other extreme, and it trades that for file count:
+	// one merged block per pass, forever, which is the inode problem
+	// merging exists to solve (issue #30).  The ratio is the middle and
+	// the standard answer -- a block is rewritten only once enough has
+	// arrived to justify its size, so a byte is copied a few times over
+	// the store's life rather than once per pass, and the merged blocks
+	// stay few.  It is the rule the dynamic layer already uses (#31).
+	run, first := compactionRunWithin(s.history[:n], CompactRatio, CompactPassRecords)
+	if run == nil { // Nothing worth folding yet
+		s.History.RUnlock()
+		return meta, false, nil
 	}
-	run := append([]*segment(nil), s.history[first:n]...)
+	run = append([]*segment(nil), run...)
 	s.History.RUnlock()
-	if len(run) < 2 {
-		return meta, false, nil // Nothing to gain from merging one segment
-	}
 
 	// The merged segment takes the sequence after the newest it
 	// replaces.  That is free and correctly ordered: everything merged

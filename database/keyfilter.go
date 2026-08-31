@@ -68,9 +68,8 @@ import (
 
 const (
 	// DefaultFilterBlocks is the roll period N for a store that is not
-	// told otherwise: a fresh filter every 128 blocks, so the live pair
-	// covers 128 to 256 blocks -- two to four minutes of chain at a
-	// block a second.
+	// told otherwise: a fresh filter every 20 blocks, so the live pair
+	// covers 20 to 40 blocks.
 	//
 	// The window is the reach of the immutability check (lookup), so N
 	// trades that reach against two bounded costs: what the two filters
@@ -80,17 +79,23 @@ const (
 	// ~1.9 MB a filter and a rescan of ~61 MB; at 100 entries a block,
 	// the 4 KB floor per filter and ~1.2 MB.
 	//
-	// What the window has to reach is short.  Healing writes reach back
-	// several blocks (MinFilterBlocks is the floor for that), and replay
-	// after a crash re-applies the last committed block or two.  It
-	// does NOT need to reach the packed block sets: those carry a
-	// filter of their own, and a hit is followed into them.  128 is
-	// twice the merge lag Accumulate's adapter runs with, so every write
-	// still sitting in a per-block segment is inside the window, and
-	// anything beyond a few hundred blocks would buy nothing but a
-	// larger rescan.  It was 1,000 at first, chosen as a cautious
-	// bound; the repository owner set it to 128.
-	DefaultFilterBlocks = 128
+	// What the window has to reach is SHORT, and deliberately so.  It
+	// is the reach of the immutability check and the horizon of a
+	// protocol read -- not the reach of the database.  Everything older
+	// is still there and still readable; reaching it is an explicit
+	// deep read (GetDeep), which is what the API, healing, and anything
+	// else that knowingly looks back use.  Sizing the window for those
+	// callers would make every node pay their memory and their rescan
+	// on every block.
+	//
+	// So N is set at the floor of what the protocol itself needs:
+	// healing writes reach back several blocks, and replay after a
+	// crash re-applies the last committed block or two.  20 is the
+	// repository owner's floor for that (MinFilterBlocks), and the
+	// default now sits on it.  It was 1,000 at first, then 128; each
+	// reduction was a smaller resident filter, a shorter rescan, and a
+	// smaller active tier for maintenance to work around.
+	DefaultFilterBlocks = MinFilterBlocks
 
 	// MinFilterBlocks is the smallest roll period a store accepts.
 	// Healing writes reach back over several blocks, and a window that
