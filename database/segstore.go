@@ -197,6 +197,12 @@ type StoreManifest struct {
 	FilterHeight   uint64 `json:"filterHeight,omitempty"`
 	FilterSeq      uint64 `json:"filterSeq,omitempty"`
 	FilterSegments uint64 `json:"filterSegments,omitempty"`
+
+	// FilterDemand is what completed filter spans took recently, one
+	// bucket per hour: what the next filter is sized from (issue #54).
+	// Small by construction -- 24 entries -- because a seal rewrites
+	// this file.
+	FilterDemand []spanDemand `json:"filterDemand,omitempty"`
 }
 
 // HistoryManifest
@@ -622,11 +628,11 @@ type SegmentStore struct {
 	// added (attachCold).  Filters loaded from disk were saved complete.
 	filtersLackCold bool
 
-	// spanKeys is the most keys a completed filter span has taken, which
-	// is what a filter that is starting is sized for (rollKeyFilters).
-	// Not persisted: a reopened store sizes its first filters from what
-	// they hold and learns the rest at its first roll.
-	spanKeys uint64
+	// demand is what completed filter spans took, one bucket per hour,
+	// and it is what a filter that is starting is sized from
+	// (keyfilter.go, issue #54).  Persisted in the manifest, so a
+	// restart sizes from yesterday's demand rather than from a guess.
+	demand []spanDemand
 
 	stats storeCounters // Atomic: the read path holds only a shared lock
 }
@@ -883,6 +889,7 @@ func (s *SegmentStore) load() (err error) {
 	}
 	s.FilterBlocks = m.FilterBlocks
 	s.blockHeight = m.BlockHeight
+	s.demand = m.FilterDemand // What spans took before the restart (issue #54)
 
 	// The union, in (Height, Seq) order, which is the order both tiers
 	// keep and the order the lists had before any restart
@@ -1515,7 +1522,7 @@ func (s *SegmentStore) writeManifest() (err error) {
 
 	m := StoreManifest{Version: StoreFormatVersion,
 		Mutable: s.Mutable, SealLimit: s.SealLimit, FilterBlocks: s.FilterBlocks,
-		BlockHeight: s.blockHeight}
+		BlockHeight: s.blockHeight, FilterDemand: s.demand}
 	if s.filterValid {
 		m.FilterValid = true
 		m.FilterStart, m.FilterHeight = s.filterSaved.Start, s.filterSaved.Height

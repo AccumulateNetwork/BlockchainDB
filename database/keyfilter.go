@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // The rolling key filter (issue #44).
@@ -102,6 +103,110 @@ const (
 	filtersMagic       = 0x4B465731        // "KFW1"
 )
 
+// Filter sizing from demand (issue #54).
+//
+// A bloom filter's false-positive rate is set by bits per key at its
+// design capacity, so the size a filter is built at decides what it
+// costs and what it is worth.  Too small and it fills past its design
+// point: the rate climbs, and every false positive is a segment walk
+// that finds nothing -- silent, nothing fails, everything slows.  Too
+// large and the bits are memory spent on nothing, doubled, because two
+// filters are live at once.
+//
+// The right size is not a constant.  Keys per span follow the
+// transaction rate, which moves with the time of day and grows over
+// the life of a chain.  So each roll sizes the filter it starts from
+// what spans actually took recently: the largest completed span in the
+// last FilterDemandHours, plus FilterHeadroomPercent.
+//
+// Demand is remembered as one bucket per hour -- the largest span that
+// completed in that hour -- and 24 of them.  A ring that small is
+// exact enough for a maximum, and it is written into the manifest,
+// which a seal rewrites: a per-span record would be hundreds of
+// entries a day in a file on the protocol path, and this is 24.
+const (
+	// FilterDemandHours is how far back the sizing looks.  A day
+	// smooths over a burst that lasted one roll while still tracking
+	// real growth.
+	FilterDemandHours = 24
+
+	// FilterHeadroomPercent is how much room over the recent peak a new
+	// filter is given, so a rise from one roll to the next does not
+	// push it past its design point.
+	FilterHeadroomPercent = 150
+)
+
+// FilterCapacityMax caps what demand can ask for, so a wrong estimate
+// -- or a burst that will not repeat -- cannot allocate without limit.
+// 16Mi keys is ~24 MB of bits per filter at BloomBitsPerKey; a store
+// whose spans really need more is one whose filter window is set too
+// wide (SetFilterBlocks), and the BloomSet layers rather than fails.
+var FilterCapacityMax uint64 = 16 << 20
+
+// spanDemand is the largest span that completed in one hour: `hour` is
+// the hour number since the epoch, so a bucket says which hour it
+// speaks for and is stale rather than wrong after a gap.
+type spanDemand struct {
+	Hour int64  `json:"hour"`
+	Keys uint64 `json:"keys"`
+}
+
+// recordSpanDemand notes what a completed span took.  The caller must
+// hold the Mutex.
+func (s *SegmentStore) recordSpanDemand(keys uint64, now time.Time) {
+	if keys == 0 {
+		return
+	}
+	if s.demand == nil {
+		s.demand = make([]spanDemand, FilterDemandHours)
+	}
+	hour := now.Unix() / 3600
+	b := &s.demand[hour%FilterDemandHours]
+	if b.Hour != hour { // A new hour reuses the bucket a day older
+		b.Hour, b.Keys = hour, keys
+		return
+	}
+	if keys > b.Keys {
+		b.Keys = keys
+	}
+}
+
+// spanDemandPeak is the largest span completed within the demand
+// window, and whether anything was recorded there at all.  The caller
+// must hold the Mutex.
+func (s *SegmentStore) spanDemandPeak(now time.Time) (keys uint64, ok bool) {
+	oldest := now.Unix()/3600 - FilterDemandHours + 1
+	for _, b := range s.demand {
+		if b.Hour >= oldest && b.Keys > keys {
+			keys, ok = b.Keys, true
+		}
+	}
+	return keys, ok
+}
+
+// filterCapacity is what a filter starting now should be sized for:
+// the recent peak plus headroom, bounded above by FilterCapacityMax
+// and below by whatever the live filters already hold -- a filter
+// cannot be sized under what its own window has taken.  With no
+// history at all (a fresh store) the estimate is zero and
+// newKeyFilter's floor, the seal limit, decides.  The caller must hold
+// the Mutex.
+func (s *SegmentStore) filterCapacity(live []*keyFilter, now time.Time) uint64 {
+	var want uint64
+	if peak, ok := s.spanDemandPeak(now); ok {
+		want = peak * FilterHeadroomPercent / 100
+	}
+	if want > FilterCapacityMax {
+		want = FilterCapacityMax
+	}
+	for _, f := range live { // Never below what a live span already holds
+		if n := f.keys.Count(); n > want {
+			want = n
+		}
+	}
+	return want
+}
+
 // keyFilter is one live filter: a membership set over every key the
 // store holds from block `start` on.
 type keyFilter struct {
@@ -168,6 +273,26 @@ func (s *SegmentStore) windowStart() (start uint64, ok bool) {
 		return 0, false
 	}
 	return s.filters[0].start, true
+}
+
+// FilterSizing
+// What the live filters were sized for and what they hold: the numbers
+// that say whether demand sizing is working (issue #54).  Capacity is
+// what a filter starting now would be built for, Peak is the largest
+// span the demand window remembers, and Fill is what the live filters
+// actually hold, largest first.  A Fill well under Capacity is memory
+// spent on nothing; a Fill at or over it means the filter is past its
+// design point and the false-positive rate is climbing.
+func (s *SegmentStore) FilterSizing() (capacity, peak uint64, fill []uint64) {
+	s.Mutex.RLock()
+	defer s.Mutex.RUnlock()
+	now := time.Now()
+	peak, _ = s.spanDemandPeak(now)
+	capacity = s.newKeyFilter(s.filterCapacity(s.filters, now)).Capacity()
+	for _, f := range s.filters {
+		fill = append(fill, f.keys.Count())
+	}
+	return capacity, peak, fill
 }
 
 // SetFilterBlocks
@@ -297,21 +422,13 @@ func (s *SegmentStore) rollKeyFilters() {
 		}
 		if live {
 			kept = append(kept, f)
-		} else if n := f.keys.Count(); n > s.spanKeys {
-			s.spanKeys = n // Its span is complete: this is what a span takes
+		} else {
+			// Its span is complete: this is what a span took, and it is
+			// what the filters starting from here are sized from
+			s.recordSpanDemand(f.keys.Count(), time.Now())
 		}
 	}
-	// Size a filter that is starting for what a full span held, which
-	// is the best estimate of what this one will take.  The estimate is
-	// the largest span seen so far; issue #54 would make it the largest
-	// over a recent period, which is why the completed count is recorded
-	// above rather than read from the filter being dropped.
-	expected := s.spanKeys
-	for _, f := range kept {
-		if n := f.keys.Count(); n > expected {
-			expected = n
-		}
-	}
+	expected := s.filterCapacity(kept, time.Now())
 	for _, start := range wanted {
 		have := false
 		for _, f := range kept {

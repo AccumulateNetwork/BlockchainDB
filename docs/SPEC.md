@@ -288,8 +288,13 @@ directory fsync.  `StoreFormatVersion` (4) is checked strictly (1.10).
 
 `keyfilter.go`: a pair of `BloomSet`s spanning 2N each, rolled every N
 (`rollKeyFilters` — an allocation at a normal roll, a bounded rebuild
-after a block jump).  Sizing feeds from the largest completed span
-(`spanKeys`; #54 will bound it to recent demand).  Coverage claims are
+after a block jump).  Sizing feeds from recent demand: each completed span records what it
+took in an hourly bucket (24 of them, carried in the manifest so a
+restart does not size from a guess), and a filter starting now is
+built for the largest span of the last day plus 50% headroom, floored
+by what a live span already holds and by the seal limit, capped by
+`FilterCapacityMax`.  `FilterSizing` reports capacity, peak and fill
+so the sizing can be checked against reality (#54).  Coverage claims are
 verified before a persisted filter is trusted; any doubt rebuilds from
 the window, and a store that cannot build filters *walks* — a filter
 may cost a pointless walk, never a false "absent" (#35).
@@ -388,7 +393,6 @@ The current gaps between Section 1 and the code, in one place:
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
 | #47 | 1.4 pack cadence | Daily cross-shard tier not yet scheduled |
-| #54 | 1.3 filter sizing | Filters sized from all-time max, not recent demand |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.

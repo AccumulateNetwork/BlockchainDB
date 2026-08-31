@@ -51,6 +51,17 @@ func (b *BloomSet) Count() (n uint64) {
 	return n
 }
 
+// Capacity
+// How many keys the set is sized for: every layer's design capacity.
+// A set at or over it is past its design point and layering, which
+// costs a probe per layer on every lookup.
+func (b *BloomSet) Capacity() (n uint64) {
+	for _, l := range b.Layers {
+		n += l.Capacity
+	}
+	return n
+}
+
 // Set
 // Add a key.  Grows a new layer when the active one is full.
 func (b *BloomSet) Set(key [32]byte) {
