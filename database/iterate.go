@@ -21,8 +21,9 @@ import (
 // this is not something to call on the hot path of a large store.
 //
 // (A k-way merge across the segments' sorted indexes would emit keys
-// in order with no such set.  It is the better implementation and the
-// obvious next step if iteration ever moves off the cold path.)
+// in order with no such set.  mergeIndexes in indexmerge.go is exactly
+// that, and the merges use it; iteration could too if it ever moves off
+// the cold path.)
 
 // ForEach
 // Call fn for every key the store holds, with its current value.

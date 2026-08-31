@@ -215,32 +215,33 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	// records where the body landed.  Where the bodies begin in the file
 	// depends on the key count, which is known only once every index has
 	// been read, so body positions are laid out from 0 here.
+	// Pass one: lay out every shard's bodies and count its distinct keys,
+	// so the directory, the index region and the bloom can all be sized
+	// before anything is written.  Nothing per key is held (issue #59).
 	dir := make([]setEntry, NumShards)
 	sizes := make([][]int64, NumShards)
-	indexes := make([][]byte, NumShards)
+	bases := make([][]uint64, NumShards)
 	var keys, bodies uint64
 	for i, segs := range shards {
 		if len(segs) == 0 {
 			continue
 		}
-		var bases []uint64
 		var size uint64
-		if sizes[i], bases, size, err = layoutBodies(segs); err != nil {
+		if sizes[i], bases[i], size, err = layoutBodies(segs); err != nil {
 			return nil, err
 		}
-		if indexes[i], err = shiftedIndex(segs, bases); err != nil {
+		count, err := mergeIndexes(segs, nil)
+		if err != nil {
 			return nil, err
 		}
-		dir[i] = setEntry{dataOff: bodies, dataLen: size, count: uint64(len(indexes[i]) / DBKeyFullSize)}
-		keys += dir[i].count
+		dir[i] = setEntry{dataOff: bodies, dataLen: size, count: count}
+		keys += count
 		bodies += size
 	}
 	bloom := NewBloomSizedForKeys(keys, 3)
 	dataStart := uint64(setHdrSize) + NumShards*setDirEntSize + keys*DBKeyFullSize + bloom.NumBytes
 
-	// Now the head region can be assembled: the directory, with each
-	// body's position made absolute; the indexes, verbatim; the bloom
-	head := make([]byte, 0, dataStart-setHdrSize)
+	dirBytes := make([]byte, 0, NumShards*setDirEntSize)
 	indexOff := uint64(setHdrSize) + NumShards*setDirEntSize
 	for i := range dir {
 		if dir[i].count > 0 {
@@ -248,20 +249,11 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 		}
 		dir[i].indexOff = indexOff
 		indexOff += dir[i].count * DBKeyFullSize
-		head = binary.BigEndian.AppendUint64(head, dir[i].dataOff)
-		head = binary.BigEndian.AppendUint64(head, dir[i].dataLen)
-		head = binary.BigEndian.AppendUint64(head, dir[i].indexOff)
-		head = binary.BigEndian.AppendUint64(head, dir[i].count)
+		dirBytes = binary.BigEndian.AppendUint64(dirBytes, dir[i].dataOff)
+		dirBytes = binary.BigEndian.AppendUint64(dirBytes, dir[i].dataLen)
+		dirBytes = binary.BigEndian.AppendUint64(dirBytes, dir[i].indexOff)
+		dirBytes = binary.BigEndian.AppendUint64(dirBytes, dir[i].count)
 	}
-	for _, index := range indexes {
-		for pos := 0; pos < len(index); pos += DBKeyFullSize {
-			var key [32]byte
-			copy(key[:], index[pos:])
-			bloom.Set(key)
-		}
-		head = append(head, index...)
-	}
-	head = append(head, bloom.Map...)
 
 	var header [setHdrSize]byte
 	binary.BigEndian.PutUint32(header[0:], setMagic)
@@ -274,8 +266,7 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	binary.BigEndian.PutUint64(header[40:], bloom.NumBytes)
 	binary.BigEndian.PutUint64(header[48:], dataStart)
 
-	// Pass two: the file.  Header, then the bodies past the reserved
-	// head region, then the head region in one write.
+	// Pass two: the file, front to back.
 	name := setFileName(first, last)
 	path := filepath.Join(ss.Directory, name)
 	tmpPath := path + segTmpSuffix
@@ -289,13 +280,40 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 			os.Remove(tmpPath)
 		}
 	}()
-	if _, err = f.WriteAt(header[:], 0); err != nil {
-		return nil, err
-	}
-	if _, err = f.Seek(int64(dataStart), 0); err != nil {
-		return nil, err
-	}
+	// The whole file is written in order: header, directory, every
+	// shard's index streamed through the merge (which also fills the
+	// bloom), the bloom, then the bodies.  One sequential pass, and the
+	// only thing held for the file's size is the bloom bitmap.
 	bw := bufio.NewWriterSize(f, segWriteBuffer)
+	if _, err = bw.Write(header[:]); err != nil {
+		return nil, err
+	}
+	if _, err = bw.Write(dirBytes); err != nil {
+		return nil, err
+	}
+	var rec [DBKeyFullSize]byte
+	for i, segs := range shards {
+		if len(segs) == 0 {
+			continue
+		}
+		written, err := mergeIndexes(segs, func(src int, key [32]byte, dbb DBBKey) error {
+			bloom.Set(key)
+			copy(rec[:32], key[:])
+			binary.BigEndian.PutUint64(rec[32:], dbb.Offset+bases[i][src])
+			binary.BigEndian.PutUint64(rec[40:], dbb.Length)
+			_, err := bw.Write(rec[:])
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		if written != dir[i].count {
+			return nil, fmt.Errorf("shard %d: index changed between passes (%d then %d keys)", i, dir[i].count, written)
+		}
+	}
+	if _, err = bw.Write(bloom.Map); err != nil {
+		return nil, err
+	}
 	buf := make([]byte, segWriteBuffer)
 	for i, segs := range shards {
 		for j, seg := range segs {
@@ -305,9 +323,6 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 		}
 	}
 	if err = bw.Flush(); err != nil {
-		return nil, err
-	}
-	if _, err = f.WriteAt(head, setHdrSize); err != nil {
 		return nil, err
 	}
 	if err = f.Sync(); err != nil {

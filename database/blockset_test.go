@@ -87,10 +87,10 @@ func permDataFiles(t *testing.T, kvs *KVShard, height uint64) (n, below int) {
 func checkEveryKey(t *testing.T, kvs *KVShard, keys [][32]byte, values map[[32]byte][]byte, when string) {
 	t.Helper()
 	for i, key := range keys {
-		v, err := kvs.GetPerm(key)
+		v, err := kvs.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost %s", i, when)
 		require.Equalf(t, values[key], v, "key %d wrong %s", i, when)
-		v, err = kvs.Get(key)
+		v, err = kvs.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost via Get %s", i, when)
 		require.Equal(t, values[key], v)
 	}
@@ -311,7 +311,7 @@ func TestPackedKeysStayImmutable(t *testing.T) {
 	v, err := reopened.Get(packedKey)
 	require.NoError(t, err)
 	assert.Equal(t, other, v, "Get answers with the dynamic copy")
-	v, err = reopened.GetPerm(packedKey)
+	v, err = shard.PermKV.GetDeep(packedKey)
 	require.NoError(t, err)
 	assert.Equal(t, values[packedKey], v, "the permanent copy is unchanged")
 	require.NoError(t, reopened.Close())

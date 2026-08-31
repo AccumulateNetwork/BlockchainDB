@@ -150,7 +150,7 @@ func TestKeyFilterSurvivesCompaction(t *testing.T) {
 	require.True(t, compacted)
 
 	for i, key := range keys {
-		got, err := store.Get(key)
+		got, err := store.GetDeep(key)
 		require.NoErrorf(t, err, "key %d went missing in compaction", i)
 		require.Equal(t, []byte{3, byte(i)}, got, "key %d is stale", i)
 	}
@@ -425,19 +425,23 @@ func TestKeyFilterRollsWithTheBlock(t *testing.T) {
 	require.Equal(t, sizes[1], sizes[len(sizes)-1],
 		"filter memory must not grow with the chain: %v", sizes)
 
-	// Everything is still readable, in the window or below it
+	// Everything is still readable below the window -- through the
+	// explicit deep read, which is what reaches past the window
 	for i, key := range all {
-		_, err := store.Get(key)
+		_, err := store.GetDeep(key)
 		require.NoErrorf(t, err, "key %d went missing (block %d)", i, i/10+1)
 	}
-	// And a key below the window is settled by the filters first: the
-	// walk it costs is of the segments the filters do not cover
+	// The protocol read stops at the window: the filters settle a key
+	// below it as absent, and no history segment is probed (spec 1.3)
 	before := store.Stats()
 	_, err = store.Get(all[0])
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errNotFound,
+		"outside the window the protocol read assumes absent")
 	after := store.Stats()
 	require.Equal(t, before.FilterAbsent+1, after.FilterAbsent,
 		"a key below the window is outside what the filters cover")
+	require.Equal(t, before.FilterWalked, after.FilterWalked,
+		"and it costs no walk at all")
 	require.NoError(t, store.Close())
 }
 
@@ -478,7 +482,7 @@ func TestKeyFilterCoversAMergedSegmentByItsOldestBlock(t *testing.T) {
 		t.Helper()
 		for h := 1; h < len(keys); h++ {
 			for _, key := range keys[h] {
-				_, err := s.Get(key)
+				_, err := s.GetDeep(key)
 				require.NoErrorf(t, err, "key from block %d went missing %s", h, when)
 			}
 		}
@@ -587,7 +591,7 @@ func TestKeyFilterFollowsABlockJump(t *testing.T) {
 		"the tail's key was sealed into block 100, inside the window")
 	for h := 1; h < len(keys); h++ {
 		for _, key := range keys[h] {
-			_, err := store.Get(key)
+			_, err := store.GetDeep(key)
 			require.NoErrorf(t, err, "key from block %d went missing after the jump", h)
 		}
 	}

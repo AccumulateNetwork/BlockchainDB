@@ -260,13 +260,16 @@ func runCrashRounds(t *testing.T, mode string) {
 		// The contract: the DB opens, and every checkpointed key reads
 		// back correctly
 		kv, err := OpenKV2(dir)
-		require.NoErrorf(t, err, "round %d: reopen after kill (durable=%d)", round, durable)
+		if err != nil {
+			t.Fatalf("round %d: reopen after kill (durable=%d): %v\n%s",
+				round, durable, err, crashDumpState(dir))
+		}
 		require.NoErrorf(t, kv.Open(), "round %d: open files", round)
 		kr, vr := crashKV(0)
 		for i := 0; i < durable; i++ {
 			key := kr.NextHash()
 			value := vr.RandBuff(10, 50)
-			got, err := kv.Get(key)
+			got, err := kv.GetDeep(key)
 			if err != nil {
 				t.Fatalf("round %d: durable key %d lost (durable=%d): %v\n%s",
 					round, i, durable, err, crashDiagnose(kv, dir, i, key))
@@ -331,6 +334,41 @@ func crashDiagnose(kv *KV2, dir string, i int, key [32]byte) string {
 			fmt.Fprintf(&b, " %s(%d)", e.Name(), size)
 		}
 		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// crashDumpState renders what is on disk when a reopen fails: the
+// files of each layer and both manifests, so an "impossible" state --
+// a manifest naming a file that does not exist (issue #61) -- can be
+// post-mortemed from the test log alone.  The test deletes its
+// directory on exit, so the log is the only artifact that survives.
+func crashDumpState(dir string) string {
+	var b strings.Builder
+	for _, layer := range []string{PermDirName, DynaDirName} {
+		d := filepath.Join(dir, layer)
+		fmt.Fprintf(&b, "--- %s files ---\n", layer)
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			fmt.Fprintf(&b, "  %v\n", err)
+			continue
+		}
+		for _, e := range entries {
+			info, _ := e.Info()
+			var size int64 = -1
+			if info != nil {
+				size = info.Size()
+			}
+			fmt.Fprintf(&b, "  %s (%d)\n", e.Name(), size)
+		}
+		for _, mf := range []string{segManifestName, "history.json", "unlink.log"} {
+			data, err := os.ReadFile(filepath.Join(d, mf))
+			if err != nil {
+				fmt.Fprintf(&b, "--- %s/%s: %v\n", layer, mf, err)
+				continue
+			}
+			fmt.Fprintf(&b, "--- %s/%s ---\n%s\n", layer, mf, data)
+		}
 	}
 	return b.String()
 }

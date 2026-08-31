@@ -93,7 +93,7 @@ func TestSegmentsHandOffAtTheRoll(t *testing.T) {
 
 	// A key from either tier reads back
 	for _, h := range []int{1, 39, 40, 60} {
-		v, err := store.Get(keys[h][0])
+		v, err := store.GetDeep(keys[h][0])
 		require.NoErrorf(t, err, "block %d", h)
 		assert.Equal(t, fmt.Sprintf("b%d-0", h), string(v))
 	}
@@ -141,7 +141,7 @@ func TestSegmentsHandOffAtTheRoll(t *testing.T) {
 
 	for h := 1; h <= 60; h++ {
 		for _, key := range keys[h] {
-			_, err := store.Get(key)
+			_, err := store.GetDeep(key)
 			require.NoErrorf(t, err, "block %d", h)
 		}
 	}
@@ -154,7 +154,7 @@ func TestSegmentsHandOffAtTheRoll(t *testing.T) {
 	assert.Len(t, active, 22)
 	for h := 1; h <= 60; h++ {
 		for _, key := range keys[h] {
-			_, err := reopened.Get(key)
+			_, err := reopened.GetDeep(key)
 			require.NoErrorf(t, err, "block %d after a reopen", h)
 		}
 	}
@@ -292,7 +292,7 @@ func TestCommitsRunDuringHistoryMaintenance(t *testing.T) {
 				if _, err := store.Get(keys[55][0]); err != nil { // Active
 					return err
 				}
-				if _, err := store.Get(keys[5][0]); err != nil { // History: sees the inputs
+				if _, err := store.GetDeep(keys[5][0]); err != nil { // History: sees the inputs
 					return err
 				}
 				_, err := store.Get(fresh)
@@ -304,7 +304,7 @@ func TestCommitsRunDuringHistoryMaintenance(t *testing.T) {
 			require.NoError(t, <-done)
 			for h := 1; h <= 60; h++ {
 				for _, key := range keys[h] {
-					_, err := store.Get(key)
+					_, err := store.GetDeep(key)
 					require.NoErrorf(t, err, "block %d after the %s", h, tc.name)
 				}
 			}
@@ -426,7 +426,7 @@ func TestHandoffSurvivesACrash(t *testing.T) {
 		require.NoErrorf(t, err, "open %s", when)
 		for h := 1; h < len(keys); h++ {
 			for _, key := range keys[h] {
-				v, err := store.Get(key)
+				v, err := store.GetDeep(key)
 				require.NoErrorf(t, err, "block %d %s", h, when)
 				require.Equal(t, fmt.Sprintf("b%d-0", h), string(v))
 			}

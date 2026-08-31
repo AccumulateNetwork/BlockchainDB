@@ -226,7 +226,14 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 }
 
 // Get
-// Get a value from the KV2.  Checks the DynaKV first, then the PermKV
+// Get a value from the KV2.  Checks the DynaKV first, then the PermKV.
+//
+// The two layers answer over different horizons (spec 1.3, 1.5).  The
+// Dyna layer answers from anywhere it holds the key: dynamic values
+// are state, and state does not expire.  The Perm layer answers from
+// its window; permanent data below it is reached explicitly, by
+// GetDeep, because that is the layer that grows without limit and the
+// per-miss history probing was costing 23% of a validator's CPU.
 func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
@@ -237,6 +244,20 @@ func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	}
 	return k.PermKV.Get(key) //                      PermKV has.
 
+}
+
+// GetDeep
+// Get a value from wherever it is, the history below each layer's
+// window and the packed sets included: the explicit deep read for
+// export and query APIs (spec 1.4).  Not the protocol path.
+func (k *KV2) GetDeep(key [32]byte) (value []byte, err error) {
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
+
+	if value, err = k.DynaKV.GetDeep(key); err == nil {
+		return value, nil
+	}
+	return k.PermKV.GetDeep(key)
 }
 
 // PutDyna

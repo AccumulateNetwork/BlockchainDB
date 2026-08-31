@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Sealed segments as storage.
@@ -295,16 +296,22 @@ func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
 // where the body landed, and a reader adds that base instead of this
 // one.  Nothing in an index is rewritten when it is moved.
 func (s *segment) value(dbb *DBBKey) (value []byte, err error) {
+	value = make([]byte, dbb.Length)
+	return value, s.readValue(*dbb, value)
+}
+
+// readValue reads a value into buf, which must be dbb.Length long: for
+// a caller that reads many values in a row and does not want an
+// allocation per value.  The offset is body-relative, as every index
+// entry's is.
+func (s *segment) readValue(dbb DBBKey, buf []byte) (err error) {
 	data, release, err := s.data()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer release()
-	value = make([]byte, dbb.Length)
-	if _, err = data.ReadAt(value, segDataHdrSize+int64(dbb.Offset)); err != nil {
-		return nil, err
-	}
-	return value, nil
+	_, err = data.ReadAt(buf, segDataHdrSize+int64(dbb.Offset))
+	return err
 }
 
 // SegmentStore
@@ -373,7 +380,7 @@ type SegmentStore struct {
 	// on a Seal after a 3,579-segment compaction.  unlinking says the
 	// goroutine is running, and unlinkDone is signalled when it stops.
 	unlinkMu    sync.Mutex
-	unlinkQueue []string
+	unlinkQueue []unlinkItem
 	unlinking   bool
 	unlinkDone  *sync.Cond
 
@@ -967,7 +974,7 @@ func (s *SegmentStore) releaseFromHistory(seg *segment) {
 			return
 		}
 	}
-	s.unlinkLater(seg.dataPath, seg.indexPath)
+	s.unlinkLater("release-after-history-commit", seg.dataPath, seg.indexPath)
 }
 
 // addSegmentKeys
@@ -1215,6 +1222,7 @@ func (s *SegmentStore) recoverOrphans(all []*segment) (segs []*segment, adopted 
 		orphan := SegmentMeta{Height: height, Seq: seq}
 		path := filepath.Join(s.Directory, name)
 		if haveSegments && !orphan.after(newest) { // Superseded by a committed compaction
+			auditUnlink(s.Directory, fmt.Sprintf("recoverOrphans-superseded(newest=%d-%d)", newest.Height, newest.Seq), path)
 			os.Remove(path)
 			os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
 			continue
@@ -1263,6 +1271,21 @@ func keyFromName(name string) (height, seq uint64, err error) {
 // segmentFileName is the data file name for a (height, seq)
 func segmentFileName(height, seq uint64) string {
 	return fmt.Sprintf("%s%08d-%04d%s", segFilePrefix, height, seq, segDataSuffix)
+}
+
+// claimSegmentName publishes a finished file under a segment's name,
+// refusing to replace a file already there.  A rename replaces
+// silently, and every existing segment file is committed, immutable
+// data: a taken name means two segments were minted the same identity
+// -- the pair fallback did exactly that (issue #61) -- and overwriting
+// turns the identity bug into data loss.  The hard link publishes the
+// name atomically or fails with ErrExist leaving both files as they
+// were; the temporary name is dropped once the claim holds.
+func claimSegmentName(tmpPath, dataPath string) (err error) {
+	if err = os.Link(tmpPath, dataPath); err != nil {
+		return err
+	}
+	return os.Remove(tmpPath)
 }
 
 // readManifest loads segments.json
@@ -1351,6 +1374,11 @@ func (s *SegmentStore) writeManifest() (err error) {
 	if err = commitJSON(s.Directory, segManifestName, &m); err != nil {
 		return err
 	}
+	anames := make([]string, 0, len(m.Segments))
+	for _, sm := range m.Segments {
+		anames = append(anames, sm.File)
+	}
+	auditUnlink(s.Directory, "ACTIVE-COMMIT["+strings.Join(anames, ",")+"]")
 
 	// Committed.  The handoffs history has recorded are named by neither
 	// this manifest nor any later one, and the files history left for
@@ -1371,7 +1399,7 @@ func (s *SegmentStore) writeManifest() (err error) {
 	s.handoffs = kept
 	s.retireAfterActiveCommit = s.retireAfterActiveCommit[len(retire):]
 	s.handoffMu.Unlock()
-	s.unlinkLater(retire...)
+	s.unlinkLater("handoff-drop-after-active-commit", retire...)
 	return nil
 }
 
@@ -1392,6 +1420,11 @@ func (s *SegmentStore) writeHistoryManifest() (err error) {
 	if err = commitJSON(s.Directory, segHistoryName, &m); err != nil {
 		return err
 	}
+	hnames := make([]string, 0, len(m.Segments))
+	for _, sm := range m.Segments {
+		hnames = append(hnames, sm.File)
+	}
+	auditUnlink(s.Directory, "HISTORY-COMMIT["+strings.Join(hnames, ",")+"]")
 	s.handoffMu.Lock()
 	for i := range s.handoffs {
 		s.handoffs[i].recorded = true
@@ -1428,6 +1461,28 @@ func commitJSON(directory, name string, m any) (err error) {
 		return err
 	}
 	return syncDir(directory)
+}
+
+// auditUnlink records every deletion of a segment or set file in an
+// append-only log beside the data, with who deleted it and why.  A
+// diagnostic for issue #61 -- a committed manifest naming a file that
+// does not exist -- where the one fact the failure cannot tell you is
+// which path removed the file.  Appends are O_APPEND writes with no
+// sync: a lost tail costs diagnostic detail, never correctness, and
+// the store never reads the log.
+func auditUnlink(dir, why string, paths ...string) {
+	f, err := os.OpenFile(filepath.Join(dir, "unlink.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	now := time.Now().UTC().Format("15:04:05.000000")
+	if len(paths) == 0 { // A bare event, like a manifest commit
+		fmt.Fprintf(f, "%s %s\n", now, why)
+	}
+	for _, p := range paths {
+		fmt.Fprintf(f, "%s %s %s\n", now, why, filepath.Base(p))
+	}
 }
 
 // errStoreClosed is returned by every operation that would read or
@@ -1480,6 +1535,43 @@ func (s *SegmentStore) checkOpen() error {
 // at worst, and a merge that commits in the gap is seen either as its
 // inputs or as its output: both hold the same keys.
 func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
+	s.Mutex.RLock()
+	value, inWindow, found, err := s.lookupActive(key)
+	s.Mutex.RUnlock()
+	if err != nil || found {
+		return value, err
+	}
+	// In an IMMUTABLE store the window is the whole of the protocol's
+	// horizon: a key the filters deny is ABSENT, and history is not
+	// consulted (spec 1.3).  Probing history cost one resident bloom
+	// test per history segment on every miss -- measured at 23% of a
+	// validator's CPU (11% in Bloom.Test alone) at block ~245, and
+	// growing with the segment count, which is the curve issues #9,
+	// #30 and #50 each moved somewhere else.  Permanent data is what
+	// grows without limit, and reaching into it is explicit: GetDeep.
+	//
+	// A MUTABLE store does not stop: dynamic keys are state -- the BPT
+	// above all -- and state must resolve wherever it last landed,
+	// however long ago it was written.  The walk is affordable because
+	// the dynamic layer is small and grows slowly (spec 1.5), and
+	// compaction keeps its history to a few segments.
+	//
+	// inWindow is false only when filters exist and answered; a store
+	// without filters walks, which is correct and bounded by the
+	// rebuild rule (keyfilter.go).
+	if !inWindow && !s.Mutable {
+		return nil, errNotFound
+	}
+	return s.lookupHistory(key, inWindow)
+}
+
+// GetDeep
+// Find a key wherever it is, the history below the window and the
+// packed sets included.  This is the explicit deep read -- export, a
+// query API reaching into old blocks, a test proving durability across
+// a merge -- and it is not the protocol path: the protocol's horizon
+// is the window, and Get answers from it alone (spec 1.3, 1.4).
+func (s *SegmentStore) GetDeep(key [32]byte) (value []byte, err error) {
 	s.Mutex.RLock()
 	value, inWindow, found, err := s.lookupActive(key)
 	s.Mutex.RUnlock()
@@ -1764,13 +1856,15 @@ func (s *SegmentStore) LiveRecords() uint64 {
 // no manifest, so nothing depends on when the unlink happens: a crash
 // first leaves orphans that recoverOrphans sweeps on the next open.
 // Close and the tests wait for the queue to drain (awaitUnlinks).
-func (s *SegmentStore) unlinkLater(paths ...string) {
+func (s *SegmentStore) unlinkLater(why string, paths ...string) {
 	if len(paths) == 0 {
 		return
 	}
 	s.unlinkMu.Lock()
 	defer s.unlinkMu.Unlock()
-	s.unlinkQueue = append(s.unlinkQueue, paths...)
+	for _, p := range paths {
+		s.unlinkQueue = append(s.unlinkQueue, unlinkItem{why: why, path: p})
+	}
 	if s.unlinking {
 		return
 	}
@@ -1794,8 +1888,8 @@ func (s *SegmentStore) drainUnlinks() {
 		batch := s.unlinkQueue
 		s.unlinkQueue = nil
 		s.unlinkMu.Unlock()
-		for _, path := range batch {
-			s.retire(path)
+		for _, it := range batch {
+			s.retireWhy(it.why, it.path)
 		}
 	}
 }
@@ -1814,12 +1908,53 @@ func (s *SegmentStore) awaitUnlinks() {
 // until the iterations and pinned snapshots reading it have finished.
 // Safe under either tier lock, or none.
 func (s *SegmentStore) retire(path string) {
+	s.retireWhy("retire", path)
+}
+
+// manifestStillNames reports whether an on-disk manifest still names
+// the segment the path belongs to (an index file counts as its data
+// file).  The deferred-deletion protocol guarantees it never does by
+// the time a path reaches retireWhy; this makes the invariant
+// executable, so any future gap in that protocol -- like the identity
+// collision of issue #61 -- costs a leaked file and a loud audit line
+// instead of a store that cannot open.  A byte scan, not a parse: the
+// manifests are small and a segment's name appears in them quoted
+// verbatim.
+func (s *SegmentStore) manifestStillNames(path string) bool {
+	name := filepath.Base(path)
+	if strings.HasSuffix(name, segIndexSuffix) {
+		name = strings.TrimSuffix(name, segIndexSuffix) + segDataSuffix
+	}
+	if !strings.HasPrefix(name, segFilePrefix) || !strings.HasSuffix(name, segDataSuffix) {
+		return false
+	}
+	quoted := []byte(`"` + name + `"`)
+	for _, mf := range []string{segManifestName, segHistoryName} {
+		data, err := os.ReadFile(filepath.Join(s.Directory, mf))
+		if err == nil && bytes.Contains(data, quoted) {
+			return true
+		}
+	}
+	return false
+}
+
+// unlinkItem is one queued deletion and the site that queued it, for
+// the issue #61 audit trail
+type unlinkItem struct{ why, path string }
+
+// retireWhy is retire with the enqueuing site recorded
+func (s *SegmentStore) retireWhy(why, path string) {
 	s.retireMu.Lock()
 	defer s.retireMu.Unlock()
 	if s.iterating > 0 {
 		s.pendingDelete = append(s.pendingDelete, path)
 		return
 	}
+	if s.manifestStillNames(path) {
+		auditUnlink(s.Directory, "REFUSED-"+why+": an on-disk manifest still names it", path)
+		return
+	}
+	auditUnlink(s.Directory, why, path)
 	os.Remove(path)
 }
 
@@ -1844,6 +1979,11 @@ func (s *SegmentStore) unpin() {
 		return
 	}
 	for _, path := range s.pendingDelete {
+		if s.manifestStillNames(path) {
+			auditUnlink(s.Directory, "REFUSED-pendingDelete: an on-disk manifest still names it", path)
+			continue
+		}
+		auditUnlink(s.Directory, "pendingDelete", path)
 		os.Remove(path)
 	}
 	s.pendingDelete = nil
@@ -2030,21 +2170,30 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		return meta, nil
 	}
 
+	// The live file is promoted as it stands -- an fsync and a rename,
+	// never a rewrite.  A mutable tail holds shadowed records
+	// (overwrites), and sealing used to rewrite it to drop them: one
+	// pread per record, under the store lock, inside the Put that
+	// tipped SealLimit.  At 100,000 records that was a ~98 MB tail read
+	// back a syscall at a time every few blocks, and every node paused
+	// 10-15 s while 71 goroutines queued on the lock (issue #60).
+	//
+	// Nothing needs the rewrite.  The index is built from s.live, which
+	// already holds the newest offset for every key, so lookups land on
+	// the newest copy; the shadowed bytes ride along dead until
+	// CompactHistory -- whose job reclamation is, off this lock -- folds
+	// them away.  The seal's cost is the flush of what the tail's own
+	// buffer holds, one fsync, and a rename: bounded by a constant, not
+	// by SealLimit, which is the #57 invariant applied to the innermost
+	// part of the active tier.  (An immutable tail never shadows -- a
+	// duplicate put is refused or a no-op -- so the Perm layer loses
+	// nothing it ever had.)
+	sl, seq, err := s.promoteLiveFile(height, seq)
+	if err != nil {
+		return meta, err
+	}
 	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
-
-	var sl sealed
-	if uint64(len(s.live)) == s.liveRecords {
-		// No shadowed records: promote the live file as it stands
-		if sl, err = s.promoteLiveFile(dataPath); err != nil {
-			return meta, err
-		}
-	} else {
-		// Shadowed records present (overwrites): write a compacted copy
-		if sl, err = s.rewriteLiveFile(dataPath); err != nil {
-			return meta, err
-		}
-	}
 
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if err = writeIndexFile(indexPath, sl.order, sl.entries); err != nil {
@@ -2124,30 +2273,57 @@ type sealed struct {
 }
 
 // promoteLiveFile
-// Finish the live file's header, make it durable, and rename it into
-// place as a sealed segment.  No record is copied.
-func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
+// Finish the live file's header, make it durable, and link it into
+// place as the sealed segment (height, seq) -- or the next free
+// sequence above it.  No record is copied.
+//
+// The seal is not the only identity minter: a compaction of history's
+// newest suffix names its output (historyNewest.Seq+1), and when the
+// active tier is empty that is exactly what nextKeyAt mints for the
+// seal.  The two race; the exclusive link turns what used to be a
+// silent overwrite (issue #61) into ErrExist here, and the seal takes
+// the sequence after -- correctly ordered, because the seal holds the
+// Mutex and anything that claimed the name is maintenance output at or
+// below it.  The caller must use the returned seq.
+func (s *SegmentStore) promoteLiveFile(height, seq uint64) (sl sealed, seqOut uint64, err error) {
 	count := s.liveRecords
 	if err = s.liveFile.Flush(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	binary.BigEndian.PutUint64(header[16:], count)
 	if err = s.liveFile.WriteAt(0, header[:]); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	if err = s.liveFile.File.Sync(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	livePath := s.liveFile.Filename
 	if err = s.liveFile.File.Close(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	s.liveFile.File = nil
-	if err = os.Rename(livePath, dataPath); err != nil {
-		return sl, err
+	// Link, not rename: a rename would silently replace the file of a
+	// segment minted the same identity, turning the race above into
+	// data loss.  A taken name is skipped, audibly, and the squatter is
+	// never touched (issue #61).
+	var dataPath string
+	for {
+		dataPath = filepath.Join(s.Directory, segmentFileName(height, seq))
+		err = os.Link(livePath, dataPath)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return sl, seq, err
+		}
+		auditUnlink(s.Directory, fmt.Sprintf("seal-remint: %s is taken", segmentFileName(height, seq)))
+		seq++
+	}
+	if err = os.Remove(livePath); err != nil {
+		return sl, seq, err
 	}
 	// No directory fsync here: the manifest commit that ends this
 	// operation fsyncs the same directory, and that one barrier makes
@@ -2162,101 +2338,10 @@ func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
 	}
 	if !s.Mutable { // Immutable segments are transported; a peer verifies this
 		if sl.hash, _, err = hashAndCount(dataPath); err != nil {
-			return sl, err
+			return sl, seq, err
 		}
 	}
-	return sl, nil
-}
-
-// rewriteLiveFile
-// Write the live tail's newest record per key to a new sealed segment,
-// dropping records shadowed by later writes
-func (s *SegmentStore) rewriteLiveFile(dataPath string) (sl sealed, err error) {
-	keys := make([][32]byte, 0, len(s.live))
-	for key := range s.live {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-
-	tmpPath := dataPath + segTmpSuffix
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return sl, err
-	}
-	defer func() {
-		if f != nil {
-			f.Close()
-			os.Remove(tmpPath)
-		}
-	}()
-
-	bw := bufio.NewWriterSize(f, segWriteBuffer)
-	var h hash.Hash
-	var out io.Writer = bw
-	if !s.Mutable { // Immutable segments are transported; a peer verifies this
-		h = sha256.New()
-		out = io.MultiWriter(bw, h)
-	}
-	var header [segDataHdrSize]byte
-	binary.BigEndian.PutUint32(header[:], segmentMagic)
-	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
-	if _, err = out.Write(header[:]); err != nil {
-		return sl, err
-	}
-
-	// Record where each value lands, so the index needs no read-back
-	sl.order, sl.entries = keys, make(map[[32]byte]*DBBKey, len(keys))
-	offset := uint64(segDataHdrSize)
-
-	var recHdr [segRecHdrSize]byte
-	value := make([]byte, 0, 1024)
-	for _, key := range keys {
-		dbb := s.live[key]
-		if uint64(cap(value)) < dbb.Length {
-			value = make([]byte, dbb.Length)
-		}
-		value = value[:dbb.Length]
-		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
-			return sl, err
-		}
-		copy(recHdr[:32], key[:])
-		binary.BigEndian.PutUint64(recHdr[32:], dbb.Length)
-		if _, err = out.Write(recHdr[:]); err != nil {
-			return sl, err
-		}
-		if _, err = out.Write(value); err != nil {
-			return sl, err
-		}
-		sl.entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: dbb.Length}
-		offset += segRecHdrSize + dbb.Length
-	}
-	if err = bw.Flush(); err != nil {
-		return sl, err
-	}
-	if err = f.Sync(); err != nil {
-		return sl, err
-	}
-	if err = f.Close(); err != nil {
-		f = nil
-		return sl, err
-	}
-	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
-		return sl, err
-	}
-	// The manifest commit's directory fsync covers this rename
-
-	// The old live file is superseded by the sealed segment
-	if s.liveFile.File != nil {
-		s.liveFile.File.Close()
-		s.liveFile.File = nil
-	}
-	os.Remove(s.liveFile.Filename)
-	if h != nil {
-		sl.hash = fmt.Sprintf("%x", h.Sum(nil))
-	}
-	return sl, nil
+	return sl, seq, nil
 }
 
 // DefaultCompactRatio
@@ -2284,29 +2369,80 @@ const DefaultCompactRatio = 0.25
 // reverse.
 var CompactRatio = DefaultCompactRatio
 
+// CompactPassRecords bounds one compaction pass: a run is chosen so
+// that its inputs hold at most this many physical records, whatever
+// has accumulated.  The default, 4Mi records, is roughly half a
+// gigabyte of Accumulate's dynamic records -- a pass of a few seconds
+// on NVMe -- so however large history grows, one pass costs about
+// that, and the maint lock it holds never delays the per-shard merges
+// behind it by more (issue #59; the unbounded pass measured 12-19 s
+// after four hours at 500 tx/s and was still growing).
+//
+// The price of the bound is that a segment which grows to the budget
+// is no longer folded INTO -- garbage that lands in it after that
+// waits for the cross-shard consolidation (#47's daily tier) rather
+// than for this loop.  Bounded latency for bounded reclamation reach:
+// the budget trades the second for the first, and the default keeps a
+// segment's frozen garbage under CompactRatio of its size at the
+// moment it froze.
+var CompactPassRecords uint64 = 4 << 20
+
 // compactionRun
-// The suffix of history worth compacting into one segment: the newest
-// segment, and each older one in turn while it is no larger than
-// 1/ratio times what has gathered behind it.  A run shorter than two
-// is nothing to do.  Sized by physical record count, which every
-// segment holds in memory, so choosing costs no I/O.
-func compactionRun(history []*segment, ratio float64) (run []*segment) {
+// The run of history worth compacting into one segment, and where it
+// sits.  First choice: the newest suffix, taking each older segment in
+// turn while it is no larger than 1/ratio times what has gathered
+// behind it AND the run stays inside CompactPassRecords.  If that
+// yields nothing (the next segment is too big for the budget), fall
+// back to the newest ADJACENT PAIR that fits the budget, so
+// consolidation still advances -- bounded, one pair per pass -- rather
+// than stopping the moment any segment outgrows the budget.  A run
+// shorter than two is nothing to do.  Sized by physical record count,
+// which every segment holds in memory, so choosing costs no I/O.
+func compactionRun(history []*segment, ratio float64) (run []*segment, at int) {
 	n := len(history)
 	if n == 0 {
-		return nil
+		return nil, 0
 	}
-	var behind float64
+	budget := CompactPassRecords
+	var behind uint64
 	i := n - 1
 	for ; i >= 0; i-- {
-		if i < n-1 && float64(history[i].records)*ratio > behind {
-			break // Too big for what has gathered behind it, and so is everything older
+		r := uint64(history[i].records)
+		if i < n-1 && (float64(r)*ratio > float64(behind) || behind+r > budget) {
+			break // Too big for what gathered behind it, or for one pass
 		}
-		behind += float64(history[i].records)
+		behind += r
 	}
-	if run = history[i+1:]; len(run) < 2 {
-		return nil
+	if run = history[i+1:]; len(run) >= 2 {
+		return run, i + 1
 	}
-	return run
+	// Pair fallback: the newest adjacent pair that fits one pass AND
+	// satisfies the same worth-it rule -- the newer member must be at
+	// least ratio of the older, or the fold rewrites much to reclaim
+	// little.  Without that gate the fallback would fold what the ratio
+	// had just declined.
+	for j := n - 2; j >= 0; j-- {
+		older, newer := uint64(history[j].records), uint64(history[j+1].records)
+		if older+newer > budget || float64(older)*ratio > float64(newer) {
+			continue
+		}
+		// The pair's replacement is named (Height, Seq+1) after its
+		// newer member.  A suffix ends where that identity is free, but
+		// a pair can sit anywhere in history -- and when several seals
+		// share one block, the segment right behind the pair IS
+		// (Height, Seq+1).  Folding this pair would mint a second
+		// segment under that segment's name and overwrite its committed
+		// file; the store then held two segments sharing one file, and
+		// releasing either deleted the other's data (issue #61).
+		if j+2 < n {
+			last, next := history[j+1].meta, history[j+2].meta
+			if next.Height == last.Height && next.Seq == last.Seq+1 {
+				continue
+			}
+		}
+		return history[j : j+2], j
+	}
+	return nil, 0
 }
 
 // CompactHistory
@@ -2333,10 +2469,13 @@ func compactionRun(history []*segment, ratio float64) (run []*segment) {
 // checks that the run is still exactly where it was -- a drop or an
 // import could have changed history meanwhile -- and abandons the
 // output if not.  The identity is the sequence after the run's
-// newest, which is free: everything in history is below the window
-// and the run is history's newest suffix.  Crash safety is the merge's
-// rule: an uncommitted output sits below the newest active segment
-// and recoverOrphans deletes it, while the inputs are still named.
+// newest.  For a suffix run that identity is free; the pair fallback
+// refuses a pair whose successor already holds it, and publishing the
+// output refuses to replace an existing file, so a taken identity can
+// never overwrite a committed segment (issue #61).  Crash safety is
+// the merge's rule: an uncommitted output sits below the newest active
+// segment and recoverOrphans deletes it, while the inputs are still
+// named.
 func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	s.maint.Lock()
 	defer s.maint.Unlock()
@@ -2346,8 +2485,7 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 		s.History.RUnlock()
 		return false, err
 	}
-	run := compactionRun(s.history, CompactRatio)
-	at := len(s.history) - len(run) // Where the run sits: history's newest suffix
+	run, at := compactionRun(s.history, CompactRatio)
 	s.History.RUnlock()
 	if run == nil {
 		return false, nil
@@ -2356,12 +2494,16 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	// to reclaim; compactionRun already refuses runs shorter than two,
 	// so anything here has at least two segments to fold together.
 
-	winners, keys, err := s.mergeInputs(run)
-	if err != nil {
-		return false, err
-	}
 	last := run[len(run)-1].meta
-	meta, seg, err := s.writeMergedSegment(winners, keys, last.Height, last.Seq+1)
+	meta, seg, err := s.writeMergedRun(run, last.Height, last.Seq+1)
+	if errors.Is(err, os.ErrExist) {
+		// The replacement's identity is already a segment on disk.
+		// compactionRun refuses the pairs that would mint one, so this
+		// is the last line of defence: skip the pass rather than let
+		// anything overwrite a committed segment's file (issue #61).
+		auditUnlink(s.Directory, fmt.Sprintf("compact-refused-name-taken(%d-%d)", last.Height, last.Seq+1))
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -2388,7 +2530,7 @@ func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok boo
 	defer s.History.Unlock()
 	discard := func() {
 		out.close()
-		s.unlinkLater(out.dataPath, out.indexPath)
+		s.unlinkLater("discard-uncommitted-output", out.dataPath, out.indexPath)
 	}
 	if err = s.checkOpen(); err != nil {
 		discard()
@@ -2426,18 +2568,36 @@ func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok boo
 // what the protocol path can do meanwhile.  Nil except under test.
 var maintenanceHook func()
 
-// writeMergedSegment
-// Write the resolved keys and values of a merge into a new sealed
-// segment at (height, seq), build its index, and open it.  No lock is
-// needed -- the inputs are immutable -- and the caller is responsible
-// for committing it into the segment list.
+// writeMergedRun
+// Write a run of segments into one new sealed segment at (height, seq)
+// holding the newest value for every key in the run, build its index,
+// and open it.  No lock is needed -- the inputs are immutable -- and
+// the caller is responsible for committing it into the segment list.
+//
+// Two passes over the inputs' sorted indexes, both streaming
+// (mergeIndexes).  The first only counts distinct keys, which is what
+// the data header, the index header and the bloom filter need to be
+// written up front -- and an immutable segment's hash covers its
+// header, so the header cannot be patched in afterwards.  The second
+// emits each winner in key order: its value is read from whichever
+// input holds it and appended to the data file, and its index record
+// goes straight to the index writer.  Nothing is held per key.
+//
+// The values are read back one at a time and in key order, which is
+// random order within each input's data file; that was already so, and
+// a merge that reclaims space has to touch every surviving value.  What
+// changed is that the keys are no longer all in memory at once (issue
+// #59).
 //
 // The segment is complete and durable when this returns; it is simply
 // not yet named by the manifest, which is what makes the commit that
 // follows the only thing that decides whether the merge happened.
-func (s *SegmentStore) writeMergedSegment(
-	winners map[[32]byte]mergeInput, keys [][32]byte, height, seq uint64,
-) (meta SegmentMeta, merged *segment, err error) {
+func (s *SegmentStore) writeMergedRun(run []*segment, height, seq uint64) (meta SegmentMeta, merged *segment, err error) {
+	count, err := mergeIndexes(run, nil)
+	if err != nil {
+		return meta, nil, err
+	}
+
 	dataName := segmentFileName(height, seq)
 	dataPath := filepath.Join(s.Directory, dataName)
 	tmpPath := filepath.Join(s.Directory, segCompactName+segTmpSuffix)
@@ -2462,32 +2622,43 @@ func (s *SegmentStore) writeMergedSegment(
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], uint64(len(keys)))
+	binary.BigEndian.PutUint64(header[16:], count)
 	if _, err = out.Write(header[:]); err != nil {
 		return meta, nil, err
 	}
 
-	// Record where each value lands, so the index needs no read-back
-	entries := make(map[[32]byte]*DBBKey, len(keys))
-	offset := uint64(segDataHdrSize)
+	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	iw, err := newIndexWriter(indexPath, count)
+	if err != nil {
+		return meta, nil, err
+	}
+	defer iw.abort()
 
+	body := uint64(0) // Bytes of records written so far: the next value's body-relative offset
 	var recHdr [segRecHdrSize]byte
-	for _, key := range keys {
-		w := winners[key]
-		value, err := w.seg.value(w.dbb)
-		if err != nil {
-			return meta, nil, err
+	value := make([]byte, 0, 4096)
+	_, err = mergeIndexes(run, func(src int, key [32]byte, dbb DBBKey) error {
+		if uint64(cap(value)) < dbb.Length {
+			value = make([]byte, dbb.Length)
+		}
+		value = value[:dbb.Length]
+		if err := run[src].readValue(dbb, value); err != nil {
+			return err
 		}
 		copy(recHdr[:32], key[:])
-		binary.BigEndian.PutUint64(recHdr[32:], uint64(len(value)))
-		if _, err = out.Write(recHdr[:]); err != nil {
-			return meta, nil, err
+		binary.BigEndian.PutUint64(recHdr[32:], dbb.Length)
+		if _, err := out.Write(recHdr[:]); err != nil {
+			return err
 		}
-		if _, err = out.Write(value); err != nil {
-			return meta, nil, err
+		if _, err := out.Write(value); err != nil {
+			return err
 		}
-		entries[key] = &DBBKey{Offset: offset + segRecHdrSize, Length: uint64(len(value))}
-		offset += segRecHdrSize + uint64(len(value))
+		rel := DBBKey{Offset: body + segRecHdrSize, Length: dbb.Length}
+		body += segRecHdrSize + dbb.Length
+		return iw.write(key, rel)
+	})
+	if err != nil {
+		return meta, nil, err
 	}
 	if err = bw.Flush(); err != nil {
 		return meta, nil, err
@@ -2500,16 +2671,15 @@ func (s *SegmentStore) writeMergedSegment(
 		return meta, nil, err
 	}
 	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
+	if err = claimSegmentName(tmpPath, dataPath); err != nil {
 		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
-	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = writeIndexFile(indexPath, keys, entries); err != nil {
+	if err = iw.finish(); err != nil {
 		return meta, nil, err
 	}
 
-	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(keys)), Hash: ""}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: count}
 	if h != nil {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
@@ -2576,70 +2746,6 @@ func layoutBodies(segs []*segment) (sizes []int64, bases []uint64, total uint64,
 	return sizes, bases, total, nil
 }
 
-// shiftedIndex
-// The index records of several segments as they read once their bodies
-// are laid end to end: each entry's offset moved by where its segment's
-// body landed, one entry per key, sorted.  Returns raw 48-byte records,
-// relative to the combined body, which is the form an index file and a
-// block-set file both store.
-//
-// This is the whole per-key cost of merging: the index is 48 bytes a
-// key and already sorted within each source, so the work is a read of
-// each index, an add per entry, and a sort of a few hundred records.
-// No value is touched.  With ONE source there is not even the add: its
-// index is already relative to its body, and its body is the whole
-// result, so the records are copied verbatim.
-//
-// A key that appears in two sources -- possible in the Perm layer only
-// through an import, which permits an identical value and rejects a
-// differing one -- keeps the NEWEST source's entry.  The sources are
-// taken newest first so that a stable sort leaves that entry first
-// among equals, and the older ones are dropped.
-func shiftedIndex(segs []*segment, bases []uint64) (records []byte, err error) {
-	var total int64
-	for _, seg := range segs {
-		total += seg.count
-	}
-	records = make([]byte, 0, total*DBKeyFullSize)
-	for i := len(segs) - 1; i >= 0; i-- {
-		seg := segs[i]
-		shift := bases[i]
-		start := len(records)
-		records = records[:start+int(seg.count)*DBKeyFullSize]
-		index, release, err := seg.index()
-		if err != nil {
-			return nil, err
-		}
-		_, err = index.ReadAt(records[start:], segIndexHdrSize)
-		release()
-		if err != nil {
-			return nil, err
-		}
-		if shift == 0 {
-			continue // Verbatim: the body sits where the index says
-		}
-		for pos := start; pos < len(records); pos += DBKeyFullSize {
-			off := binary.BigEndian.Uint64(records[pos+32:])
-			binary.BigEndian.PutUint64(records[pos+32:], off+shift)
-		}
-	}
-	if len(segs) == 1 {
-		return records, nil // One source: already sorted and unique
-	}
-	sort.Stable(recordSort(records))
-	w := 0
-	for r := 0; r < len(records); r += DBKeyFullSize {
-		if w > 0 && bytes.Equal(records[w-DBKeyFullSize:w-DBKeyFullSize+32], records[r:r+32]) {
-			continue // An older copy of the key just kept
-		}
-		if w != r {
-			copy(records[w:w+DBKeyFullSize], records[r:r+DBKeyFullSize])
-		}
-		w += DBKeyFullSize
-	}
-	return records[:w], nil
-}
-
 // concatSegments
 // Build one segment from several by COPYING their bodies end to end
 // and shifting their index offsets, rather than reading every value
@@ -2673,7 +2779,9 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 	if err != nil {
 		return meta, nil, err
 	}
-	records, err := shiftedIndex(segs, bases)
+	// Count first, so the index header and bloom can be written before
+	// the records stream through (issue #59)
+	count, err := mergeIndexes(segs, nil)
 	if err != nil {
 		return meta, nil, err
 	}
@@ -2728,17 +2836,29 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 		return meta, nil, err
 	}
 	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
+	if err = claimSegmentName(tmpPath, dataPath); err != nil {
 		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
 
+	// The index: each input's entries shifted by where its body landed,
+	// merged in key order, newest winning a repeated key, streamed
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = writeIndexRecords(indexPath, records); err != nil {
+	iw, err := newIndexWriter(indexPath, count)
+	if err != nil {
+		return meta, nil, err
+	}
+	defer iw.abort()
+	if _, err = mergeIndexes(segs, func(src int, key [32]byte, dbb DBBKey) error {
+		return iw.write(key, DBBKey{Offset: dbb.Offset + bases[src], Length: dbb.Length})
+	}); err != nil {
+		return meta, nil, err
+	}
+	if err = iw.finish(); err != nil {
 		return meta, nil, err
 	}
 
-	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(records) / DBKeyFullSize)}
+	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: count}
 	if h != nil {
 		meta.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	}
@@ -2823,6 +2943,13 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	outHeight, outSeq := last.Height, last.Seq+1
 
 	meta, seg, err := s.concatSegments(run, outHeight, outSeq)
+	if errors.Is(err, os.ErrExist) {
+		// The merged segment's identity is already a file on disk.  The
+		// prefix rule should make that impossible; refuse rather than
+		// overwrite, and leave the run for a later pass (issue #61).
+		auditUnlink(s.Directory, fmt.Sprintf("merge-refused-name-taken(%d-%d)", outHeight, outSeq))
+		return meta, false, nil
+	}
 	if err != nil {
 		return meta, false, err
 	}
@@ -2910,57 +3037,6 @@ func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
 		s.releaseFromHistory(seg)
 	}
 	return n, nil
-}
-
-// mergeInput names where a key's surviving value lives
-type mergeInput struct {
-	seg *segment
-	dbb *DBBKey
-}
-
-// mergeInputs
-// Resolve what a merge of segs should write: one entry per key, taking
-// the newest where a key appears more than once, and the keys sorted so
-// the output is a sorted run.
-//
-// Newest-wins matters even in the Perm layer, where a key is written
-// once and never overwritten: adopting a peer's segment can introduce a
-// second copy of a key the store already holds, because
-// checkNoConflicts rejects a DIFFERING value and permits an identical
-// one.  The copies agree, so which one survives does not matter -- but
-// the merge still has to emit only one.
-//
-// No lock: the segments are immutable and the caller holds them.
-func (s *SegmentStore) mergeInputs(segs []*segment) (winners map[[32]byte]mergeInput, keys [][32]byte, err error) {
-	winners = make(map[[32]byte]mergeInput)
-	for i := len(segs) - 1; i >= 0; i-- { // Newest first, so it wins
-		seg := segs[i]
-		entries := make([]byte, seg.count*DBKeyFullSize)
-		index, release, err := seg.index()
-		if err != nil {
-			return nil, nil, err
-		}
-		_, err = index.ReadAt(entries, segIndexHdrSize)
-		release()
-		if err != nil {
-			return nil, nil, err
-		}
-		for pos := 0; pos+DBKeyFullSize <= len(entries); pos += DBKeyFullSize {
-			key, dbb, err := GetDBBKey(entries[pos : pos+DBKeyFullSize])
-			if err != nil {
-				return nil, nil, err
-			}
-			if _, seen := winners[key]; !seen {
-				winners[key] = mergeInput{seg, dbb}
-			}
-		}
-	}
-	keys = make([][32]byte, 0, len(winners))
-	for key := range winners {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i][:], keys[j][:]) < 0 })
-	return winners, keys, nil
 }
 
 // SegmentPaths

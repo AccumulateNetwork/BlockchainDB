@@ -217,7 +217,7 @@ func TestSegmentStoreCompact(t *testing.T) {
 
 	// Values intact, before and after a reopen
 	for i := range keys {
-		v, err := store.Get(keys[i])
+		v, err := store.GetDeep(keys[i])
 		require.NoErrorf(t, err, "key %d after compact", i)
 		assert.Equal(t, latest[i], v)
 	}
@@ -225,7 +225,7 @@ func TestSegmentStoreCompact(t *testing.T) {
 	store, err = OpenSegmentStore(dir)
 	require.NoError(t, err)
 	for i := range keys {
-		v, err := store.Get(keys[i])
+		v, err := store.GetDeep(keys[i])
 		require.NoErrorf(t, err, "key %d after compact+reopen", i)
 		assert.Equal(t, latest[i], v)
 	}

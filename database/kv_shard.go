@@ -215,6 +215,18 @@ func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
 	return value, nil
 }
 
+// GetDeep
+// Find a key wherever it is: the shard's windows, its history, and the
+// packed sets.  The explicit deep read (spec 1.3, 1.4) -- export and
+// query APIs -- never the protocol path, which stops at the window.
+func (k *KVShard) GetDeep(key [32]byte) (value []byte, err error) {
+	index := ShardIndex(key[:])
+	if err = k.Shards[index].Open(); err != nil {
+		return
+	}
+	return k.Shards[index].GetDeep(key)
+}
+
 // GetPerm
 // Find the right shard, and extract the value from the PermKV in the shard
 func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {

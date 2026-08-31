@@ -167,7 +167,7 @@ func TestForEachCallbackMayUseTheStore(t *testing.T) {
 		seen := 0
 		done <- store.ForEach(func(key [32]byte, value []byte) error {
 			// Read the store from inside its own iteration
-			got, err := store.Get(key)
+			got, err := store.GetDeep(key)
 			if err != nil {
 				return fmt.Errorf("Get inside ForEach: %w", err)
 			}
@@ -241,7 +241,7 @@ func TestForEachSurvivesConcurrentCompaction(t *testing.T) {
 
 	// And the store is intact afterwards
 	for i, key := range keys {
-		v, err := store.Get(key)
+		v, err := store.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost", i)
 		require.Equal(t, fmt.Sprintf("v%d", i), string(v))
 	}
