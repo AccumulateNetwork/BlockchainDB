@@ -361,7 +361,7 @@ func crashDumpState(dir string) string {
 			}
 			fmt.Fprintf(&b, "  %s (%d)\n", e.Name(), size)
 		}
-		for _, mf := range []string{segManifestName, "history.json"} {
+		for _, mf := range []string{segManifestName, "history.json", "unlink.log"} {
 			data, err := os.ReadFile(filepath.Join(d, mf))
 			if err != nil {
 				fmt.Fprintf(&b, "--- %s/%s: %v\n", layer, mf, err)
