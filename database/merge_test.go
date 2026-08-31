@@ -537,3 +537,114 @@ func TestImportRefusesToReplaceAFileAtItsIdentity(t *testing.T) {
 	require.NoError(t, os.Remove(squatter))
 	require.NoError(t, dst.ImportSegmentFile(exported, meta))
 }
+
+// TestRecoveryNeverAdoptsAMergeOutput
+// recoverOrphans classifies an unnamed data file by height: above the
+// manifest's newest is an interrupted seal, complete by construction,
+// and is adopted.  That is right for a seal, whose records exist
+// nowhere else -- and wrong for a merge output, whose every key is
+// still in the inputs the manifest names.  A shard whose segments are
+// ALL below the watermark (a shard that took no writes for a whole
+// set, ordinary at low entry rates) merges its entire list, so the
+// output takes an identity above everything and the height rule adopts
+// it: every key of that shard, stored twice, until a later merge folds
+// the duplicate away (issue #52).
+//
+// The output says what it is in its header now, and recovery believes
+// the file over the arithmetic.
+func TestRecoveryNeverAdoptsAMergeOutput(t *testing.T) {
+	dir := storeDir(t, "orphanmerge")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	kr := NewFastRandom([]byte{183})
+	var keys [][32]byte
+	for b := uint64(1); b <= 3; b++ {
+		for i := 0; i < 10; i++ {
+			k := kr.NextHash()
+			keys = append(keys, k)
+			require.NoError(t, store.Put(k, []byte{byte(b), byte(i)}))
+		}
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	// Roll the window so all three are history, and merge them the way
+	// MergeBelow would -- but stop before the commit, which is the crash
+	for b := uint64(4); b <= 3*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	store.History.RLock()
+	run := append([]*segment(nil), store.history...)
+	store.History.RUnlock()
+	require.GreaterOrEqual(t, len(run), 3, "the run must be history for this to test anything")
+
+	last := run[len(run)-1].meta
+	meta, seg, err := store.concatSegments(run, last.Height, last.Seq+1)
+	require.NoError(t, err)
+	seg.close()
+	orphan := filepath.Join(dir, meta.File)
+	_, err = os.Stat(orphan)
+	require.NoError(t, err, "the merge output must be on disk for the crash to matter")
+
+	// The crash: reopen without closing, so recovery runs against a
+	// store whose manifest never learned about that file
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	_, err = os.Stat(orphan)
+	require.Truef(t, os.IsNotExist(err),
+		"recovery adopted the merge output %s; its keys are already in the segments the manifest names", meta.File)
+
+	// Every key is still there, exactly once
+	for i, k := range keys {
+		v, err := reopened.GetDeep(k)
+		require.NoErrorf(t, err, "key %d lost", i)
+		require.Equal(t, []byte{byte(i/10 + 1), byte(i % 10)}, v)
+	}
+	seen := map[string]bool{}
+	for _, s := range reopened.sealedSegments() {
+		require.Falsef(t, seen[s.meta.File], "%s counted twice", s.meta.File)
+		seen[s.meta.File] = true
+	}
+}
+
+// TestRecoveryStillAdoptsAnInterruptedSeal
+// The other half of the rule: a SEAL that reached disk before its
+// commit is the only copy of its records, and must still be adopted
+// (issue #45).  Marking maintenance output must not cost that.
+func TestRecoveryStillAdoptsAnInterruptedSeal(t *testing.T) {
+	dir := storeDir(t, "orphanseal")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+
+	kr := NewFastRandom([]byte{184})
+	first := kr.NextHash()
+	require.NoError(t, store.Put(first, []byte("committed")))
+	_, err = store.Seal(1)
+	require.NoError(t, err)
+
+	// A seal whose manifest commit never happened: write the tail,
+	// promote it, and reopen without committing
+	late := kr.NextHash()
+	require.NoError(t, store.Put(late, []byte("late")))
+	store.Mutex.Lock()
+	sl, seq, err := store.promoteLiveFile(2, 0)
+	require.NoError(t, err)
+	require.NoError(t, writeIndexFile(
+		filepath.Join(dir, strings.TrimSuffix(segmentFileName(2, seq), segDataSuffix)+segIndexSuffix),
+		sl.order, sl.entries))
+	store.Mutex.Unlock()
+
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	v, err := reopened.GetDeep(late)
+	require.NoError(t, err, "an interrupted seal is the only copy of its records; it must be adopted")
+	require.Equal(t, []byte("late"), v)
+	v, err = reopened.GetDeep(first)
+	require.NoError(t, err)
+	require.Equal(t, []byte("committed"), v)
+}

@@ -122,7 +122,7 @@ const (
 	// every segment history.json names.
 	StoreFormatVersion = 4
 	segIndexHdrSize    = 32 // magic(4) version(4) count(8) bloomBytes(8) bloomK(4) reserved(4)
-	segDataHdrSize     = 24 // magic(4) version(4) sinceOffset(8) count(8) -- segment.go's stream header
+	segDataHdrSize     = 24 // magic(4) version(4) kind(1) unused(7) count(8) -- segment.go's stream header
 	segRecHdrSize      = 40 // key(32) valueLen(8) precede each value in a .dat
 )
 
@@ -1104,6 +1104,54 @@ func (s *SegmentStore) addSegmentKeys(keys *BloomSet, seg *segment) (err error) 
 // count on trust, so a file that was not a segment at all -- or was one
 // written by a format this build does not understand -- was parsed as
 // though it were.
+// A segment's KIND, written in the header byte that segment.go's
+// stream format documented as the start of "sinceOffset" and that
+// nothing has ever written or read.  Zero -- what every file written
+// before this says -- is segKindSealed, which is what those files are.
+//
+// It answers one question, and recovery is the only thing that asks
+// it: is a file the manifests do not name a SEAL that reached disk
+// before its commit, or the OUTPUT of maintenance that did the same?
+// A seal is data that exists nowhere else and must be adopted.  A
+// merge, compaction or pack output holds keys that its inputs still
+// hold -- the inputs the manifest still names -- so adopting one
+// stores every one of those keys twice, until a later merge folds the
+// duplicate away.  It is space, not wrong answers, but it is space a
+// crash can leave behind at any size (issue #52).
+const (
+	segKindSealed  byte = 0 // A sealed live tail: adopt it if it is not named
+	segKindDerived byte = 1 // Maintenance output: named by a manifest, or garbage
+)
+
+// segKindOffset is where the kind byte sits in a segment data header
+const segKindOffset = 8
+
+// writeSegmentDataHeader fills in a segment file's header: what it is,
+// and how many physical records follow.
+func writeSegmentDataHeader(hdr []byte, kind byte, records uint64) {
+	binary.BigEndian.PutUint32(hdr[:], segmentMagic)
+	binary.BigEndian.PutUint32(hdr[4:], segmentVersion)
+	hdr[segKindOffset] = kind
+	binary.BigEndian.PutUint64(hdr[16:], records)
+}
+
+// segmentKind reads a segment data file's kind byte.  An unreadable
+// file reads as sealed, which is the conservative answer: recovery
+// adopts it and a later merge sorts out any duplication, rather than
+// deleting something that might be the only copy.
+func segmentKind(path string) byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return segKindSealed
+	}
+	defer f.Close()
+	var hdr [segDataHdrSize]byte
+	if _, err = f.ReadAt(hdr[:], 0); err != nil {
+		return segKindSealed
+	}
+	return hdr[segKindOffset]
+}
+
 func checkSegmentHeader(path string, hdr []byte) error {
 	if magic := binary.BigEndian.Uint32(hdr[:]); magic != segmentMagic {
 		return fmt.Errorf("%s is not a segment file (magic %#08x)", path, magic)
@@ -1303,11 +1351,37 @@ func (s *SegmentStore) recoverOrphans(all []*segment) (segs []*segment, adopted 
 		}
 		orphan := SegmentMeta{Height: height, Seq: seq}
 		path := filepath.Join(s.Directory, name)
-		if haveSegments && !orphan.after(newest) { // Superseded by a committed compaction
-			auditUnlink(s.Directory, fmt.Sprintf("recoverOrphans-superseded(newest=%d-%d)", newest.Height, newest.Seq), path)
+		drop := func(why string) {
+			auditUnlink(s.Directory, why, path)
 			os.Remove(path)
 			os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
+		}
+		if haveSegments && !orphan.after(newest) { // Superseded by a committed compaction
+			drop(fmt.Sprintf("recoverOrphans-superseded(newest=%d-%d)", newest.Height, newest.Seq))
 			continue
+		}
+		// Above the newest, so the height rule calls it an interrupted
+		// seal -- but only a SEAL holds data that exists nowhere else.
+		// A merge, compaction or pack output is named by a manifest or
+		// it is garbage: its keys are all in the inputs the manifest
+		// still names, and a run whose every segment is below the
+		// watermark produces an output above them all, so the height
+		// rule alone would adopt it and store those keys twice
+		// (issue #52).
+		if segmentKind(path) == segKindDerived {
+			drop("recoverOrphans-derived-output")
+			continue
+		}
+		// A shard whose segments were packed into a block set commits a
+		// manifest naming none of them; a crash before the unlinks
+		// leaves files above nothing at all.  The set holds those keys
+		// now, so the cold watermark settles them as the manifest would
+		// have (issue #52).
+		if s.cold != nil {
+			if last, ok := s.cold.watermark(); ok && height <= last {
+				drop(fmt.Sprintf("recoverOrphans-packed(watermark=%d)", last))
+				continue
+			}
 		}
 		hash, count, err := s.identify(path)
 		if err != nil {
@@ -2374,9 +2448,7 @@ func (s *SegmentStore) promoteLiveFile(height, seq uint64) (sl sealed, seqOut ui
 		return sl, seq, err
 	}
 	var header [segDataHdrSize]byte
-	binary.BigEndian.PutUint32(header[:], segmentMagic)
-	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], count)
+	writeSegmentDataHeader(header[:], segKindSealed, count)
 	if err = s.liveFile.WriteAt(0, header[:]); err != nil {
 		return sl, seq, err
 	}
@@ -2743,9 +2815,7 @@ func (s *SegmentStore) writeMergedRun(run []*segment, height, seq uint64) (meta 
 		out = io.MultiWriter(bw, h)
 	}
 	var header [segDataHdrSize]byte
-	binary.BigEndian.PutUint32(header[:], segmentMagic)
-	binary.BigEndian.PutUint32(header[4:], segmentVersion)
-	binary.BigEndian.PutUint64(header[16:], count)
+	writeSegmentDataHeader(header[:], segKindDerived, count) // Maintenance output (issue #52)
 	if _, err = out.Write(header[:]); err != nil {
 		return meta, nil, err
 	}
@@ -2932,13 +3002,11 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 	}
 
 	var header [segDataHdrSize]byte
-	binary.BigEndian.PutUint32(header[:], segmentMagic)
-	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	var physical uint64
 	for _, seg := range segs {
 		physical += uint64(seg.records)
 	}
-	binary.BigEndian.PutUint64(header[16:], physical)
+	writeSegmentDataHeader(header[:], segKindDerived, physical) // Maintenance output (issue #52)
 	if _, err = out.Write(header[:]); err != nil {
 		return meta, nil, err
 	}

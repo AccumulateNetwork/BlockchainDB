@@ -304,9 +304,13 @@ Deletion is deferred through `retireAfterActiveCommit` and an unlink
 queue; `retireWhy` **refuses to unlink any file an on-disk manifest
 still names** and audits the refusal (`unlink.log`) — invariant 1.8
 made executable (#61).  `recoverOrphans` deletes only files named by
-*no* manifest, and only at or below the newest named identity; above
-it, an orphan is an interrupted seal and is adopted (#45, #52 tracks a
-duplicate-adoption gap).
+*no* manifest.  At or below the newest named identity an orphan was
+superseded; above it, an orphan is an interrupted seal and is adopted
+(#45) -- unless the file says it is maintenance output, which is named
+by a manifest or is garbage, or the cold watermark already covers its
+block, both of which would otherwise store the same keys twice (#52).
+A segment's header records which it is; files written before that
+field read as sealed, which is what they are.
 
 ### 2.7 Maintenance (1.2, 1.4, 1.5, 1.7)
 
@@ -384,7 +388,6 @@ The current gaps between Section 1 and the code, in one place:
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
 | #47 | 1.4 pack cadence | Daily cross-shard tier not yet scheduled |
-| #52 | 1.8 recovery | recoverOrphans can adopt a duplicate of named data |
 | #54 | 1.3 filter sizing | Filters sized from all-time max, not recent demand |
 
 A pull request that closes one of these updates this table.  A pull
