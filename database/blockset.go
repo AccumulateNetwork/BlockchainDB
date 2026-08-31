@@ -101,10 +101,48 @@ type setEntry struct {
 // whether, and where, to read.  The file itself is borrowed from the
 // shared pool for the length of a read, like a segment's.
 type blockSet struct {
-	meta  SetMeta
-	path  string
-	dir   []setEntry // One per shard
-	bloom *Bloom     // Over every key in the set
+	meta SetMeta
+	path string
+	dir  []setEntry // One per shard
+
+	// The set's filter stays ON DISK.  A set covers a whole finished
+	// period -- every key of every shard -- so its filter is the
+	// largest single thing a set would keep resident, and sets
+	// accumulate for the life of the chain: holding them all is memory
+	// growing with the age of the store, and reading them all is an
+	// open that gets slower forever (issue #64).  A set is consulted
+	// only by a deep read, which is rare by design (spec 1.4), and the
+	// probe costs K one-byte reads from a file the pool already holds
+	// open.
+	bloomOff   int64
+	bloomBytes uint64
+	bloomK     int
+}
+
+// bloomTest asks the set's on-disk filter whether the key might be
+// here.  An unreadable filter reads as "might": a pointless read, not
+// a wrong answer.
+func (b *blockSet) bloomTest(key [32]byte) (mightBe bool, err error) {
+	if b.bloomBytes == 0 || b.bloomK < 1 {
+		return true, nil
+	}
+	f, release, err := segmentFiles.acquire(b.path)
+	if err != nil {
+		return true, err
+	}
+	defer release()
+	probe := Bloom{NumBytes: b.bloomBytes, K: b.bloomK}
+	var one [1]byte
+	for i := 0; i < b.bloomK; i++ {
+		idx, mask := probe.ByteMask(key, i)
+		if _, err = f.ReadAt(one[:], b.bloomOff+int64(idx)); err != nil {
+			return true, err
+		}
+		if one[0]&mask == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // SetStore
@@ -341,10 +379,14 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	}
 
 	set = &blockSet{
-		meta:  SetMeta{First: first, Last: last, File: name, Keys: keys},
-		path:  path,
-		dir:   dir,
-		bloom: bloom,
+		meta: SetMeta{First: first, Last: last, File: name, Keys: keys},
+		path: path,
+		dir:  dir,
+		// The filter this build just wrote is left on disk with the
+		// rest of the set, and probed there (issue #64)
+		bloomOff:   int64(setHdrSize) + NumShards*setDirEntSize + int64(keys)*DBKeyFullSize,
+		bloomBytes: bloom.NumBytes,
+		bloomK:     bloom.K,
 	}
 	ss.Mutex.Lock()
 	ss.sets = append(ss.sets, set)
@@ -401,19 +443,10 @@ func openBlockSet(path string) (set *blockSet, err error) {
 		}
 	}
 
-	bitmap := make([]byte, bloomBytes)
-	bloomOff := int64(setHdrSize) + NumShards*setDirEntSize + int64(set.meta.Keys)*DBKeyFullSize
-	if _, err = f.ReadAt(bitmap, bloomOff); err != nil {
-		return nil, err
-	}
-	set.bloom = &Bloom{
-		SizeOfMap: float64(bloomBytes) / (1024 * 1024),
-		NumBytes:  bloomBytes,
-		Map:       bitmap,
-		K:         bloomK,
-		Capacity:  bloomBytes * 8 / BloomBitsPerKey,
-		Count:     set.meta.Keys,
-	}
+	// The filter is left where it is; see blockSet (issue #64)
+	set.bloomOff = int64(setHdrSize) + NumShards*setDirEntSize + int64(set.meta.Keys)*DBKeyFullSize
+	set.bloomBytes = bloomBytes
+	set.bloomK = bloomK
 	return set, nil
 }
 
@@ -421,8 +454,11 @@ func openBlockSet(path string) (set *blockSet, err error) {
 // Find a key in this set: bloom, then the shard's directory entry, then
 // a binary search of that shard's index slice, then the value.
 func (b *blockSet) lookup(shard int, key [32]byte) (value []byte, found bool, err error) {
-	if !b.bloom.Test(key) {
-		return nil, false, nil // Definitely not here: no file needed
+	switch mightBe, err := b.bloomTest(key); {
+	case err != nil:
+		return nil, false, err
+	case !mightBe:
+		return nil, false, nil // Definitely not here
 	}
 	e := b.dir[shard]
 	if e.count == 0 {

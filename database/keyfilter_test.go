@@ -622,3 +622,93 @@ func TestFilterBlocksIsValidatedAndPersisted(t *testing.T) {
 	require.Equal(t, uint64(MinFilterBlocks+5), reopened.PermKV.FilterBlocks, "the period must survive a reopen")
 	require.NoError(t, reopened.Close())
 }
+
+// TestResidentFiltersFollowTheWindow
+// A segment's bloom is worth memory only while the segment is in the
+// window a protocol read walks.  Holding every filter resident cost
+// 1.5 bytes per key for every key the store had ever held: memory
+// growing with the age of the chain, scanned by every GC, and read in
+// full at open, so opening got slower forever (issue #64).  History is
+// probed on disk instead -- the same bits, K one-byte reads -- so what
+// the store holds follows the working set, not the chain (spec 1.2).
+func TestResidentFiltersFollowTheWindow(t *testing.T) {
+	dir := storeDir(t, "residency")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	kr := NewFastRandom([]byte{179})
+	var keys [][32]byte
+	const blocks = 6 * MinFilterBlocks
+	for b := uint64(1); b <= blocks; b++ {
+		for i := 0; i < 5; i++ {
+			k := kr.NextHash()
+			keys = append(keys, k)
+			require.NoError(t, store.Put(k, []byte{byte(b), byte(i)}))
+		}
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+
+	resident := func(segs []*segment) (n int) {
+		for _, seg := range segs {
+			if seg.bloom != nil {
+				n++
+			}
+		}
+		return n
+	}
+	store.History.RLock()
+	history := append([]*segment(nil), store.history...)
+	store.History.RUnlock()
+	store.Mutex.RLock()
+	active := append([]*segment(nil), store.active...)
+	store.Mutex.RUnlock()
+
+	require.NotEmpty(t, history, "the window must have rolled past something")
+	require.Equal(t, 0, resident(history),
+		"history holds %d resident filters; they belong on disk", resident(history))
+	require.Equal(t, len(active), resident(active),
+		"the window's filters are the ones worth memory")
+
+	// Cold filters still answer, and answer correctly: every key is
+	// found through the history walk, and unwritten keys are not
+	for i, k := range keys {
+		v, err := store.GetDeep(k)
+		require.NoErrorf(t, err, "key %d unreachable with cold filters", i)
+		require.Equal(t, []byte{byte(i/5 + 1), byte(i % 5)}, v)
+	}
+	for i := 0; i < 200; i++ {
+		_, err := store.GetDeep(kr.NextHash())
+		require.ErrorIsf(t, err, errNotFound, "unwritten key %d", i)
+	}
+
+	// A cold probe agrees with the resident one, bit for bit: load a
+	// history segment's filter and compare the two answers
+	seg := history[0]
+	require.Nil(t, seg.bloom)
+	var cold []bool
+	for _, k := range keys {
+		mightBe, err := seg.bloomTest(k)
+		require.NoError(t, err)
+		cold = append(cold, mightBe)
+	}
+	require.NoError(t, seg.loadBloom())
+	require.NotNil(t, seg.bloom, "the filter must be loadable when it is wanted")
+	for i, k := range keys {
+		require.Equalf(t, cold[i], seg.bloom.Test(k), "key %d: cold and resident disagree", i)
+	}
+	seg.freeBloom()
+
+	// And an open reads no filter it does not need
+	require.NoError(t, store.Close())
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	reopened.History.RLock()
+	rh := resident(reopened.history)
+	nh := len(reopened.history)
+	reopened.History.RUnlock()
+	require.Equalf(t, 0, rh, "reopen materialised %d of %d history filters", rh, nh)
+}
