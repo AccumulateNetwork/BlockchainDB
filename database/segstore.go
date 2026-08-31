@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Sealed segments as storage.
@@ -1221,6 +1222,7 @@ func (s *SegmentStore) recoverOrphans(all []*segment) (segs []*segment, adopted 
 		orphan := SegmentMeta{Height: height, Seq: seq}
 		path := filepath.Join(s.Directory, name)
 		if haveSegments && !orphan.after(newest) { // Superseded by a committed compaction
+			auditUnlink(s.Directory, fmt.Sprintf("recoverOrphans-superseded(newest=%d-%d)", newest.Height, newest.Seq), path)
 			os.Remove(path)
 			os.Remove(strings.TrimSuffix(path, segDataSuffix) + segIndexSuffix)
 			continue
@@ -1434,6 +1436,25 @@ func commitJSON(directory, name string, m any) (err error) {
 		return err
 	}
 	return syncDir(directory)
+}
+
+// auditUnlink records every deletion of a segment or set file in an
+// append-only log beside the data, with who deleted it and why.  A
+// diagnostic for issue #61 -- a committed manifest naming a file that
+// does not exist -- where the one fact the failure cannot tell you is
+// which path removed the file.  Appends are O_APPEND writes with no
+// sync: a lost tail costs diagnostic detail, never correctness, and
+// the store never reads the log.
+func auditUnlink(dir, why string, paths ...string) {
+	f, err := os.OpenFile(filepath.Join(dir, "unlink.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	now := time.Now().UTC().Format("15:04:05.000000")
+	for _, p := range paths {
+		fmt.Fprintf(f, "%s %s %s\n", now, why, filepath.Base(p))
+	}
 }
 
 // errStoreClosed is returned by every operation that would read or
@@ -1826,6 +1847,7 @@ func (s *SegmentStore) retire(path string) {
 		s.pendingDelete = append(s.pendingDelete, path)
 		return
 	}
+	auditUnlink(s.Directory, "retire", path)
 	os.Remove(path)
 }
 
@@ -1850,6 +1872,7 @@ func (s *SegmentStore) unpin() {
 		return
 	}
 	for _, path := range s.pendingDelete {
+		auditUnlink(s.Directory, "pendingDelete", path)
 		os.Remove(path)
 	}
 	s.pendingDelete = nil
