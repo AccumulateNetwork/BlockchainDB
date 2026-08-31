@@ -203,6 +203,9 @@ func (s *SegmentStore) SetFilterBlocks(n uint64) (err error) {
 	}
 	if back < len(s.history) {
 		pulled := s.history[back:]
+		for _, seg := range pulled { // Back inside the window (issue #64)
+			_ = seg.loadBloom()
+		}
 		s.active = append(append([]*segment(nil), pulled...), s.active...)
 		s.history = append([]*segment(nil), s.history[:back]...)
 		if back > 0 {

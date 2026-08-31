@@ -335,9 +335,14 @@ run is still in place and discards its output if not.
   then drops them from the shards, 16 at a time so the barriers
   overlap.  This is 1.4's "merge once, then permanent" done right.
   #47 tracks the daily cadence and levelled runs.
-- **DEVIATION #64**: every segment's and set's bloom is loaded
-  resident at open, so filter memory and open time grow with age; the
-  spec keeps cold filters on disk.
+- **Filter residency** — a segment's bloom is held in memory only
+  while the segment is in the active tier; a history segment's and
+  every block set's filter stays on disk and is probed there
+  (`segment.bloomTest`, `blockSet.bloomTest`): K one-byte reads from a
+  file the pool already holds open, which the page cache keeps hot.
+  Resident filter memory therefore follows the window, not the chain,
+  and an open reads one index header per segment rather than every
+  filter the store ever wrote (#64).
 
 ### 2.8 Crash recovery (1.8)
 
@@ -367,7 +372,6 @@ The current gaps between Section 1 and the code, in one place:
 
 | Issue | Invariant | Gap |
 |---|---|---|
-| #64 | 1.2 memory / 1.4 cold filters | All blooms resident; open scans every filter |
 | #65 | 1.5 dyna converges | Budget-frozen segments never merge; frozen garbage is permanent |
 | #66 | 1.6 lock rules | `KV2.Put` holds the store-wide lock across cross-layer reads |
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |

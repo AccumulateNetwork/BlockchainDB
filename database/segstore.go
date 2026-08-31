@@ -223,9 +223,87 @@ type segment struct {
 	meta      SegmentMeta
 	dataPath  string
 	indexPath string
-	count     int64  // Indexed keys
-	records   int64  // Physical records in the data file; > count if any key repeats
-	bloom     *Bloom // Membership filter over this segment's keys
+	count     int64 // Indexed keys
+	records   int64 // Physical records in the data file; > count if any key repeats
+
+	// bloom is the segment's membership filter, held in memory only
+	// while the segment is worth the memory -- the active tier, the
+	// window a commit writes and a protocol read walks.  A history
+	// segment's filter is COLD: it stays on disk and is probed there
+	// (bloomTest).  Holding every filter resident cost 1.5 bytes per
+	// key for every key the store had ever held -- growing without
+	// limit, scanned by every GC, and read in full at open, so opening
+	// took longer the older the store was (issue #64).  What the bloom
+	// bits cost cold is what Test reads: K bytes, at K offsets, from a
+	// file the pool already holds open and the page cache keeps hot.
+	bloom *Bloom
+
+	// Where the bloom lives in the index file, so a cold filter can be
+	// probed without materialising it.  Set for every segment.
+	bloomOff   int64
+	bloomBytes uint64
+	bloomK     int
+}
+
+// loadBloom brings the segment's filter into memory, if it has one and
+// it is not there already
+func (s *segment) loadBloom() (err error) {
+	if s.bloom != nil || s.bloomBytes == 0 {
+		return nil
+	}
+	index, release, err := s.index()
+	if err != nil {
+		return err
+	}
+	defer release()
+	bitmap := make([]byte, s.bloomBytes)
+	if _, err = index.ReadAt(bitmap, s.bloomOff); err != nil {
+		return err
+	}
+	s.bloom = &Bloom{
+		SizeOfMap: float64(s.bloomBytes) / (1024 * 1024),
+		NumBytes:  s.bloomBytes,
+		Map:       bitmap,
+		K:         s.bloomK,
+		Capacity:  s.bloomBytes * 8 / BloomBitsPerKey,
+		Count:     uint64(s.count),
+	}
+	return nil
+}
+
+// freeBloom drops the resident filter; the segment goes on answering
+// from the one on disk
+func (s *segment) freeBloom() { s.bloom = nil }
+
+// bloomTest asks the segment's filter whether the key might be here.
+// Resident: a memory probe.  Cold: one byte read per hash function,
+// from the index file -- the same bits, at the same offsets, without
+// holding the map.  An unreadable filter reads as "might", which costs
+// a lookup and never a wrong answer.
+func (s *segment) bloomTest(key [32]byte) (mightBe bool, err error) {
+	if s.bloom != nil {
+		return s.bloom.Test(key), nil
+	}
+	if s.bloomBytes == 0 || s.bloomK < 1 {
+		return true, nil // No filter: everything might be here
+	}
+	index, release, err := s.index()
+	if err != nil {
+		return true, err
+	}
+	defer release()
+	probe := Bloom{NumBytes: s.bloomBytes, K: s.bloomK}
+	var b [1]byte
+	for i := 0; i < s.bloomK; i++ {
+		idx, mask := probe.ByteMask(key, i)
+		if _, err = index.ReadAt(b[:], s.bloomOff+int64(idx)); err != nil {
+			return true, err
+		}
+		if b[0]&mask == 0 {
+			return false, nil // Definitely not in this segment
+		}
+	}
+	return true, nil
 }
 
 // close
@@ -254,8 +332,11 @@ func (s *segment) index() (f *os.File, release func(), err error) {
 // Find a key in this segment.  Returns where its value lives in the
 // segment's data file.
 func (s *segment) lookup(key [32]byte) (dbb *DBBKey, found bool, err error) {
-	if s.bloom != nil && !s.bloom.Test(key) {
-		return nil, false, nil // Definitely not in this segment: no file needed
+	switch mightBe, err := s.bloomTest(key); {
+	case err != nil:
+		return nil, false, err
+	case !mightBe:
+		return nil, false, nil // Definitely not in this segment
 	}
 	// One borrow for the whole binary search rather than one per probe
 	index, release, err := s.index()
@@ -840,9 +921,14 @@ func (s *SegmentStore) load() (err error) {
 	for _, seg := range all {
 		if seg.meta.first() < start {
 			s.history = append(s.history, seg)
-		} else {
-			s.active = append(s.active, seg)
+			continue
 		}
+		s.active = append(s.active, seg)
+		// The window's filters are worth memory; history's are read
+		// from disk (issue #64).  A filter that will not load is left
+		// cold rather than failing the open: cold is correct, just
+		// slower, and it is one pread per probe.
+		_ = seg.loadBloom()
 	}
 	if n := len(s.history); n > 0 {
 		s.historyNewest, s.historyAny = s.history[n-1].meta, true
@@ -945,6 +1031,11 @@ func (s *SegmentStore) handoffBelowWindow() {
 	s.handoffMu.Lock()
 	for _, seg := range moved {
 		s.handoffs = append(s.handoffs, handoff{seg: seg})
+		// Out of the window, out of memory: history is probed on disk,
+		// so the filters the store holds cover the window and no more
+		// (issue #64).  This is the one place a segment leaves the
+		// active tier while the store runs.
+		seg.freeBloom()
 	}
 	s.handoffMu.Unlock()
 	s.History.Unlock()
@@ -1094,23 +1185,14 @@ func (s *SegmentStore) openSegmentAt(meta SegmentMeta, dataPath, indexPath strin
 		return nil, err
 	}
 	seg.count = int64(binary.BigEndian.Uint64(header[8:]))
-	bloomBytes := binary.BigEndian.Uint64(header[16:])
-	bloomK := int(binary.BigEndian.Uint32(header[24:]))
-	if bloomBytes > 0 {
-		bitmap := make([]byte, bloomBytes)
-		if _, err = index.ReadAt(bitmap, segIndexHdrSize+seg.count*DBKeyFullSize); err != nil {
-			seg.close()
-			return nil, err
-		}
-		seg.bloom = &Bloom{
-			SizeOfMap: float64(bloomBytes) / (1024 * 1024),
-			NumBytes:  bloomBytes,
-			Map:       bitmap,
-			K:         bloomK,
-			Capacity:  bloomBytes * 8 / BloomBitsPerKey,
-			Count:     uint64(seg.count),
-		}
-	}
+	seg.bloomBytes = binary.BigEndian.Uint64(header[16:])
+	seg.bloomK = int(binary.BigEndian.Uint32(header[24:]))
+	seg.bloomOff = segIndexHdrSize + seg.count*DBKeyFullSize
+	// The filter is left on disk.  Whoever places the segment in a tier
+	// loads it if the segment is worth the memory -- the active tier --
+	// and a history segment is probed cold (issue #64).  Opening a
+	// store therefore reads one header per segment rather than every
+	// filter it ever wrote.
 	return seg, nil
 }
 
@@ -2206,6 +2288,7 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		return meta, err
 	}
 	s.active = append(s.active, seg)
+	_ = seg.loadBloom() // Active: worth the memory (issue #64)
 	// The tail's keys are in every live filter already, and the segment
 	// they now sit in is inside the window by construction, so the
 	// filters cover it; advancing the block is what may roll them, and
@@ -3217,6 +3300,7 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 		return s.writeManifest() // Commit
 	}
 	s.active = append(s.active, seg)
+	_ = seg.loadBloom() // Active: worth the memory (issue #64)
 	// Into every live filter, whether or not the segment's block is in
 	// its range: a filter holding a key it need not is slower, never
 	// wrong, and the segment is the newest thing in the store
