@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -301,6 +302,45 @@ func TestCompactionRefusesATakenIdentity(t *testing.T) {
 		require.Equal(t, val(i), v)
 	}
 	require.NoError(t, re.Close())
+}
+
+// TestSealRemintsATakenIdentity
+// The seal is not the only identity minter: a suffix compaction names
+// its output (historyNewest.Seq+1), and when the active tier is empty
+// that is exactly what nextKeyAt mints for the next seal.  The
+// exclusive link turned that race from a silent overwrite (issue #61)
+// into ErrExist; the seal must then take the next free sequence, not
+// fail the Put that tipped it -- and never touch the squatter.
+func TestSealRemintsATakenIdentity(t *testing.T) {
+	dir := storeDir(t, "remint")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+
+	kr := NewFastRandom([]byte{215})
+	k1 := kr.NextHash()
+	require.NoError(t, store.Put(k1, []byte{1}))
+	m0, err := store.SealNext()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), m0.Seq)
+
+	// A concurrent maintenance output claims the name the next seal
+	// would mint
+	taken := filepath.Join(dir, segmentFileName(0, 1))
+	require.NoError(t, os.WriteFile(taken, []byte("someone else's segment"), 0o644))
+
+	k2 := kr.NextHash()
+	require.NoError(t, store.Put(k2, []byte{2}))
+	m1, err := store.SealNext()
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), m1.Seq, "the taken sequence must be skipped, not replaced")
+
+	v, err := store.Get(k2)
+	require.NoError(t, err)
+	require.Equal(t, []byte{2}, v)
+	data, err := os.ReadFile(taken)
+	require.NoError(t, err)
+	require.Equal(t, []byte("someone else's segment"), data, "the squatter must be untouched")
 }
 
 func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {

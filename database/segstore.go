@@ -2133,9 +2133,6 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 		return meta, nil
 	}
 
-	dataName := segmentFileName(height, seq)
-	dataPath := filepath.Join(s.Directory, dataName)
-
 	// The live file is promoted as it stands -- an fsync and a rename,
 	// never a rewrite.  A mutable tail holds shadowed records
 	// (overwrites), and sealing used to rewrite it to drop them: one
@@ -2154,10 +2151,12 @@ func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta
 	// part of the active tier.  (An immutable tail never shadows -- a
 	// duplicate put is refused or a no-op -- so the Perm layer loses
 	// nothing it ever had.)
-	sl, err := s.promoteLiveFile(dataPath)
+	sl, seq, err := s.promoteLiveFile(height, seq)
 	if err != nil {
 		return meta, err
 	}
+	dataName := segmentFileName(height, seq)
+	dataPath := filepath.Join(s.Directory, dataName)
 
 	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
 	if err = writeIndexFile(indexPath, sl.order, sl.entries); err != nil {
@@ -2237,38 +2236,57 @@ type sealed struct {
 }
 
 // promoteLiveFile
-// Finish the live file's header, make it durable, and rename it into
-// place as a sealed segment.  No record is copied.
-func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
+// Finish the live file's header, make it durable, and link it into
+// place as the sealed segment (height, seq) -- or the next free
+// sequence above it.  No record is copied.
+//
+// The seal is not the only identity minter: a compaction of history's
+// newest suffix names its output (historyNewest.Seq+1), and when the
+// active tier is empty that is exactly what nextKeyAt mints for the
+// seal.  The two race; the exclusive link turns what used to be a
+// silent overwrite (issue #61) into ErrExist here, and the seal takes
+// the sequence after -- correctly ordered, because the seal holds the
+// Mutex and anything that claimed the name is maintenance output at or
+// below it.  The caller must use the returned seq.
+func (s *SegmentStore) promoteLiveFile(height, seq uint64) (sl sealed, seqOut uint64, err error) {
 	count := s.liveRecords
 	if err = s.liveFile.Flush(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	var header [segDataHdrSize]byte
 	binary.BigEndian.PutUint32(header[:], segmentMagic)
 	binary.BigEndian.PutUint32(header[4:], segmentVersion)
 	binary.BigEndian.PutUint64(header[16:], count)
 	if err = s.liveFile.WriteAt(0, header[:]); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	if err = s.liveFile.File.Sync(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	livePath := s.liveFile.Filename
 	if err = s.liveFile.File.Close(); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	s.liveFile.File = nil
-	// Link, not rename: a rename would silently replace an existing
-	// segment file if this seal's (height, seq) were ever minted twice,
-	// turning an identity bug into data loss.  The link fails with
-	// ErrExist instead, the live file is untouched, and the seal fails
-	// loudly (issue #61).
-	if err = os.Link(livePath, dataPath); err != nil {
-		return sl, err
+	// Link, not rename: a rename would silently replace the file of a
+	// segment minted the same identity, turning the race above into
+	// data loss.  A taken name is skipped, audibly, and the squatter is
+	// never touched (issue #61).
+	var dataPath string
+	for {
+		dataPath = filepath.Join(s.Directory, segmentFileName(height, seq))
+		err = os.Link(livePath, dataPath)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return sl, seq, err
+		}
+		auditUnlink(s.Directory, fmt.Sprintf("seal-remint: %s is taken", segmentFileName(height, seq)))
+		seq++
 	}
 	if err = os.Remove(livePath); err != nil {
-		return sl, err
+		return sl, seq, err
 	}
 	// No directory fsync here: the manifest commit that ends this
 	// operation fsyncs the same directory, and that one barrier makes
@@ -2283,10 +2301,10 @@ func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
 	}
 	if !s.Mutable { // Immutable segments are transported; a peer verifies this
 		if sl.hash, _, err = hashAndCount(dataPath); err != nil {
-			return sl, err
+			return sl, seq, err
 		}
 	}
-	return sl, nil
+	return sl, seq, nil
 }
 
 // DefaultCompactRatio
