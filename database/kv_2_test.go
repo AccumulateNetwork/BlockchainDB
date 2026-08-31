@@ -307,11 +307,13 @@ func TestPutReportsDynamicWriteCount(t *testing.T) {
 		_, err = kv.Put(permKeys[i], []byte("p"))
 		require.NoError(t, err)
 	}
-	require.Greater(t, kv.PWrites, kv.DWrites, "the two counts must differ for this to test anything")
+	dyna, perm := kv.Writes()
+	require.Greater(t, perm, dyna, "the two counts must differ for this to test anything")
 
 	// The replay: same key, same value, already permanent
 	writes, err := kv.Put(permKeys[0], []byte("p"))
 	require.NoError(t, err)
-	assert.Equal(t, kv.DWrites, writes,
+	dyna, _ = kv.Writes()
+	assert.Equal(t, dyna, writes,
 		"an identical permanent rewrite must report the dynamic write count, like every other path")
 }

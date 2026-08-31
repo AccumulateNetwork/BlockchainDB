@@ -3314,9 +3314,22 @@ func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err err
 	// Accepted.  Publish the names, and point the segment at them; its
 	// contents and index are unchanged, so nothing needs re-reading.
 	seg.close() // Release the pool's handles on the temporary names
-	if err = os.Rename(tmpData, dataPath); err != nil {
+	// Claim the name, never replace it (spec 1.7).  The checks above
+	// consult the segments the manifests NAME, and a complete file can
+	// sit at this identity without being named -- an earlier seal or
+	// import that reached disk and not its commit.  A rename would
+	// silently replace that committed-by-construction file; the
+	// exclusive claim refuses, and the import fails with a name a
+	// human can act on rather than losing data quietly (issue #67).
+	if err = claimSegmentName(tmpData, dataPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("import of (block %d, seq %d): %s already exists; "+
+				"the store holds a file at that identity", meta.Height, meta.Seq, dataName)
+		}
 		return err
 	}
+	// The data file's name is the identity; its index follows it, and
+	// is derived data a reader rebuilds if it is missing
 	if err = os.Rename(tmpIndex, indexPath); err != nil {
 		return err
 	}

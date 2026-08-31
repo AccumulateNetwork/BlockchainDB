@@ -59,9 +59,12 @@ type KV2 struct {
 	Directory string        // Directory where the PermKV and DynaKV directories are
 	PermKV    *SegmentStore // The Perm layer: sealed, immutable segments
 	DynaKV    *SegmentStore // The Dyna layer: sealed, mutable segments
-	DWrites   int           // Number of writes to the DynaKV since the last compress
-	PWrites   int           // Number of writes to the PermKV since the last compress
-	SealLimit int           // Seal a layer when its live tail reaches this many records
+	// dWrites and pWrites count writes to each layer since the last
+	// Compress.  Atomic, because the writes that bump them run
+	// concurrently: KV2.Put takes the lock SHARED (see Put).
+	dWrites   atomic.Int64
+	pWrites   atomic.Int64
+	SealLimit int // Seal a layer when its live tail reaches this many records
 
 	// opened says both layers are open and SealLimit is set, so that
 	// Open -- which every operation calls first -- can say so without
@@ -120,6 +123,14 @@ func NewKV2(directory string, sealLimit uint64) (kv2 *KV2, err error) {
 		return nil, err
 	}
 	return kv2, nil
+}
+
+// Writes
+// How many writes each layer has taken since the last Compress.  The
+// dynamic count is what a caller uses to decide when to compact; only
+// that layer has anything to reclaim.
+func (k *KV2) Writes() (dyna, perm int) {
+	return int(k.dWrites.Load()), int(k.pWrites.Load())
 }
 
 // SetFilterBlocks
@@ -269,25 +280,25 @@ func (k *KV2) GetDeep(key [32]byte) (value []byte, err error) {
 // PutDyna
 // Use when the k/v is known to be a dynamic k/v
 func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-	k.DWrites++
+	k.Mutex.RLock() // Shared: see Put (issue #66)
+	defer k.Mutex.RUnlock()
+	k.dWrites.Add(1)
 	if err = k.DynaKV.Put(key, value); err != nil {
-		return k.DWrites, err
+		return int(k.dWrites.Load()), err
 	}
-	return k.DWrites, k.sealDynaIfFull()
+	return int(k.dWrites.Load()), k.sealDynaIfFull()
 }
 
 // PutPerm
 // Use when the k/v is known to be a permanent (immutable) k/v
 func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-	k.PWrites++
+	k.Mutex.RLock() // Shared: see Put (issue #66)
+	defer k.Mutex.RUnlock()
+	k.pWrites.Add(1)
 	if err = k.PermKV.Put(key, value); err != nil {
-		return k.DWrites, err
+		return int(k.dWrites.Load()), err
 	}
-	return k.DWrites, k.sealPermIfFull()
+	return int(k.dWrites.Load()), k.sealPermIfFull()
 }
 
 // sealPermIfFull
@@ -376,18 +387,34 @@ func (k *KV2) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err erro
 // Put
 // Returns the number of writes since the last compress, and an err if the put failed
 func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
-	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
+	// SHARED, not exclusive.  This lock is here to exclude the
+	// operations that need both layers to hold still -- Seal, Close,
+	// SetFilterBlocks -- and nothing else: each layer synchronises its
+	// own tail, and each resolves its own history under its own lock,
+	// dropping the protocol lock to do it (SegmentStore.
+	// putUnlessPresent).  Holding this one EXCLUSIVELY meant a single
+	// put that had to consult history stopped every other put, get and
+	// seal on the shard for the length of that walk -- the head-of-line
+	// blocking the layer below was built to avoid (issue #66).
+	//
+	// What the exclusion bought was not needed either.  Two puts of one
+	// key race to the same place: whichever reaches the Perm layer
+	// first writes it, the other is told the key is present and either
+	// finds the value identical (a no-op) or moves the key to Dyna,
+	// where the newest record wins -- the rule every read already
+	// follows.  The counters are atomic for the same reason.
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
 
 	if value2, err2 := k.DynaKV.Get(key); err2 == nil { // Check.  Is this a DynaKV key?
 		if bytes.Equal(value, value2) { // If the key is in DynaKV, it stays there.
-			return k.DWrites, nil //       If the value is not changed, do nothing
+			return int(k.dWrites.Load()), nil //       If the value is not changed, do nothing
 		}
-		k.DWrites++
+		k.dWrites.Add(1)
 		if err = k.DynaKV.Put(key, value); err != nil { // If the value DID change, update
-			return k.DWrites, err
+			return int(k.dWrites.Load()), err
 		}
-		return k.DWrites, k.sealDynaIfFull()
+		return int(k.dWrites.Load()), k.sealDynaIfFull()
 	}
 	// One lookup settles all three Perm cases: absent (in which case the
 	// write has already happened), present and identical (nothing to
@@ -397,11 +424,11 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	// miss by definition -- pay for the answer twice.
 	existing, existed, err := k.PermKV.PutIfAbsent(key, value)
 	if err != nil {
-		return k.DWrites, err
+		return int(k.dWrites.Load()), err
 	}
 	if !existed { // It is a new permanent key, and it is now written
-		k.PWrites++
-		return k.DWrites, k.sealPermIfFull() // PermKV is never compacted; report DWrites
+		k.pWrites.Add(1)
+		return int(k.dWrites.Load()), k.sealPermIfFull() // PermKV is never compacted; report DWrites
 	}
 	if bytes.Equal(existing, value) { // If no change, ignore;
 		// DWrites, like every other path here: the count the caller
@@ -410,13 +437,13 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		// permanent key rewritten with the value it already has, which
 		// is what a replay looks like -- used to report the permanent
 		// count instead, a larger and unrelated number (issue #39).
-		return k.DWrites, nil
+		return int(k.dWrites.Load()), nil
 	}
-	k.DWrites++
+	k.dWrites.Add(1)
 	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
-		return k.DWrites, err
+		return int(k.dWrites.Load()), err
 	}
-	return k.DWrites, k.sealDynaIfFull()
+	return int(k.dWrites.Load()), k.sealDynaIfFull()
 }
 
 // Compress
@@ -457,8 +484,8 @@ func (k *KV2) Compress() error {
 		return err
 	}
 	k.Mutex.Lock()
-	k.DWrites = 0 // Clear write counts
-	k.PWrites = 0
+	k.dWrites.Store(0) // Clear write counts
+	k.pWrites.Store(0)
 	k.Mutex.Unlock()
 	return nil
 }

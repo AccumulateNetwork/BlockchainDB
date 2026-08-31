@@ -253,9 +253,14 @@ Segment files: `seg-<height>-<seq>.dat` (records: 40-byte header —
   one pass so `KV2.Put` pays one lookup, not two.
 - Costs are counted (`StoreStats`): what the filter settled vs sent
   walking, hits, misleads — the latency rule is measured, not assumed.
-- **DEVIATION #66**: `KV2.Put` holds the KV2-wide mutex across its
-  cross-layer lookups, re-introducing head-of-line blocking the layer
-  below was built to avoid.
+- `KV2.Put` takes the KV2 lock SHARED: it excludes only what needs
+  both layers to hold still (Seal, Close, SetFilterBlocks), and each
+  layer synchronises its own tail and resolves its own history under
+  its own lock.  Two puts of one key race to the same place -- one
+  writes it, the other finds it present and either no-ops or moves it
+  to Dyna, where the newest record wins -- so nothing needed the
+  exclusion, and one put's history walk no longer stops the shard
+  (#66).
 
 ### 2.3 Seal (1.7, 1.8)
 
@@ -376,13 +381,11 @@ The current gaps between Section 1 and the code, in one place:
 
 | Issue | Invariant | Gap |
 |---|---|---|
-| #66 | 1.6 lock rules | `KV2.Put` holds the store-wide lock across cross-layer reads |
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
 | #47 | 1.4 pack cadence | Daily cross-shard tier not yet scheduled |
 | #52 | 1.8 recovery | recoverOrphans can adopt a duplicate of named data |
 | #54 | 1.3 filter sizing | Filters sized from all-time max, not recent demand |
-| #67 | 1.7 exclusive publish | ImportSegmentFile publishes by rename, not by claim |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.
