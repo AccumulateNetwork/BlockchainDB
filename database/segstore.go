@@ -2470,6 +2470,19 @@ var CompactRatio = DefaultCompactRatio
 // moment it froze.
 var CompactPassRecords uint64 = 4 << 20
 
+// CompactDeepPassRecords bounds the rarer pass that folds two
+// segments the ordinary budget has frozen (compactionRun).  It runs
+// only when the ordinary pass has nothing to do, folds one pair, and
+// halves the frozen count each time, so the dynamic layer converges to
+// the size of its live key set instead of growing forever with the
+// garbage inside frozen segments (issue #65).
+//
+// 32Mi records is eight ordinary passes: a few seconds of streaming
+// merge, off the protocol path, at a moment when nothing cheaper is
+// worth doing.  The dynamic layer is meant to be small (spec 1.5), so
+// this is a ceiling that a healthy store never reaches.
+var CompactDeepPassRecords uint64 = 8 * CompactPassRecords
+
 // compactionRun
 // The run of history worth compacting into one segment, and where it
 // sits.  First choice: the newest suffix, taking each older segment in
@@ -2482,11 +2495,38 @@ var CompactPassRecords uint64 = 4 << 20
 // shorter than two is nothing to do.  Sized by physical record count,
 // which every segment holds in memory, so choosing costs no I/O.
 func compactionRun(history []*segment, ratio float64) (run []*segment, at int) {
+	// The ordinary pass, bounded so a compaction never stalls the
+	// maintenance behind it
+	if run, at = compactionRunWithin(history, ratio, CompactPassRecords); run != nil {
+		return run, at
+	}
+	// Nothing fits that budget.  A segment that grows past it is
+	// otherwise frozen for good: the suffix rule stops at it, and no
+	// pair containing it can fit, so every key in it that is later
+	// overwritten becomes garbage no pass will ever reclaim -- the
+	// dynamic layer's disk grows without limit under exactly the
+	// workload it is designed for, a bounded key set rewritten forever
+	// (issue #65).  So when the cheap pass has nothing to do, one
+	// deeper fold is allowed, on a budget of its own.
+	//
+	// This cannot run away.  It fires only when the ordinary pass is
+	// idle; it folds one pair; the pair must still be worth folding by
+	// the same ratio; and each fold leaves one segment where there
+	// were two, so the frozen segments halve with each one until a
+	// single segment stands and there is nothing left to pair.  The
+	// price is that a rare pass costs up to CompactDeepPassRecords
+	// instead of CompactPassRecords -- bounded latency, still, just a
+	// larger bound, and paid only when the alternative is unbounded
+	// disk.
+	return compactionRunWithin(history, ratio, CompactDeepPassRecords)
+}
+
+// compactionRunWithin is compactionRun under one record budget
+func compactionRunWithin(history []*segment, ratio float64, budget uint64) (run []*segment, at int) {
 	n := len(history)
 	if n == 0 {
 		return nil, 0
 	}
-	budget := CompactPassRecords
 	var behind uint64
 	i := n - 1
 	for ; i >= 0; i-- {
