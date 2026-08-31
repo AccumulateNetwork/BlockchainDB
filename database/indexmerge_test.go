@@ -113,7 +113,7 @@ func TestCompactionMemoryIsBoundedByInputs(t *testing.T) {
 
 	// And it merged correctly: every recently written key still reads
 	for i, k := range recent {
-		_, err := kv.GetDyna(k)
+		_, err := kv.GetDeep(k)
 		require.NoErrorf(t, err, "key %d lost by the compaction", i)
 	}
 }
@@ -289,7 +289,7 @@ func TestCompactionRefusesATakenIdentity(t *testing.T) {
 	// Every key still reads, including the 900 whose file the collision
 	// used to destroy, and the store reopens clean
 	for i, k := range keys {
-		v, err := store.Get(k)
+		v, err := store.GetDeep(k)
 		require.NoErrorf(t, err, "key %d lost", i)
 		require.Equal(t, val(i), v)
 	}
@@ -297,11 +297,52 @@ func TestCompactionRefusesATakenIdentity(t *testing.T) {
 	re, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
 	for i, k := range keys {
-		v, err := re.Get(k)
+		v, err := re.GetDeep(k)
 		require.NoErrorf(t, err, "key %d lost across reopen", i)
 		require.Equal(t, val(i), v)
 	}
 	require.NoError(t, re.Close())
+}
+
+// TestReadsStopAtTheWindow
+// The window is the whole of the protocol's horizon (spec 1.3): a key
+// the filters deny is absent, and Get must not probe history for it --
+// per-segment probing on every miss measured 23% of a validator's CPU
+// and grew with the history segment count.  Reading below the window
+// is GetDeep, explicitly.
+func TestReadsStopAtTheWindow(t *testing.T) {
+	dir := storeDir(t, "windowread")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	kr := NewFastRandom([]byte{216})
+	old := kr.NextHash()
+	require.NoError(t, store.Put(old, []byte{1}))
+	_, err = store.Seal(1)
+	require.NoError(t, err)
+
+	// Roll far past the window: `old` leaves the filters' horizon
+	for b := uint64(2); b <= 3*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	recent := kr.NextHash()
+	require.NoError(t, store.Put(recent, []byte{2}))
+
+	// Inside the window: found, either way
+	v, err := store.Get(recent)
+	require.NoError(t, err)
+	require.Equal(t, []byte{2}, v)
+
+	// Outside the window: the protocol read answers absent without a
+	// walk; the deep read still finds it
+	_, err = store.Get(old)
+	require.ErrorIs(t, err, errNotFound, "outside 2N the protocol assumes absent")
+	v, err = store.GetDeep(old)
+	require.NoError(t, err, "GetDeep is the explicit path below the window")
+	require.Equal(t, []byte{1}, v)
 }
 
 // TestSealRemintsATakenIdentity
@@ -389,7 +430,7 @@ func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {
 	require.False(t, compacted)
 
 	for i, k := range keys {
-		v, err := store.Get(k)
+		v, err := store.GetDeep(k)
 		require.NoErrorf(t, err, "key %d lost", i)
 		require.Equal(t, val(i), v, "key %d value", i)
 	}
@@ -398,7 +439,7 @@ func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {
 	re, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
 	for i, k := range keys {
-		v, err := re.Get(k)
+		v, err := re.GetDeep(k)
 		require.NoErrorf(t, err, "key %d lost across reopen", i)
 		require.Equal(t, val(i), v)
 	}
@@ -468,7 +509,7 @@ func TestSealPromotesAShadowedTail(t *testing.T) {
 	segs = store.sealedSegments()
 	require.Equal(t, segs[0].count, segs[0].records, "compaction dropped the shadowed copies")
 	for i, k := range keys {
-		v, err := store.Get(k)
+		v, err := store.GetDeep(k)
 		require.NoErrorf(t, err, "key %d after compaction", i)
 		require.Equal(t, []byte{3, byte(i), byte(i >> 8)}, v)
 	}

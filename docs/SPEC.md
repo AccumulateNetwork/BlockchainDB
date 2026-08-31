@@ -87,6 +87,14 @@ window (MinFilterBlocks).
   the hash of its value, so "same key, different value" beyond the
   window would be a hash collision.  This is what makes a permanent
   write O(1) forever (#44).
+- **Reads are windowed too.**  The window is the whole of the
+  protocol's horizon: a key the filters deny is absent, and the
+  protocol path does not search deep history — outside the last N to
+  2N blocks, we assume it isn't there.  Reaching below the window is
+  an explicit, separate operation (1.4) for export and query APIs,
+  never the consensus path.  Per-segment history probing on every
+  miss is the decay curve this rule forbids: measured at 23% of a
+  validator's CPU at block ~245 and growing with the segment count.
 
 ### 1.4 The permanent layer
 
@@ -100,11 +108,13 @@ window (MinFilterBlocks).
   never re-merged, never rewritten, never moved.  Merge cost is
   therefore O(window) per window, and lifetime merge cost is linear in
   the data — never quadratic (#63).
-- **Deep reads walk merged blocks newest-first**, one filter probe per
-  block, binary-searching only a block whose filter claims the key.
-  Old blocks are read rarely (1.1); their filters may live on disk and
-  be probed there — resident filter memory follows the working set,
-  not the chain (#64).
+- **Deep reads are explicit** (`GetDeep`): they walk merged blocks
+  newest-first, one filter probe per block, binary-searching only a
+  block whose filter claims the key.  The protocol path never takes
+  this walk (1.3); it belongs to export and query APIs.  Old blocks
+  are read rarely (1.1); their filters may live on disk and be probed
+  there — resident filter memory follows the working set, not the
+  chain (#64).
 - **Cross-shard consolidation is a rarer, second pass**: per-shard
   merges fold into one set file per period (targeting daily), with one
   filter over the set.  Searching years back skips whole days by their

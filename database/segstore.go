@@ -1541,6 +1541,35 @@ func (s *SegmentStore) Get(key [32]byte) (value []byte, err error) {
 	if err != nil || found {
 		return value, err
 	}
+	// The window is the whole of the protocol's horizon: a key the
+	// filters deny is ABSENT, and history is not consulted (spec 1.3).
+	// Probing history cost one resident bloom test per history segment
+	// on every miss -- measured at 23% of a validator's CPU (11% in
+	// Bloom.Test alone) at block ~245, and growing with the segment
+	// count, which is the curve issues #9, #30 and #50 each moved
+	// somewhere else.  inWindow is false only when filters exist and
+	// answered; a store without filters still walks, which is correct
+	// and bounded by the rebuild rule (keyfilter.go).  Reads below the
+	// window are explicit: GetDeep.
+	if !inWindow {
+		return nil, errNotFound
+	}
+	return s.lookupHistory(key, inWindow)
+}
+
+// GetDeep
+// Find a key wherever it is, the history below the window and the
+// packed sets included.  This is the explicit deep read -- export, a
+// query API reaching into old blocks, a test proving durability across
+// a merge -- and it is not the protocol path: the protocol's horizon
+// is the window, and Get answers from it alone (spec 1.3, 1.4).
+func (s *SegmentStore) GetDeep(key [32]byte) (value []byte, err error) {
+	s.Mutex.RLock()
+	value, inWindow, found, err := s.lookupActive(key)
+	s.Mutex.RUnlock()
+	if err != nil || found {
+		return value, err
+	}
 	return s.lookupHistory(key, inWindow)
 }
 

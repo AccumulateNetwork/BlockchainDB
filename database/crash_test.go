@@ -269,7 +269,7 @@ func runCrashRounds(t *testing.T, mode string) {
 		for i := 0; i < durable; i++ {
 			key := kr.NextHash()
 			value := vr.RandBuff(10, 50)
-			got, err := kv.Get(key)
+			got, err := kv.GetDeep(key)
 			if err != nil {
 				t.Fatalf("round %d: durable key %d lost (durable=%d): %v\n%s",
 					round, i, durable, err, crashDiagnose(kv, dir, i, key))

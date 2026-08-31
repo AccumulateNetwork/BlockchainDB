@@ -46,8 +46,12 @@ import (
 // is a windowed guarantee, a key written in the last N to 2N blocks
 // cannot be overwritten and older history is not consulted, because
 // the check is there for replay safety and a Perm key is the hash of
-// its value (SegmentStore.Put).  A READ goes on below the window
-// and into the packed sets, each of which carries a filter of its own.
+// its value (SegmentStore.Put).  A protocol READ stops at the same
+// line: a key the filters deny is absent, and history is not probed --
+// per-segment probing on every miss measured 23% of a validator's CPU
+// and grew with the history segment count.  Reading below the window
+// is explicit (GetDeep): export and deep query APIs, off the protocol
+// path, where the packed sets' own filters answer.
 //
 // The failure modes are still not symmetric.  A filter claiming a key it
 // does not have costs a walk; a filter DENYING a key that is in a

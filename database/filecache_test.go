@@ -62,7 +62,7 @@ func TestSegmentFDsStayBounded(t *testing.T) {
 	// The bound is worth nothing if the data is not still reachable:
 	// every key lives in a segment whose files the pool has closed
 	for i, key := range keys {
-		v, err := store.Get(key)
+		v, err := store.GetDeep(key)
 		require.NoErrorf(t, err, "key %d unreachable after its segment's files were closed", i)
 		assert.Equal(t, []byte(fmt.Sprintf("value-%d", i)), v)
 	}

@@ -58,7 +58,7 @@ func TestMergeBelowKeepsEveryKeyAndCutsFiles(t *testing.T) {
 
 	// Every key still reads back, from a segment that no longer exists
 	for i, key := range keys {
-		v, err := store.Get(key)
+		v, err := store.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost by the merge", i)
 		assert.Equal(t, values[key], string(v))
 	}
@@ -81,7 +81,7 @@ func TestMergeBelowKeepsEveryKeyAndCutsFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, reopened.sealedSegments(), 2)
 	for i, key := range keys {
-		v, err := reopened.Get(key)
+		v, err := reopened.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost across the reopen", i)
 		assert.Equal(t, values[key], string(v))
 	}
@@ -180,7 +180,7 @@ func TestMergeFinalizedAcrossShards(t *testing.T) {
 	assert.Less(t, after, before, "merging must reduce the segment count (%d -> %d)", before, after)
 
 	for i, key := range keys {
-		v, err := kvs.GetPerm(key)
+		v, err := kvs.GetDeep(key)
 		require.NoErrorf(t, err, "key %d lost by the merge", i)
 		assert.Equal(t, values[key], v)
 	}
@@ -260,7 +260,7 @@ func TestMergeDoesNotDisturbBlockExport(t *testing.T) {
 	}
 	assert.Equal(t, uint64(len(keys)), total, "every record must reach the peer")
 	for i, key := range keys {
-		v, err := nodeB.GetPerm(key)
+		v, err := nodeB.GetDeep(key)
 		require.NoErrorf(t, err, "key %d never reached the peer", i)
 		assert.Equal(t, values[key], v)
 	}
@@ -321,7 +321,7 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 	// The oldest entries have now been through several merges.  Every
 	// entry must still be reachable, and with the right value.
 	for i, e := range all {
-		v, err := store.Get(e.key)
+		v, err := store.GetDeep(e.key)
 		require.NoErrorf(t, err, "entry %d from block %d unreachable after repeated merges", i, e.block)
 		require.Equalf(t, e.value, string(v), "entry %d from block %d has the wrong value", i, e.block)
 	}
@@ -338,7 +338,7 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 	reopened, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
 	for i, e := range all {
-		v, err := reopened.Get(e.key)
+		v, err := reopened.GetDeep(e.key)
 		require.NoErrorf(t, err, "entry %d from block %d lost across the reopen", i, e.block)
 		require.Equal(t, e.value, string(v))
 	}
@@ -400,7 +400,7 @@ func TestRejectedImportIsNotAdoptedAfterACrash(t *testing.T) {
 	assert.Empty(t, reopened.sealedSegments(),
 		"recovery adopted the segment whose import was refused")
 
-	v, err := reopened.Get(key)
+	v, err := reopened.GetDeep(key)
 	require.NoError(t, err)
 	assert.Equal(t, "the local value", string(v),
 		"the local value must stand; the peer's was rejected")
