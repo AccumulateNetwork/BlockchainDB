@@ -305,11 +305,12 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 			_, err = store.Seal(block)
 			require.NoError(t, err)
 		}
-		// Finalise every set but the one just written, so each merge
-		// after the first folds in what the previous merge produced.  A
-		// merge works on history -- what the window, N to 2N blocks, has
-		// rolled past -- so the first set has nothing to merge and every
-		// later one merges the set before the one the window still holds.
+		// Finalise every set but the one just written.  A merge works on
+		// history -- what the window, N to 2N blocks, has rolled past --
+		// so the first set has nothing to merge and every later one
+		// merges the set before the one the window still holds.  Each
+		// merge leaves a merged block behind and never touches it again
+		// (issue #63); TestMergeFoldsEachWindowOnce pins that.
 		watermark := block - uint64(setSize) + 1
 		if watermark > 1 {
 			_, merged, err := store.MergeBelow(watermark)
@@ -345,6 +346,79 @@ func TestRepeatedMergesKeepDeepEntriesReachable(t *testing.T) {
 	t.Logf("%d entries over %d blocks, %d merges, %d segments standing",
 		len(all), block, sets-1, len(reopened.sealedSegments()))
 	require.NoError(t, reopened.Close())
+}
+
+// TestMergeFoldsEachWindowOnce
+// A merged block is finished: merged once, then permanent (spec 1.4).
+// MergeBelow folded the whole prefix below the watermark, and the
+// previous merge's output is in that prefix -- so every pass re-copied
+// the entire permanent layer accumulated so far.  Lifetime IO was
+// O(chain^2) and one pass grew without limit: ~10 GB per pass after
+// four hours at 500 tx/s (issue #63).
+//
+// The proof is in what each pass writes.  With one window's worth of
+// blocks arriving between merges, every merge must fold ONE window --
+// its output holding one window's keys, the merged blocks before it
+// untouched -- rather than one output holding everything ever written.
+func TestMergeFoldsEachWindowOnce(t *testing.T) {
+	dir := storeDir(t, "mergeonce")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	const windows = 5
+	const perBlock = 4
+	kr := NewFastRandom([]byte{177})
+
+	block := uint64(0)
+	var outputs []SegmentMeta
+	for w := 0; w < windows; w++ {
+		for b := 0; b < MinFilterBlocks; b++ {
+			block++
+			for i := 0; i < perBlock; i++ {
+				require.NoError(t, store.Put(kr.NextHash(), []byte{byte(block), byte(i)}))
+			}
+			_, err = store.Seal(block)
+			require.NoError(t, err)
+		}
+		watermark := block - MinFilterBlocks + 1
+		if watermark <= 1 {
+			continue
+		}
+		meta, merged, err := store.MergeBelow(watermark)
+		require.NoErrorf(t, err, "merge %d", w)
+		if !merged {
+			continue
+		}
+		outputs = append(outputs, meta)
+	}
+	require.GreaterOrEqual(t, len(outputs), 3, "several merges must have run")
+
+	// Each pass folds one window, so its output holds about one
+	// window's keys -- never the whole layer.  Before the fix the
+	// counts grew with every pass: 80, 160, 240...
+	windowKeys := uint64(MinFilterBlocks * perBlock)
+	for i, m := range outputs {
+		require.LessOrEqualf(t, m.Count, 2*windowKeys,
+			"merge %d wrote %d keys; one window is ~%d -- it folded the previous output back in",
+			i, m.Count, windowKeys)
+	}
+
+	// And every merged block from an earlier pass is still on disk under
+	// its own name: merged once, then permanent
+	for i, m := range outputs[:len(outputs)-1] {
+		_, err := os.Stat(filepath.Join(dir, m.File))
+		require.NoErrorf(t, err, "merged block %d (%s) was rewritten by a later pass", i, m.File)
+	}
+
+	// History is the merged blocks, oldest first, plus whatever has not
+	// been merged yet -- not one segment holding everything
+	store.History.RLock()
+	n := len(store.history)
+	store.History.RUnlock()
+	require.GreaterOrEqualf(t, n, len(outputs),
+		"each merged window must stand as its own block; history has %d", n)
 }
 
 // TestRejectedImportIsNotAdoptedAfterACrash

@@ -324,9 +324,10 @@ run is still in place and discards its output if not.
   its garbage is never reclaimed.
 - **Perm window merge** — `MergeBelow` → `concatSegments`: byte-
   verbatim body copies, indexes shifted by their body's base, one
-  identity after the run's newest (1.4).  **DEVIATION #63**: the run
-  is currently *everything* below the watermark, so each pass re-folds
-  the previous output — the spec says a finished window merges once.
+  identity after the run's newest (1.4).  The run starts after the
+  merged blocks already standing — a merged block carries `Span > 0`
+  and is merged once, then permanent — so a pass folds the newly
+  finished window and nothing else (#63).
 - **Pack tier** — `KVShard.PackFinalized` + `DropBelow`
   (`kv_shard.go`, `blockset.go`): builds a `.bset` from only the
   segments since the previous set (64 B header, 512-entry directory,
@@ -366,7 +367,6 @@ The current gaps between Section 1 and the code, in one place:
 
 | Issue | Invariant | Gap |
 |---|---|---|
-| #63 | 1.4 merge-once | `MergeBelow` re-folds the previous merge's output |
 | #64 | 1.2 memory / 1.4 cold filters | All blooms resident; open scans every filter |
 | #65 | 1.5 dyna converges | Budget-frozen segments never merge; frozen garbage is permanent |
 | #66 | 1.6 lock rules | `KV2.Put` holds the store-wide lock across cross-layer reads |
