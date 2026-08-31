@@ -380,7 +380,7 @@ type SegmentStore struct {
 	// on a Seal after a 3,579-segment compaction.  unlinking says the
 	// goroutine is running, and unlinkDone is signalled when it stops.
 	unlinkMu    sync.Mutex
-	unlinkQueue []string
+	unlinkQueue []unlinkItem
 	unlinking   bool
 	unlinkDone  *sync.Cond
 
@@ -974,7 +974,7 @@ func (s *SegmentStore) releaseFromHistory(seg *segment) {
 			return
 		}
 	}
-	s.unlinkLater(seg.dataPath, seg.indexPath)
+	s.unlinkLater("release-after-history-commit", seg.dataPath, seg.indexPath)
 }
 
 // addSegmentKeys
@@ -1379,7 +1379,7 @@ func (s *SegmentStore) writeManifest() (err error) {
 	s.handoffs = kept
 	s.retireAfterActiveCommit = s.retireAfterActiveCommit[len(retire):]
 	s.handoffMu.Unlock()
-	s.unlinkLater(retire...)
+	s.unlinkLater("handoff-drop-after-active-commit", retire...)
 	return nil
 }
 
@@ -1791,13 +1791,15 @@ func (s *SegmentStore) LiveRecords() uint64 {
 // no manifest, so nothing depends on when the unlink happens: a crash
 // first leaves orphans that recoverOrphans sweeps on the next open.
 // Close and the tests wait for the queue to drain (awaitUnlinks).
-func (s *SegmentStore) unlinkLater(paths ...string) {
+func (s *SegmentStore) unlinkLater(why string, paths ...string) {
 	if len(paths) == 0 {
 		return
 	}
 	s.unlinkMu.Lock()
 	defer s.unlinkMu.Unlock()
-	s.unlinkQueue = append(s.unlinkQueue, paths...)
+	for _, p := range paths {
+		s.unlinkQueue = append(s.unlinkQueue, unlinkItem{why: why, path: p})
+	}
 	if s.unlinking {
 		return
 	}
@@ -1821,8 +1823,8 @@ func (s *SegmentStore) drainUnlinks() {
 		batch := s.unlinkQueue
 		s.unlinkQueue = nil
 		s.unlinkMu.Unlock()
-		for _, path := range batch {
-			s.retire(path)
+		for _, it := range batch {
+			s.retireWhy(it.why, it.path)
 		}
 	}
 }
@@ -1848,6 +1850,22 @@ func (s *SegmentStore) retire(path string) {
 		return
 	}
 	auditUnlink(s.Directory, "retire", path)
+	os.Remove(path)
+}
+
+// unlinkItem is one queued deletion and the site that queued it, for
+// the issue #61 audit trail
+type unlinkItem struct{ why, path string }
+
+// retireWhy is retire with the enqueuing site recorded
+func (s *SegmentStore) retireWhy(why, path string) {
+	s.retireMu.Lock()
+	defer s.retireMu.Unlock()
+	if s.iterating > 0 {
+		s.pendingDelete = append(s.pendingDelete, path)
+		return
+	}
+	auditUnlink(s.Directory, why, path)
 	os.Remove(path)
 }
 
@@ -2367,7 +2385,7 @@ func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok boo
 	defer s.History.Unlock()
 	discard := func() {
 		out.close()
-		s.unlinkLater(out.dataPath, out.indexPath)
+		s.unlinkLater("discard-uncommitted-output", out.dataPath, out.indexPath)
 	}
 	if err = s.checkOpen(); err != nil {
 		discard()
