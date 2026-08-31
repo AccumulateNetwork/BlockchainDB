@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -711,4 +712,91 @@ func TestResidentFiltersFollowTheWindow(t *testing.T) {
 	nh := len(reopened.history)
 	reopened.History.RUnlock()
 	require.Equalf(t, 0, rh, "reopen materialised %d of %d history filters", rh, nh)
+}
+
+// TestFilterSizingFollowsRecentDemand
+// A filter's size decides both what it costs and what it is worth: too
+// small and it fills past its design point, so every false positive
+// becomes a segment walk that finds nothing; too large and the bits
+// are memory spent on nothing, doubled, because two filters are live
+// at once.  Keys per span are not a constant -- they follow the
+// transaction rate -- so each roll sizes the filter it starts from
+// what spans actually took recently (issue #54).
+func TestFilterSizingFollowsRecentDemand(t *testing.T) {
+	dir := storeDir(t, "demand")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	now := time.Now()
+	store.Mutex.Lock()
+	// Yesterday's peak, outside the window, must not size anything
+	store.recordSpanDemand(9_000_000, now.Add(-(FilterDemandHours+2)*time.Hour))
+	// and this hour's demand must
+	store.recordSpanDemand(1000, now.Add(-2*time.Hour))
+	store.recordSpanDemand(4000, now.Add(-time.Hour))
+	store.recordSpanDemand(2000, now)
+	peak, ok := store.spanDemandPeak(now)
+	want := store.filterCapacity(nil, now)
+	store.Mutex.Unlock()
+
+	require.True(t, ok)
+	require.Equal(t, uint64(4000), peak, "the peak is the largest span inside the window")
+	require.Equal(t, uint64(4000*FilterHeadroomPercent/100), want,
+		"a filter is sized for the recent peak plus headroom")
+
+	// The ceiling holds: a wild span cannot ask for unbounded memory
+	store.Mutex.Lock()
+	store.recordSpanDemand(FilterCapacityMax*100, now)
+	capped := store.filterCapacity(nil, now)
+	store.Mutex.Unlock()
+	require.Equal(t, FilterCapacityMax, capped, "demand is bounded above")
+
+	// And a filter is never sized under what a live span already holds
+	store.Mutex.Lock()
+	store.demand = nil
+	live := []*keyFilter{{start: 0, keys: NewBloomSet(10, 3)}}
+	for i := 0; i < 500; i++ {
+		live[0].keys.Set(NewFastRandom([]byte{byte(i)}).NextHash())
+	}
+	floor := store.filterCapacity(live, now)
+	store.Mutex.Unlock()
+	require.GreaterOrEqual(t, floor, uint64(500),
+		"a filter cannot be sized under what its own window has taken")
+}
+
+// TestFilterDemandSurvivesAReopen
+// The measurement is only useful if a restart keeps it: a store that
+// forgot yesterday's demand would size its first filters from a guess,
+// which is what dynamic sizing exists to stop (issue #54).
+func TestFilterDemandSurvivesAReopen(t *testing.T) {
+	dir := storeDir(t, "demandreopen")
+	store, err := NewSegmentStore(dir, false)
+	require.NoError(t, err)
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	now := time.Now()
+	store.Mutex.Lock()
+	store.recordSpanDemand(7500, now)
+	store.Mutex.Unlock()
+	require.NoError(t, store.Put(NewFastRandom([]byte{190}).NextHash(), []byte("x")))
+	_, err = store.Seal(1) // A seal writes the manifest, demand and all
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	reopened, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+	reopened.Mutex.RLock()
+	peak, ok := reopened.spanDemandPeak(now)
+	reopened.Mutex.RUnlock()
+	require.True(t, ok, "the demand record must survive a restart")
+	require.Equal(t, uint64(7500), peak)
+
+	capacity, reportedPeak, fill := reopened.FilterSizing()
+	require.Equal(t, uint64(7500), reportedPeak)
+	require.GreaterOrEqual(t, capacity, uint64(7500*FilterHeadroomPercent/100),
+		"the reported capacity is what a filter starting now would take")
+	require.NotEmpty(t, fill, "the live filters report what they hold")
 }
