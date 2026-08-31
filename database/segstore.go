@@ -1273,6 +1273,21 @@ func segmentFileName(height, seq uint64) string {
 	return fmt.Sprintf("%s%08d-%04d%s", segFilePrefix, height, seq, segDataSuffix)
 }
 
+// claimSegmentName publishes a finished file under a segment's name,
+// refusing to replace a file already there.  A rename replaces
+// silently, and every existing segment file is committed, immutable
+// data: a taken name means two segments were minted the same identity
+// -- the pair fallback did exactly that (issue #61) -- and overwriting
+// turns the identity bug into data loss.  The hard link publishes the
+// name atomically or fails with ErrExist leaving both files as they
+// were; the temporary name is dropped once the claim holds.
+func claimSegmentName(tmpPath, dataPath string) (err error) {
+	if err = os.Link(tmpPath, dataPath); err != nil {
+		return err
+	}
+	return os.Remove(tmpPath)
+}
+
 // readManifest loads segments.json
 func (s *SegmentStore) readManifest() (m *StoreManifest, err error) {
 	data, err := os.ReadFile(filepath.Join(s.Directory, segManifestName))
@@ -1462,6 +1477,9 @@ func auditUnlink(dir, why string, paths ...string) {
 	}
 	defer f.Close()
 	now := time.Now().UTC().Format("15:04:05.000000")
+	if len(paths) == 0 { // A bare event, like a manifest commit
+		fmt.Fprintf(f, "%s %s\n", now, why)
+	}
 	for _, p := range paths {
 		fmt.Fprintf(f, "%s %s %s\n", now, why, filepath.Base(p))
 	}
@@ -1853,14 +1871,34 @@ func (s *SegmentStore) awaitUnlinks() {
 // until the iterations and pinned snapshots reading it have finished.
 // Safe under either tier lock, or none.
 func (s *SegmentStore) retire(path string) {
-	s.retireMu.Lock()
-	defer s.retireMu.Unlock()
-	if s.iterating > 0 {
-		s.pendingDelete = append(s.pendingDelete, path)
-		return
+	s.retireWhy("retire", path)
+}
+
+// manifestStillNames reports whether an on-disk manifest still names
+// the segment the path belongs to (an index file counts as its data
+// file).  The deferred-deletion protocol guarantees it never does by
+// the time a path reaches retireWhy; this makes the invariant
+// executable, so any future gap in that protocol -- like the identity
+// collision of issue #61 -- costs a leaked file and a loud audit line
+// instead of a store that cannot open.  A byte scan, not a parse: the
+// manifests are small and a segment's name appears in them quoted
+// verbatim.
+func (s *SegmentStore) manifestStillNames(path string) bool {
+	name := filepath.Base(path)
+	if strings.HasSuffix(name, segIndexSuffix) {
+		name = strings.TrimSuffix(name, segIndexSuffix) + segDataSuffix
 	}
-	auditUnlink(s.Directory, "retire", path)
-	os.Remove(path)
+	if !strings.HasPrefix(name, segFilePrefix) || !strings.HasSuffix(name, segDataSuffix) {
+		return false
+	}
+	quoted := []byte(`"` + name + `"`)
+	for _, mf := range []string{segManifestName, segHistoryName} {
+		data, err := os.ReadFile(filepath.Join(s.Directory, mf))
+		if err == nil && bytes.Contains(data, quoted) {
+			return true
+		}
+	}
+	return false
 }
 
 // unlinkItem is one queued deletion and the site that queued it, for
@@ -1873,6 +1911,10 @@ func (s *SegmentStore) retireWhy(why, path string) {
 	defer s.retireMu.Unlock()
 	if s.iterating > 0 {
 		s.pendingDelete = append(s.pendingDelete, path)
+		return
+	}
+	if s.manifestStillNames(path) {
+		auditUnlink(s.Directory, "REFUSED-"+why+": an on-disk manifest still names it", path)
 		return
 	}
 	auditUnlink(s.Directory, why, path)
@@ -1900,6 +1942,10 @@ func (s *SegmentStore) unpin() {
 		return
 	}
 	for _, path := range s.pendingDelete {
+		if s.manifestStillNames(path) {
+			auditUnlink(s.Directory, "REFUSED-pendingDelete: an on-disk manifest still names it", path)
+			continue
+		}
 		auditUnlink(s.Directory, "pendingDelete", path)
 		os.Remove(path)
 	}
@@ -2213,7 +2259,15 @@ func (s *SegmentStore) promoteLiveFile(dataPath string) (sl sealed, err error) {
 		return sl, err
 	}
 	s.liveFile.File = nil
-	if err = os.Rename(livePath, dataPath); err != nil {
+	// Link, not rename: a rename would silently replace an existing
+	// segment file if this seal's (height, seq) were ever minted twice,
+	// turning an identity bug into data loss.  The link fails with
+	// ErrExist instead, the live file is untouched, and the seal fails
+	// loudly (issue #61).
+	if err = os.Link(livePath, dataPath); err != nil {
+		return sl, err
+	}
+	if err = os.Remove(livePath); err != nil {
 		return sl, err
 	}
 	// No directory fsync here: the manifest commit that ends this
@@ -2314,9 +2368,24 @@ func compactionRun(history []*segment, ratio float64) (run []*segment, at int) {
 	// had just declined.
 	for j := n - 2; j >= 0; j-- {
 		older, newer := uint64(history[j].records), uint64(history[j+1].records)
-		if older+newer <= budget && float64(older)*ratio <= float64(newer) {
-			return history[j : j+2], j
+		if older+newer > budget || float64(older)*ratio > float64(newer) {
+			continue
 		}
+		// The pair's replacement is named (Height, Seq+1) after its
+		// newer member.  A suffix ends where that identity is free, but
+		// a pair can sit anywhere in history -- and when several seals
+		// share one block, the segment right behind the pair IS
+		// (Height, Seq+1).  Folding this pair would mint a second
+		// segment under that segment's name and overwrite its committed
+		// file; the store then held two segments sharing one file, and
+		// releasing either deleted the other's data (issue #61).
+		if j+2 < n {
+			last, next := history[j+1].meta, history[j+2].meta
+			if next.Height == last.Height && next.Seq == last.Seq+1 {
+				continue
+			}
+		}
+		return history[j : j+2], j
 	}
 	return nil, 0
 }
@@ -2345,10 +2414,13 @@ func compactionRun(history []*segment, ratio float64) (run []*segment, at int) {
 // checks that the run is still exactly where it was -- a drop or an
 // import could have changed history meanwhile -- and abandons the
 // output if not.  The identity is the sequence after the run's
-// newest, which is free: everything in history is below the window
-// and the run is history's newest suffix.  Crash safety is the merge's
-// rule: an uncommitted output sits below the newest active segment
-// and recoverOrphans deletes it, while the inputs are still named.
+// newest.  For a suffix run that identity is free; the pair fallback
+// refuses a pair whose successor already holds it, and publishing the
+// output refuses to replace an existing file, so a taken identity can
+// never overwrite a committed segment (issue #61).  Crash safety is
+// the merge's rule: an uncommitted output sits below the newest active
+// segment and recoverOrphans deletes it, while the inputs are still
+// named.
 func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	s.maint.Lock()
 	defer s.maint.Unlock()
@@ -2369,6 +2441,14 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 
 	last := run[len(run)-1].meta
 	meta, seg, err := s.writeMergedRun(run, last.Height, last.Seq+1)
+	if errors.Is(err, os.ErrExist) {
+		// The replacement's identity is already a segment on disk.
+		// compactionRun refuses the pairs that would mint one, so this
+		// is the last line of defence: skip the pass rather than let
+		// anything overwrite a committed segment's file (issue #61).
+		auditUnlink(s.Directory, fmt.Sprintf("compact-refused-name-taken(%d-%d)", last.Height, last.Seq+1))
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -2536,7 +2616,7 @@ func (s *SegmentStore) writeMergedRun(run []*segment, height, seq uint64) (meta 
 		return meta, nil, err
 	}
 	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
+	if err = claimSegmentName(tmpPath, dataPath); err != nil {
 		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
@@ -2701,7 +2781,7 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 		return meta, nil, err
 	}
 	f = nil
-	if err = os.Rename(tmpPath, dataPath); err != nil {
+	if err = claimSegmentName(tmpPath, dataPath); err != nil {
 		return meta, nil, err
 	}
 	// The manifest commit's directory fsync covers this rename
@@ -2808,6 +2888,13 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	outHeight, outSeq := last.Height, last.Seq+1
 
 	meta, seg, err := s.concatSegments(run, outHeight, outSeq)
+	if errors.Is(err, os.ErrExist) {
+		// The merged segment's identity is already a file on disk.  The
+		// prefix rule should make that impossible; refuse rather than
+		// overwrite, and leave the run for a later pass (issue #61).
+		auditUnlink(s.Directory, fmt.Sprintf("merge-refused-name-taken(%d-%d)", outHeight, outSeq))
+		return meta, false, nil
+	}
 	if err != nil {
 		return meta, false, err
 	}

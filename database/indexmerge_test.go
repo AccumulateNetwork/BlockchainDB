@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -225,6 +226,83 @@ func TestCompactionPassIsBounded(t *testing.T) {
 // segment at the head of history.  The swap must replace exactly the
 // chosen run, in place, leave the big segment untouched, and every key
 // must survive with its newest value.
+// TestCompactionRefusesATakenIdentity
+// Several seals in one block sit at (H,0), (H,1), (H,2)...  The pair
+// fallback folding (H,0)+(H,1) names its replacement (H, 1+1) = (H,2)
+// -- the very segment behind the pair -- and the rename that published
+// the output overwrote that segment's committed file.  History then
+// held two segments sharing one file; whichever was folded first, its
+// release deleted the file while history.json still named the other,
+// and the store could not reopen: issue #61, the one-in-a-hundred
+// TestCrashRecoverySeal flake.  The chooser must skip such a pair, and
+// the publish must refuse a taken name rather than replace it.
+func TestCompactionRefusesATakenIdentity(t *testing.T) {
+	dir := storeDir(t, "takenid")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.SetFilterBlocks(MinFilterBlocks))
+
+	kr := NewFastRandom([]byte{214})
+	var keys [][32]byte
+	val := func(i int) []byte { return []byte{byte(i), byte(i >> 8), 9} }
+	seal := func(n int) { // n records, one segment, all in block 0
+		for j := 0; j < n; j++ {
+			k := kr.NextHash()
+			keys = append(keys, k)
+			require.NoError(t, store.Put(k, val(len(keys)-1)))
+		}
+		_, err := store.SealNext()
+		require.NoError(t, err)
+	}
+	seal(300) // (0,0)
+	seal(300) // (0,1)
+	seal(900) // (0,2) -- the identity folding the pair would mint
+	// Roll the window so all three segments become history
+	for b := uint64(1); b <= 3*MinFilterBlocks; b++ {
+		_, err = store.Seal(b)
+		require.NoError(t, err)
+	}
+	require.Len(t, store.history, 3)
+
+	old := CompactPassRecords
+	defer func() { CompactPassRecords = old }()
+	CompactPassRecords = 700 // Only (0,0)+(0,1) fits the budget
+
+	// The chooser must decline: the one pair under budget would mint
+	// (0,2), and (0,2) is a committed segment
+	run, _ := compactionRun(store.history, CompactRatio)
+	require.Nil(t, run, "the only affordable pair's replacement identity is taken")
+
+	compacted, err := store.CompactHistory()
+	require.NoError(t, err)
+	require.False(t, compacted)
+	require.Len(t, store.history, 3, "nothing may be rewritten")
+
+	// The belt behind the chooser: publishing at a taken identity must
+	// refuse, never replace.  Before the fix this call silently
+	// overwrote seg-00000000-0002.dat with a 600-record merge.
+	_, _, err = store.writeMergedRun(store.history[:2], 0, 2)
+	require.ErrorIs(t, err, os.ErrExist, "a taken segment name must refuse the publish")
+
+	// Every key still reads, including the 900 whose file the collision
+	// used to destroy, and the store reopens clean
+	for i, k := range keys {
+		v, err := store.Get(k)
+		require.NoErrorf(t, err, "key %d lost", i)
+		require.Equal(t, val(i), v)
+	}
+	require.NoError(t, store.Close())
+	re, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	for i, k := range keys {
+		v, err := re.Get(k)
+		require.NoErrorf(t, err, "key %d lost across reopen", i)
+		require.Equal(t, val(i), v)
+	}
+	require.NoError(t, re.Close())
+}
+
 func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {
 	dir := storeDir(t, "midrun")
 	store, err := NewSegmentStore(dir, true)
