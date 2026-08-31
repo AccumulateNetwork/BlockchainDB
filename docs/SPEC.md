@@ -320,8 +320,12 @@ run is still in place and discards its output if not.
   last.Seq+1)`; the chooser refuses a pair whose successor already
   holds that identity, and `claimSegmentName` (hard link) refuses to
   replace any existing file — a taken name skips the pass, audibly
-  (#61).  **DEVIATION #65**: a segment at the budget freezes forever;
-  its garbage is never reclaimed.
+  (#61).  A segment that grows past the budget would otherwise freeze
+  for good, so when the ordinary pass has nothing to do one deeper
+  fold is allowed, bounded by `CompactDeepPassRecords`: it folds one
+  pair, still only if the ratio says it is worth it, and the frozen
+  segments halve with each one, so the layer converges to its live key
+  set instead of holding frozen garbage forever (#65).
 - **Perm window merge** — `MergeBelow` → `concatSegments`: byte-
   verbatim body copies, indexes shifted by their body's base, one
   identity after the run's newest (1.4).  The run starts after the
@@ -372,7 +376,6 @@ The current gaps between Section 1 and the code, in one place:
 
 | Issue | Invariant | Gap |
 |---|---|---|
-| #65 | 1.5 dyna converges | Budget-frozen segments never merge; frozen garbage is permanent |
 | #66 | 1.6 lock rules | `KV2.Put` holds the store-wide lock across cross-layer reads |
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |

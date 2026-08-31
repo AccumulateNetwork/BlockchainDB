@@ -217,9 +217,79 @@ func TestCompactionPassIsBounded(t *testing.T) {
 	require.Equal(t, 0, at)
 	require.Equal(t, int64(400), run[0].records)
 
-	// Nothing fits: two giants and nothing else
-	run, _ = compactionRun(mk(2000, 3000), DefaultCompactRatio)
-	require.Nil(t, run)
+	// Nothing fits the ordinary budget: two giants and nothing else.
+	// The deeper tier is what folds these, and only when the cheap pass
+	// is idle -- TestFrozenSegmentsStillConverge covers it (issue #65).
+	run, _ = compactionRunWithin(mk(2000, 3000), DefaultCompactRatio, CompactPassRecords)
+	require.Nil(t, run, "one ordinary pass must stay inside its budget")
+}
+
+// TestFrozenSegmentsStillConverge
+// CompactPassRecords bounds one pass, which is what keeps a
+// compaction from stalling the maintenance behind it -- but a segment
+// that grows past the budget was frozen for good: the suffix rule
+// stops at it and no pair containing it fits, so its garbage was
+// permanent and the dynamic layer grew without limit under exactly
+// the workload it is built for, a bounded key set rewritten forever
+// (issue #65).  When the ordinary pass has nothing to do, one deeper
+// fold is allowed, and the frozen segments halve with each one.
+func TestFrozenSegmentsStillConverge(t *testing.T) {
+	mk := func(records ...int64) (h []*segment) {
+		for i, r := range records {
+			h = append(h, &segment{records: r, meta: SegmentMeta{Height: uint64(i+1) * 10}})
+		}
+		return h
+	}
+	oldPass, oldDeep := CompactPassRecords, CompactDeepPassRecords
+	defer func() { CompactPassRecords, CompactDeepPassRecords = oldPass, oldDeep }()
+	CompactPassRecords = 1000
+	CompactDeepPassRecords = 8000
+
+	// Two frozen segments: each is over the ordinary budget, so nothing
+	// the cheap pass can do -- and before the deep pass they stood
+	// forever, holding whatever the other superseded
+	frozen := mk(900, 800)
+	run, _ := compactionRunWithin(frozen, DefaultCompactRatio, CompactPassRecords)
+	require.Nil(t, run, "the ordinary budget cannot touch them")
+	run, at := compactionRun(frozen, DefaultCompactRatio)
+	require.Len(t, run, 2, "the deep pass folds them")
+	require.Equal(t, 0, at)
+
+	// It still has to be worth it: a big segment with little behind it
+	// is not rewritten just because the deep budget could afford it
+	run, _ = compactionRun(mk(5000, 10), DefaultCompactRatio)
+	require.Nil(t, run, "the ratio gate holds at every budget")
+
+	// And the deep pass never pre-empts the cheap one: with ordinary
+	// work available, that is what runs
+	run, _ = compactionRun(mk(4000, 300, 200, 100), DefaultCompactRatio)
+	require.Len(t, run, 3, "the affordable suffix, not the giant")
+	var total int64
+	for _, s := range run {
+		total += s.records
+	}
+	require.LessOrEqual(t, uint64(total), CompactPassRecords)
+
+	// Convergence: repeatedly folding a frozen ladder ends at one
+	// segment, rather than stalling forever
+	ladder := mk(900, 800, 700, 600)
+	for pass := 0; pass < 10 && len(ladder) > 1; pass++ {
+		run, at := compactionRun(ladder, DefaultCompactRatio)
+		if run == nil {
+			break
+		}
+		var folded int64
+		for _, s := range run {
+			folded += s.records
+		}
+		require.LessOrEqualf(t, uint64(folded), CompactDeepPassRecords,
+			"pass %d folded %d records; every pass must stay inside a budget", pass, folded)
+		next := append([]*segment(nil), ladder[:at]...)
+		next = append(next, &segment{records: folded, meta: ladder[at+len(run)-1].meta})
+		next = append(next, ladder[at+len(run):]...)
+		ladder = next
+	}
+	require.Lenf(t, ladder, 1, "the ladder must consolidate, not freeze: %d segments left", len(ladder))
 }
 
 // TestCompactHistoryFoldsANonSuffixRun
@@ -269,6 +339,9 @@ func TestCompactionRefusesATakenIdentity(t *testing.T) {
 	old := CompactPassRecords
 	defer func() { CompactPassRecords = old }()
 	CompactPassRecords = 700 // Only (0,0)+(0,1) fits the budget
+	oldDeep := CompactDeepPassRecords
+	defer func() { CompactDeepPassRecords = oldDeep }()
+	CompactDeepPassRecords = CompactPassRecords // The subject here is the chooser, not the tier (#65)
 
 	// The chooser must decline: the one pair under budget would mint
 	// (0,2), and (0,2) is a committed segment
@@ -440,11 +513,23 @@ func TestCompactHistoryFoldsANonSuffixRun(t *testing.T) {
 	require.Len(t, store.history, 2)
 	require.Equal(t, int64(900), store.history[0].records, "the over-budget segment stands untouched")
 
-	// A second pass has nothing it may touch: the survivors' pair is
-	// over the budget
+	// A second pass has nothing the ORDINARY budget may touch: the
+	// survivors' pair is over it
+	deep := CompactDeepPassRecords
+	CompactDeepPassRecords = CompactPassRecords // No deeper tier for now
 	compacted, err = store.CompactHistory()
 	require.NoError(t, err)
 	require.False(t, compacted)
+
+	// With the deeper tier back, the frozen pair does fold -- one pass,
+	// inside its own budget, and only because the cheap pass was idle.
+	// Without it the 900 would hold whatever the 600 superseded for the
+	// life of the store (issue #65).
+	CompactDeepPassRecords = deep
+	compacted, err = store.CompactHistory()
+	require.NoError(t, err)
+	require.True(t, compacted, "the deeper tier folds what the budget froze")
+	require.Len(t, store.history, 1)
 
 	for i, k := range keys {
 		v, err := store.GetDeep(k)
