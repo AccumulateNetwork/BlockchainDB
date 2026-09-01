@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Block-set files: the second stage of merging finalized Perm data.
@@ -149,16 +150,47 @@ func (b *blockSet) bloomTest(key [32]byte) (mightBe bool, err error) {
 // The block-set files of one sharded database, oldest first.  Methods
 // are safe for concurrent use: every shard consults it.
 type SetStore struct {
+	// Mutex serializes WRITERS.  A reader takes none: it loads the
+	// snapshot below, which is replaced wholesale and never edited in
+	// place.  Every cold read of all 512 shards used to take this one
+	// exclusive lock, twice, to read two slice headers.
 	Mutex     sync.Mutex
 	Directory string
-	sets      []*blockSet
 
-	// days is one filter per FINISHED group of sets, oldest first: a
+	// state is what a reader sees: the sets and the group filters, as
+	// one value, so a walk cannot see a filter built from sets it does
+	// not have.  Published atomically; the slices inside it are treated
+	// as immutable once published.
+	state atomic.Pointer[setState]
+}
+
+// setState is the set store as a reader sees it.  Both lists are
+// replaced, never edited: `sets` grows by a new slice and `days` by a
+// sorted copy, so a reader holding an older state reads an array
+// nothing will touch.
+type setState struct {
+	// sets are the block-set files, oldest first
+	sets []*blockSet
+
+	// days is one filter per FINISHED group of sets, sorted by group: a
 	// deep read skips a whole group with one probe instead of walking
 	// its sets, which is what keeps the walk from growing with the age
 	// of the chain (dayfilter.go, issue #47).  The group still being
 	// filled has none, and its sets are probed directly.
 	days []*dayFilter
+}
+
+// load is the current state, never nil
+func (ss *SetStore) load() *setState {
+	if st := ss.state.Load(); st != nil {
+		return st
+	}
+	return &setState{}
+}
+
+// publish replaces the state.  The caller must hold the Mutex.
+func (ss *SetStore) publish(sets []*blockSet, days []*dayFilter) {
+	ss.state.Store(&setState{sets: sets, days: days})
 }
 
 // NewSetStore creates an empty set directory, replacing any existing one
@@ -184,6 +216,7 @@ func OpenSetStore(directory string) (store *SetStore, err error) {
 		return nil, err
 	}
 	store = &SetStore{Directory: directory}
+	var sets []*blockSet
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasSuffix(name, segTmpSuffix) {
@@ -197,18 +230,20 @@ func OpenSetStore(directory string) (store *SetStore, err error) {
 		if err != nil {
 			return nil, err
 		}
-		store.sets = append(store.sets, set)
+		sets = append(sets, set)
 	}
-	sort.Slice(store.sets, func(i, j int) bool { return store.sets[i].meta.First < store.sets[j].meta.First })
-	if store.days, err = loadDayFilters(directory); err != nil {
+	sort.Slice(sets, func(i, j int) bool { return sets[i].meta.First < sets[j].meta.First })
+	days, err := loadDayFilters(directory)
+	if err != nil {
 		return nil, err
 	}
-	for i := 1; i < len(store.sets); i++ {
-		a, b := store.sets[i-1].meta, store.sets[i].meta
+	for i := 1; i < len(sets); i++ {
+		a, b := sets[i-1].meta, sets[i].meta
 		if b.First <= a.Last {
 			return nil, fmt.Errorf("block sets %s and %s overlap", a.File, b.File)
 		}
 	}
+	store.publish(sets, days) // Nothing reads it before this
 	return store, nil
 }
 
@@ -232,11 +267,7 @@ func (ss *SetStore) Newest() (meta SetMeta, ok bool) {
 // snapshot is the set list as it stands.  A set, once opened, never
 // changes, and the list only ever grows, so a caller can walk the
 // snapshot without the lock.
-func (ss *SetStore) snapshot() []*blockSet {
-	ss.Mutex.Lock()
-	defer ss.Mutex.Unlock()
-	return ss.sets
-}
+func (ss *SetStore) snapshot() []*blockSet { return ss.load().sets }
 
 // setFileName is the file name for a set covering blocks first..last
 func setFileName(first, last uint64) string {
@@ -399,7 +430,10 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 		bloomK:     bloom.K,
 	}
 	ss.Mutex.Lock()
-	ss.sets = append(ss.sets, set)
+	st := ss.load()
+	sets := make([]*blockSet, len(st.sets), len(st.sets)+1)
+	copy(sets, st.sets)
+	ss.publish(append(sets, set), st.days)
 	ss.Mutex.Unlock()
 
 	// This set may have closed out the group before it: nothing can
@@ -430,8 +464,9 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 // filters existed, and the next pack tries again.
 func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 	ss.Mutex.Lock()
-	have := make(map[uint64]bool, len(ss.days))
-	for _, d := range ss.days {
+	st := ss.load()
+	have := make(map[uint64]bool, len(st.days))
+	for _, d := range st.days {
 		have[d.group] = true
 	}
 	// The OLDEST group still missing a filter, and only that one.
@@ -447,7 +482,7 @@ func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 	var oldest uint64
 	var sets []*blockSet
 	found := false
-	for _, s := range ss.sets {
+	for _, s := range st.sets {
 		g := setGroup(s.meta.First)
 		if g >= current || have[g] {
 			continue
@@ -457,7 +492,7 @@ func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 		}
 	}
 	if found {
-		for _, s := range ss.sets {
+		for _, s := range st.sets {
 			if setGroup(s.meta.First) == oldest {
 				sets = append(sets, s)
 			}
@@ -483,22 +518,19 @@ func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 		// append alone because it only ever grows at the end and is
 		// never reordered; this one is sorted.
 		ss.Mutex.Lock()
-		days := make([]*dayFilter, len(ss.days), len(ss.days)+1)
-		copy(days, ss.days)
+		cur := ss.load()
+		days := make([]*dayFilter, len(cur.days), len(cur.days)+1)
+		copy(days, cur.days)
 		days = append(days, f)
 		sort.Slice(days, func(i, j int) bool { return days[i].group < days[j].group })
-		ss.days = days
+		ss.publish(cur.sets, days)
 		ss.Mutex.Unlock()
 	}
 	return nil
 }
 
 // groupFilters is the day filters as they stand
-func (ss *SetStore) groupFilters() []*dayFilter {
-	ss.Mutex.Lock()
-	defer ss.Mutex.Unlock()
-	return ss.days
-}
+func (ss *SetStore) groupFilters() []*dayFilter { return ss.load().days }
 
 // openBlockSet
 // Read what a lookup keeps in memory: the header, the directory, and
