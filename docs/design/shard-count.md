@@ -49,10 +49,15 @@ writer waits behind fewer others — while its extra files are still
 few enough not to cost anything.
 
 **Above ~16 shards every axis rises monotonically.** Latency roughly
-doubles per 4x shards, files grow linearly at ~58 a shard (126 at 2,
-250 at 4, 480 at 8 — exactly 30 a shard, no economy of scale
-anywhere), and memory climbs because each shard carries its own live
-tail, its own filter pair and its own segment metadata.
+doubles per 4x shards, and memory climbs because each shard carries
+its own live tail, its own filter pair and its own segment metadata.
+
+Files are the plainest of the three: the count per shard is flat
+across the whole sweep — 63.0 at 2 shards, 62.5 at 4, 60.0 at 8, 57.9
+at 16, and 57.6 to 57.8 from 32 all the way to 512. Every shard pays
+the same ~58 files whatever the rate it sees, so the total is simply
+the count times that, and there is no economy of scale to be had
+anywhere on the curve.
 
 So the cost is not sharding; it is sharding **past the point where a
 shard's files are worth writing**.
