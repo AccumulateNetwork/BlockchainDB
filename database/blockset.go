@@ -659,29 +659,42 @@ type shardSets struct {
 // or read falls back to.
 func (c shardSets) lookup(key [32]byte) (value []byte, found bool, err error) {
 	sets := c.store.snapshot()
-	filtered := map[uint64]*dayFilter{}
-	for _, d := range c.store.groupFilters() {
-		filtered[d.group] = d
-	}
-	skip := map[uint64]bool{}
+	days := c.store.groupFilters()
+
+	// Sets are ordered by block and groups tile the block space, so
+	// one group's sets are CONTIGUOUS in this walk: the decision about
+	// a group is made when its first set is reached and held in two
+	// scalars until the group changes.  No map, and nothing allocated
+	// per lookup -- a map keyed by group would be O(groups) of setup on
+	// every read, which after a year is more work than the probes it
+	// saves.
+	group, asked, skip := uint64(0), false, false
 	for i := len(sets) - 1; i >= 0; i-- {
-		g := setGroup(sets[i].meta.First)
-		if skip[g] {
-			continue
-		}
-		if d, ok := filtered[g]; ok {
-			if !d.mightHold(key) {
-				skip[g] = true // The whole group is ruled out, in one probe
-				continue
+		if g := setGroup(sets[i].meta.First); g != group || !asked {
+			group, asked, skip = g, true, false
+			if d := findDayFilter(days, g); d != nil && !d.mightHold(key) {
+				skip = true // The whole group is ruled out, in one probe
 			}
-			filtered[g] = nil // Asked once; walk the group's sets now
-			delete(filtered, g)
+		}
+		if skip {
+			continue
 		}
 		if value, found, err = sets[i].lookup(c.shard, key); err != nil || found {
 			return value, found, err
 		}
 	}
 	return nil, false, nil
+}
+
+// findDayFilter is the filter for a group, or nil if the group has
+// none.  The filters are sorted by group, so this is a binary search
+// rather than a scan that would grow with the age of the chain.
+func findDayFilter(days []*dayFilter, group uint64) *dayFilter {
+	i := sort.Search(len(days), func(i int) bool { return days[i].group >= group })
+	if i < len(days) && days[i].group == group {
+		return days[i]
+	}
+	return nil
 }
 
 // forEachKeySince visits every key the shard holds in a set that
