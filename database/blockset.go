@@ -152,6 +152,13 @@ type SetStore struct {
 	Mutex     sync.Mutex
 	Directory string
 	sets      []*blockSet
+
+	// days is one filter per FINISHED group of sets, oldest first: a
+	// deep read skips a whole group with one probe instead of walking
+	// its sets, which is what keeps the walk from growing with the age
+	// of the chain (dayfilter.go, issue #47).  The group still being
+	// filled has none, and its sets are probed directly.
+	days []*dayFilter
 }
 
 // NewSetStore creates an empty set directory, replacing any existing one
@@ -193,6 +200,9 @@ func OpenSetStore(directory string) (store *SetStore, err error) {
 		store.sets = append(store.sets, set)
 	}
 	sort.Slice(store.sets, func(i, j int) bool { return store.sets[i].meta.First < store.sets[j].meta.First })
+	if store.days, err = loadDayFilters(directory); err != nil {
+		return nil, err
+	}
 	for i := 1; i < len(store.sets); i++ {
 		a, b := store.sets[i-1].meta, store.sets[i].meta
 		if b.First <= a.Last {
@@ -391,7 +401,59 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	ss.Mutex.Lock()
 	ss.sets = append(ss.sets, set)
 	ss.Mutex.Unlock()
+
+	// This set may have closed out the group before it: nothing can
+	// join a group once a set sits above it, so its filter can be
+	// built, once, and never touched again (issue #47).
+	if err = ss.closeFinishedGroups(setGroup(first)); err != nil {
+		return nil, err
+	}
 	return set, nil
+}
+
+// closeFinishedGroups builds the filter for every group below
+// `current` that has none: a group no later set can join.
+//
+// A failure here is not a failure of the pack.  The sets are committed
+// and complete; a missing group filter costs a walk of that group's
+// sets on a deep read, which is exactly what happened before the
+// filters existed, and the next pack tries again.
+func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
+	ss.Mutex.Lock()
+	have := make(map[uint64]bool, len(ss.days))
+	for _, d := range ss.days {
+		have[d.group] = true
+	}
+	groups := map[uint64][]*blockSet{}
+	for _, s := range ss.sets {
+		g := setGroup(s.meta.First)
+		if g < current && !have[g] {
+			groups[g] = append(groups[g], s)
+		}
+	}
+	ss.Mutex.Unlock()
+
+	for g, sets := range groups {
+		f, err := writeDayFilter(ss.Directory, g, sets)
+		if err != nil {
+			return err
+		}
+		if f == nil {
+			continue
+		}
+		ss.Mutex.Lock()
+		ss.days = append(ss.days, f)
+		sort.Slice(ss.days, func(i, j int) bool { return ss.days[i].group < ss.days[j].group })
+		ss.Mutex.Unlock()
+	}
+	return nil
+}
+
+// groupFilters is the day filters as they stand
+func (ss *SetStore) groupFilters() []*dayFilter {
+	ss.Mutex.Lock()
+	defer ss.Mutex.Unlock()
+	return ss.days
 }
 
 // openBlockSet
@@ -581,10 +643,40 @@ type shardSets struct {
 	shard int
 }
 
-// lookup walks the sets newest first
+// lookup walks the sets newest first, skipping whole GROUPS the day
+// filters rule out.
+//
+// Probing every set is one cheap probe each, but the sets accumulate
+// for the life of the chain, so the walk grows with age: ~31,500 sets
+// after a year at a pack every 1,000 blocks.  A finished group carries
+// one filter over every key in it, so a "no" there skips ~86 sets at
+// once, and the walk becomes the groups plus the sets of the group
+// still being filled -- ~451 probes after a year instead of 31,500,
+// ~1,900 after five years instead of 158,000 (issue #47).
+//
+// A group with no filter is walked, which is what the group being
+// filled always is, and what any group whose filter could not be built
+// or read falls back to.
 func (c shardSets) lookup(key [32]byte) (value []byte, found bool, err error) {
 	sets := c.store.snapshot()
+	filtered := map[uint64]*dayFilter{}
+	for _, d := range c.store.groupFilters() {
+		filtered[d.group] = d
+	}
+	skip := map[uint64]bool{}
 	for i := len(sets) - 1; i >= 0; i-- {
+		g := setGroup(sets[i].meta.First)
+		if skip[g] {
+			continue
+		}
+		if d, ok := filtered[g]; ok {
+			if !d.mightHold(key) {
+				skip[g] = true // The whole group is ruled out, in one probe
+				continue
+			}
+			filtered[g] = nil // Asked once; walk the group's sets now
+			delete(filtered, g)
+		}
 		if value, found, err = sets[i].lookup(c.shard, key); err != nil || found {
 			return value, found, err
 		}

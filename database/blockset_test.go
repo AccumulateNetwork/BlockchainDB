@@ -508,3 +508,78 @@ func TestBlockSetHeaderIsChecked(t *testing.T) {
 		require.NoError(t, reopened.Close())
 	})
 }
+
+// TestDayFiltersSkipWholeGroups
+// A deep read rules a key out of cold storage by probing every block
+// set's filter: one cheap probe each, but sets accumulate for the life
+// of the chain, so the WALK grows with age even though each step does
+// not.  Packing every 1,000 blocks, a year is ~31,500 sets, and every
+// deep miss walks all of them.
+//
+// A finished group of sets carries one filter over every key in it, so
+// a miss skips the group in a single probe, and a hit still walks
+// (issue #47).  The group is a BLOCK RANGE, not a clock reading, so
+// this test moves the group size rather than time.
+func TestDayFiltersSkipWholeGroups(t *testing.T) {
+	old := SetGroupBlocks
+	defer func() { setGroupBlocksForTest(old) }()
+	setGroupBlocksForTest(8) // Eight blocks to a group
+
+	dir := storeDir(t, "daygroups")
+	// Enough blocks that the window (N to 2N) has rolled past what is
+	// packed: only HISTORY is packed, whatever the watermark says
+	kvs, keys, values := packedFixture(t, dir, 0xd1, 100, 3)
+	defer kvs.Close()
+
+	// Three rounds, each landing in a later group, so the earlier
+	// groups finish and the last is still being filled
+	for _, upTo := range []uint64{20, 40, 60} {
+		_, packed, err := kvs.PackFinalized(upTo)
+		require.NoErrorf(t, err, "pack below %d", upTo)
+		require.Truef(t, packed, "pack below %d must have packed something", upTo)
+	}
+
+	filters := kvs.Sets.groupFilters()
+	require.NotEmpty(t, filters, "a finished group must carry a filter")
+	for _, f := range filters {
+		require.NotZero(t, f.bloomBytes, "group %d: the filter must have bits", f.group)
+	}
+
+	// Every packed key is still found -- a filter that denies a key it
+	// holds is a wrong answer, and the walk behind it must still run
+	for i, k := range keys {
+		v, err := kvs.GetDeep(k)
+		require.NoErrorf(t, err, "key %d unreachable through the group filters", i)
+		require.Equal(t, values[k], v)
+	}
+
+	// And the filters actually rule things out: a key that was never
+	// written must be denied by every finished group
+	kr := NewFastRandom([]byte{0xd2})
+	ruledOut := 0
+	for i := 0; i < 200; i++ {
+		absent := kr.NextHash()
+		_, err := kvs.GetDeep(absent)
+		require.ErrorIsf(t, err, errNotFound, "unwritten key %d", i)
+		for _, f := range filters {
+			if !f.mightHold(absent) {
+				ruledOut++
+				break
+			}
+		}
+	}
+	require.Greaterf(t, ruledOut, 150,
+		"the group filters ruled out only %d of 200 absent keys; they are not skipping groups", ruledOut)
+
+	// It survives a reopen: the filters are on disk, read by header
+	require.NoError(t, kvs.Close())
+	re, err := OpenKVShard(dir)
+	require.NoError(t, err)
+	defer re.Close()
+	require.Len(t, re.Sets.groupFilters(), len(filters), "the filters must be found again on open")
+	for i, k := range keys {
+		v, err := re.GetDeep(k)
+		require.NoErrorf(t, err, "key %d lost across reopen", i)
+		require.Equal(t, values[k], v)
+	}
+}
