@@ -889,7 +889,17 @@ func (s *SegmentStore) load() (err error) {
 	}
 	s.FilterBlocks = m.FilterBlocks
 	s.blockHeight = m.BlockHeight
-	s.demand = m.FilterDemand // What spans took before the restart (issue #54)
+	// What spans took before the restart (issue #54).  The ring is
+	// indexed by hour%FilterDemandHours, so a manifest carrying fewer
+	// buckets -- hand-edited, or written by a build with a different
+	// constant -- would panic on the next roll, which is the block
+	// commit path.  A ring that is not the right shape is no demand
+	// record at all; the store sizes from what its filters hold and
+	// learns again at its first roll.
+	s.demand = nil
+	if len(m.FilterDemand) == FilterDemandHours {
+		s.demand = m.FilterDemand
+	}
 
 	// The union, in (Height, Seq) order, which is the order both tiers
 	// keep and the order the lists had before any restart
@@ -2562,6 +2572,13 @@ var CompactPassRecords uint64 = 4 << 20
 // this is a ceiling that a healthy store never reaches.
 var CompactDeepPassRecords uint64 = 8 * CompactPassRecords
 
+// CompactPassSegments bounds a run by FILE COUNT as well as by
+// records.  The record budget cannot: a segment holding none passes
+// every record test, so a history of empty segments made a run as long
+// as history itself, and the merge then opened and streamed every one
+// of them under the maintenance lock.
+var CompactPassSegments = 1024
+
 // compactionRun
 // The run of history worth compacting into one segment, and where it
 // sits.  First choice: the newest suffix, taking each older segment in
@@ -2606,11 +2623,18 @@ func compactionRunWithin(history []*segment, ratio float64, budget uint64) (run 
 	if n == 0 {
 		return nil, 0
 	}
+	// A run is bounded by records AND by segments.  The budget counts
+	// records, and a segment with none passes every record test -- so a
+	// history of empty or near-empty segments yielded a run of
+	// unbounded length, and writeMergedRun then opened and streamed
+	// every one of them under the maintenance lock.  What a pass costs
+	// is both the bytes it moves and the files it touches.
 	var behind uint64
 	i := n - 1
 	for ; i >= 0; i-- {
 		r := uint64(history[i].records)
-		if i < n-1 && (float64(r)*ratio > float64(behind) || behind+r > budget) {
+		if i < n-1 && (float64(r)*ratio > float64(behind) || behind+r > budget ||
+			n-i > CompactPassSegments) {
 			break // Too big for what gathered behind it, or for one pass
 		}
 		behind += r

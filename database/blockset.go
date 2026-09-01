@@ -152,6 +152,13 @@ type SetStore struct {
 	Mutex     sync.Mutex
 	Directory string
 	sets      []*blockSet
+
+	// days is one filter per FINISHED group of sets, oldest first: a
+	// deep read skips a whole group with one probe instead of walking
+	// its sets, which is what keeps the walk from growing with the age
+	// of the chain (dayfilter.go, issue #47).  The group still being
+	// filled has none, and its sets are probed directly.
+	days []*dayFilter
 }
 
 // NewSetStore creates an empty set directory, replacing any existing one
@@ -193,6 +200,9 @@ func OpenSetStore(directory string) (store *SetStore, err error) {
 		store.sets = append(store.sets, set)
 	}
 	sort.Slice(store.sets, func(i, j int) bool { return store.sets[i].meta.First < store.sets[j].meta.First })
+	if store.days, err = loadDayFilters(directory); err != nil {
+		return nil, err
+	}
 	for i := 1; i < len(store.sets); i++ {
 		a, b := store.sets[i-1].meta, store.sets[i].meta
 		if b.First <= a.Last {
@@ -391,7 +401,103 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	ss.Mutex.Lock()
 	ss.sets = append(ss.sets, set)
 	ss.Mutex.Unlock()
+
+	// This set may have closed out the group before it: nothing can
+	// join a group once a set sits above it, so its filter can be
+	// built, once, and never touched again (issue #47).
+	//
+	// The error is DELIBERATELY dropped.  Everything above this line is
+	// the commit -- the set is fsynced, renamed, the directory synced,
+	// and the set is in the list -- and the caller's next act is to
+	// drop the segments the set now holds.  Failing here would abort a
+	// pack that has already happened: the shards would keep segments
+	// the committed set holds, and the retry would compute a new
+	// `first` from the set that landed while `last` stayed where it
+	// was, naming a second set file over the same blocks with First
+	// above Last.  A missing group filter costs a walk of that group's
+	// sets on a deep read, which is what happened before the filters
+	// existed, and the next pack builds it.
+	_ = ss.closeFinishedGroups(setGroup(first))
 	return set, nil
+}
+
+// closeFinishedGroups builds the filter for every group below
+// `current` that has none: a group no later set can join.
+//
+// A failure here is not a failure of the pack.  The sets are committed
+// and complete; a missing group filter costs a walk of that group's
+// sets on a deep read, which is exactly what happened before the
+// filters existed, and the next pack tries again.
+func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
+	ss.Mutex.Lock()
+	have := make(map[uint64]bool, len(ss.days))
+	for _, d := range ss.days {
+		have[d.group] = true
+	}
+	// The OLDEST group still missing a filter, and only that one.
+	//
+	// This runs inside PackFinalized's pin scope: every shard is
+	// pinned, so no file in any of the 512 shards can be reclaimed
+	// while it works, and it reads every key of every set in the
+	// groups it builds.  Building all of them in one call makes that
+	// unbounded -- a store upgraded to this build has no filters at
+	// all, so the first pack would read its entire history with the
+	// whole database pinned.  One group per pack is bounded by a
+	// group, and the groups are finite and only ever get built.
+	var oldest uint64
+	var sets []*blockSet
+	found := false
+	for _, s := range ss.sets {
+		g := setGroup(s.meta.First)
+		if g >= current || have[g] {
+			continue
+		}
+		if !found || g < oldest {
+			oldest, found = g, true
+		}
+	}
+	if found {
+		for _, s := range ss.sets {
+			if setGroup(s.meta.First) == oldest {
+				sets = append(sets, s)
+			}
+		}
+	}
+	ss.Mutex.Unlock()
+	if !found {
+		return nil
+	}
+
+	for _, g := range []uint64{oldest} {
+		f, err := writeDayFilter(ss.Directory, g, sets)
+		if err != nil {
+			return err
+		}
+		if f == nil {
+			continue
+		}
+		// Copy on write: a reader walks the slice groupFilters handed
+		// it without the lock, and appending in place then sorting
+		// would reorder the array underneath that walk whenever the
+		// append does not reallocate.  The sets list gets away with
+		// append alone because it only ever grows at the end and is
+		// never reordered; this one is sorted.
+		ss.Mutex.Lock()
+		days := make([]*dayFilter, len(ss.days), len(ss.days)+1)
+		copy(days, ss.days)
+		days = append(days, f)
+		sort.Slice(days, func(i, j int) bool { return days[i].group < days[j].group })
+		ss.days = days
+		ss.Mutex.Unlock()
+	}
+	return nil
+}
+
+// groupFilters is the day filters as they stand
+func (ss *SetStore) groupFilters() []*dayFilter {
+	ss.Mutex.Lock()
+	defer ss.Mutex.Unlock()
+	return ss.days
 }
 
 // openBlockSet
@@ -581,15 +687,58 @@ type shardSets struct {
 	shard int
 }
 
-// lookup walks the sets newest first
+// lookup walks the sets newest first, skipping whole GROUPS the day
+// filters rule out.
+//
+// Probing every set is one cheap probe each, but the sets accumulate
+// for the life of the chain, so the walk grows with age: ~31,500 sets
+// after a year at a pack every 1,000 blocks.  A finished group carries
+// one filter over every key in it, so a "no" there skips ~86 sets at
+// once, and the walk becomes the groups plus the sets of the group
+// still being filled -- ~451 probes after a year instead of 31,500,
+// ~1,900 after five years instead of 158,000 (issue #47).
+//
+// A group with no filter is walked, which is what the group being
+// filled always is, and what any group whose filter could not be built
+// or read falls back to.
 func (c shardSets) lookup(key [32]byte) (value []byte, found bool, err error) {
 	sets := c.store.snapshot()
+	days := c.store.groupFilters()
+
+	// Sets are ordered by block and groups tile the block space, so
+	// one group's sets are CONTIGUOUS in this walk: the decision about
+	// a group is made when its first set is reached and held in two
+	// scalars until the group changes.  No map, and nothing allocated
+	// per lookup -- a map keyed by group would be O(groups) of setup on
+	// every read, which after a year is more work than the probes it
+	// saves.
+	group, asked, skip := uint64(0), false, false
 	for i := len(sets) - 1; i >= 0; i-- {
+		if g := setGroup(sets[i].meta.First); g != group || !asked {
+			group, asked, skip = g, true, false
+			if d := findDayFilter(days, g); d != nil && !d.mightHold(key) {
+				skip = true // The whole group is ruled out, in one probe
+			}
+		}
+		if skip {
+			continue
+		}
 		if value, found, err = sets[i].lookup(c.shard, key); err != nil || found {
 			return value, found, err
 		}
 	}
 	return nil, false, nil
+}
+
+// findDayFilter is the filter for a group, or nil if the group has
+// none.  The filters are sorted by group, so this is a binary search
+// rather than a scan that would grow with the age of the chain.
+func findDayFilter(days []*dayFilter, group uint64) *dayFilter {
+	i := sort.Search(len(days), func(i int) bool { return days[i].group >= group })
+	if i < len(days) && days[i].group == group {
+		return days[i]
+	}
+	return nil
 }
 
 // forEachKeySince visits every key the shard holds in a set that

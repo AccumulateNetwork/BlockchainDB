@@ -130,9 +130,13 @@ window (MinFilterBlocks).
   there — resident filter memory follows the working set, not the
   chain (#64).
 - **Cross-shard consolidation is a rarer, second pass**: per-shard
-  merges fold into one set file per period (targeting daily), with one
-  filter over the set.  Searching years back skips whole days by their
-  filters; that deep search is API-level work, not protocol work.
+  merges fold into one set file every 1,000 blocks, with one filter
+  over the set.  Sets are grouped by block range (`SetGroupBlocks`, a
+  day at a block a second) and each FINISHED group carries a filter
+  over every key in it, so a deep search skips a whole group in one
+  probe instead of walking its sets — ~451 probes after a year rather
+  than ~31,500, and the walk stops tracking chain age.  That deep
+  search is API-level work, not protocol work (#47).
 - Perm accumulates **no garbage** — values are immutable — so the perm
   layer is never compacted, only merged and packed.
 
@@ -358,7 +362,20 @@ run is still in place and discards its output if not.
   contiguous per-shard sorted indexes, one bloom, verbatim bodies),
   then drops them from the shards, 16 at a time so the barriers
   overlap.  This is 1.4's "merge once, then permanent" done right.
-  #47 tracks the daily cadence and levelled runs.
+  Sets are grouped by block range and a finished group gets one filter
+  over its keys (`dayfilter.go`), written once when a later set closes
+  the group out, held on disk and probed there; a group with no filter
+  — the one being filled, or one whose filter could not be built — is
+  walked, which is correct and merely slower.
+- **A pack pins, it does not lock.**  Each shard's segments are pinned
+  and its list copied (`historyBelow`), the set is built by reading
+  those files, and only then does `DropBelow` remove them — so a pin
+  defers a file's DELETION and nothing else.  Shards go on taking
+  writes, sealing blocks and committing manifests with the whole
+  database pinned, which is what keeps the most expensive operation in
+  the store off the protocol path (#47).  `build` already streams
+  shard by shard, so nothing per-shard is held for the set's size
+  either.  #47 tracks what is left: the pack cadence in the adapter.
 - **Filter residency** — a segment's bloom is held in memory only
   while the segment is in the active tier; a history segment's and
   every block set's filter stays on disk and is probed there
@@ -398,7 +415,7 @@ The current gaps between Section 1 and the code, in one place:
 |---|---|---|
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
-| #47 | 1.4 pack cadence | Daily cross-shard tier not yet scheduled |
+| #47 | 1.4 pack cadence | Pack cadence not scheduled in the adapter (group filters and pin-not-lock done) |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.
