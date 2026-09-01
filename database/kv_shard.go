@@ -483,6 +483,9 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 	if !any {
 		return meta, false, nil
 	}
+	if packHook != nil {
+		packHook() // Tests: the pins are held, the build has not run
+	}
 	// A set covers every block since the previous set, and the first
 	// set covers every block there has been.  The segments cannot say
 	// which those are: a merged segment carries the height of the
@@ -520,6 +523,14 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 	wg.Wait()
 	return set.meta, true, err
 }
+
+// packHook, when set, is called by PackFinalized once every shard's
+// segments are PINNED and before the set is built, with no store lock
+// held.  It exists so that a test can hold a pack at its most
+// expensive moment -- the whole database pinned, a set being written
+// -- and show that the shards go on committing meanwhile.  Nil except
+// under test.
+var packHook func()
 
 // packDropWorkers is how many shards PackFinalized drops at once
 const packDropWorkers = 16

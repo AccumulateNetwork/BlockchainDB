@@ -366,9 +366,16 @@ run is still in place and discards its output if not.
   over its keys (`dayfilter.go`), written once when a later set closes
   the group out, held on disk and probed there; a group with no filter
   — the one being filled, or one whose filter could not be built — is
-  walked, which is correct and merely slower.  #47 tracks what is
-  left: the pack cadence in the adapter, and batching the build 50
-  shards at a time.
+  walked, which is correct and merely slower.
+- **A pack pins, it does not lock.**  Each shard's segments are pinned
+  and its list copied (`historyBelow`), the set is built by reading
+  those files, and only then does `DropBelow` remove them — so a pin
+  defers a file's DELETION and nothing else.  Shards go on taking
+  writes, sealing blocks and committing manifests with the whole
+  database pinned, which is what keeps the most expensive operation in
+  the store off the protocol path (#47).  `build` already streams
+  shard by shard, so nothing per-shard is held for the set's size
+  either.  #47 tracks what is left: the pack cadence in the adapter.
 - **Filter residency** — a segment's bloom is held in memory only
   while the segment is in the active tier; a history segment's and
   every block set's filter stays on disk and is probed there
@@ -408,7 +415,7 @@ The current gaps between Section 1 and the code, in one place:
 |---|---|---|
 | #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
-| #47 | 1.4 pack cadence | Pack cadence not scheduled in the adapter; build not batched (group filters done) |
+| #47 | 1.4 pack cadence | Pack cadence not scheduled in the adapter (group filters and pin-not-lock done) |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.

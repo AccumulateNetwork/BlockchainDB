@@ -599,3 +599,77 @@ func TestPutsRunConcurrentlyAcrossLayers(t *testing.T) {
 		require.Equal(t, []byte{byte(w), 0}, v)
 	}
 }
+
+// TestShardsCommitWhileAPackIsInFlight
+// A pack is the most expensive thing the database does: every shard's
+// history pinned, one set file written across all of them.  It must
+// not stop the shards while it runs -- that is the whole reason it
+// takes pins rather than locks (issue #47).
+//
+// A pin defers a file's DELETION and nothing else, so a shard can
+// accept writes, seal blocks and commit manifests with a pack holding
+// its segments; what it cannot do is remove the files the pack is
+// still reading, which is exactly the guarantee wanted.
+func TestShardsCommitWhileAPackIsInFlight(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	kvs, keys, values := packedFixture(t, dir, 82, 4, 60)
+	defer os.RemoveAll(dir)
+	ageOutShards(t, kvs, 4)
+	_, err := kvs.MergeFinalized(4)
+	require.NoError(t, err)
+
+	held := make(chan struct{})
+	release := make(chan struct{})
+	packHook = func() {
+		close(held)
+		<-release
+	}
+	defer func() { packHook = nil }()
+
+	done := make(chan error, 1)
+	go func() {
+		_, packed, err := kvs.PackFinalized(4)
+		if err == nil && !packed {
+			err = fmt.Errorf("nothing packed")
+		}
+		done <- err
+	}()
+
+	<-held // Every shard is pinned and the set is about to be written
+
+	// The shards must still take writes and close blocks
+	kr := NewFastRandom([]byte{83})
+	fresh := make([][32]byte, 20)
+	within(t, 5*time.Second, "writes during a pack", func() error {
+		for i := range fresh {
+			fresh[i] = kr.NextHash()
+			if err := kvs.PutPerm(fresh[i], []byte{byte(i)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	// A block above where the fixture aged to: sealing is what advances
+	// the shard set, and it must advance with a pack in flight
+	next := kvs.Shards[0].PermKV.BlockHeight() + 1
+	within(t, 5*time.Second, "a block boundary during a pack", func() error {
+		return kvs.SealBlock(next)
+	})
+	within(t, 5*time.Second, "reads during a pack", func() error {
+		_, err := kvs.GetPerm(fresh[0])
+		return err
+	})
+
+	close(release)
+	require.NoError(t, <-done, "the pack itself must finish")
+
+	// Nothing the pack was reading was lost, and the writes that ran
+	// beside it are there
+	checkEveryKey(t, kvs, keys, values, "after a pack that ran beside commits")
+	for i, k := range fresh {
+		v, err := kvs.GetPerm(k)
+		require.NoErrorf(t, err, "key written during the pack %d", i)
+		require.Equal(t, []byte{byte(i)}, v)
+	}
+	require.NoError(t, kvs.Close())
+}
