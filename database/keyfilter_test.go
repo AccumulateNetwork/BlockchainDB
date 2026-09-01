@@ -800,3 +800,62 @@ func TestFilterDemandSurvivesAReopen(t *testing.T) {
 		"the reported capacity is what a filter starting now would take")
 	require.NotEmpty(t, fill, "the live filters report what they hold")
 }
+
+// TestFilterRollDoesNotWalkColdStorage
+// A filter starting at S must hold every key from block S on, and a
+// packed set can reach into that range, so the build consults cold
+// storage.  But the sets are almost always entirely below S -- the
+// window only ever moves up -- and asking every set on every roll put
+// a cost that grows with the age of the chain under the store's
+// exclusive lock, on the block-commit path (spec 1.2, 1.6).  The
+// watermark settles it in one comparison.
+func TestFilterRollDoesNotWalkColdStorage(t *testing.T) {
+	dir := storeDir(t, "coldroll")
+	kvs, keys, values := packedFixture(t, dir, 0xc7, 100, 3)
+	defer kvs.Close()
+	_, packed, err := kvs.PackFinalized(40)
+	require.NoError(t, err)
+	require.True(t, packed, "there must be cold data for this to test anything")
+
+	shard := kvs.Shards[ShardIndex(keys[0][:])]
+	counted := &countingCold{inner: shard.PermKV.cold}
+	shard.PermKV.Mutex.Lock()
+	shard.PermKV.cold = counted
+	shard.PermKV.Mutex.Unlock()
+
+	// Roll the filters the way a block boundary does
+	for h := uint64(101); h <= 100+3*MinFilterBlocks; h++ {
+		require.NoError(t, kvs.SealBlock(h))
+	}
+	require.Zerof(t, counted.walks,
+		"a filter roll walked cold storage %d times; the sets are below the window", counted.walks)
+
+	// And the filters are still right: every packed key reads back, and
+	// an unwritten key is still absent
+	for i, k := range keys {
+		v, err := kvs.GetDeep(k)
+		require.NoErrorf(t, err, "key %d after the rolls", i)
+		require.Equal(t, values[k], v)
+	}
+	kr := NewFastRandom([]byte{0xc8})
+	for i := 0; i < 50; i++ {
+		_, err := kvs.GetDeep(kr.NextHash())
+		require.ErrorIsf(t, err, errNotFound, "unwritten key %d", i)
+	}
+}
+
+// countingCold counts the walks a filter build asks cold storage for
+type countingCold struct {
+	inner coldStore
+	walks int
+}
+
+func (c *countingCold) lookup(key [32]byte) ([]byte, bool, error) { return c.inner.lookup(key) }
+func (c *countingCold) forEach(fn func(key [32]byte, value []byte) error) error {
+	return c.inner.forEach(fn)
+}
+func (c *countingCold) watermark() (uint64, bool) { return c.inner.watermark() }
+func (c *countingCold) forEachKeySince(start uint64, fn func(key [32]byte)) error {
+	c.walks++
+	return c.inner.forEachKeySince(start, fn)
+}

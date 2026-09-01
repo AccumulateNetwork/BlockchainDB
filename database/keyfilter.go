@@ -492,7 +492,28 @@ func (s *SegmentStore) buildKeyFilter(start, expected uint64) (f *keyFilter, err
 	}
 	if s.cold == nil {
 		s.filtersLackCold = true
-	} else if err = s.cold.forEachKeySince(start, f.keys.Set); err != nil {
+		return f, nil
+	}
+	// The cold walk, and the reason it usually does not happen.
+	//
+	// A filter starting at S must hold every key from block S on, and a
+	// packed set can reach into that range -- a merged segment carries
+	// the block of its newest record, so one that BEGAN below the
+	// window can end inside it, and packing takes it.  Then those keys
+	// live only in the set, and a filter that never saw them would deny
+	// keys that exist.
+	//
+	// But the sets are almost always entirely below S, because the
+	// window only ever moves up.  Asking the watermark first settles
+	// that in one comparison; without it every roll scanned the whole
+	// set list, and any set reaching into the window read all of that
+	// shard's keys off disk -- both under the store's exclusive lock,
+	// on the block-commit path, at a cost that grew with the age of the
+	// chain (spec 1.2, 1.6).
+	if last, ok := s.cold.watermark(); !ok || last < start {
+		return f, nil // Nothing cold reaches this filter
+	}
+	if err = s.cold.forEachKeySince(start, f.keys.Set); err != nil {
 		return nil, err
 	}
 	return f, nil
