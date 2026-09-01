@@ -41,6 +41,9 @@ type KVShard struct {
 	// shard's merged segment (blockset.go).  Each shard's Perm layer
 	// consults it for keys its own segments no longer hold.
 	Sets *SetStore
+
+	// packMu serializes PackFinalized; see there
+	packMu sync.Mutex
 }
 
 // setDir is where the block-set files live
@@ -459,6 +462,18 @@ func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
 // pack is done, and whichever of the two lands first, the drop that
 // follows removes what the set holds.
 func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err error) {
+	// One pack at a time.  Every guard in here and below is a
+	// check-then-act on state another pack can change: two calls read
+	// the same watermark and pack the same segments into overlapping
+	// sets, and -- worse -- both build the same group's filter through
+	// one temporary path, interleaving two partial bitmaps into one
+	// file.  A bloom missing bits DENIES keys it holds, and a denial
+	// skips the group's sets without walking them, so that file is a
+	// permanent silent not-found that survives restart.  A filter may
+	// cost a walk; it may never do that (dayfilter.go).
+	k.packMu.Lock()
+	defer k.packMu.Unlock()
+
 	if newest, ok := k.Sets.Newest(); ok && height <= newest.Last+1 {
 		return meta, false, nil // Everything below is already packed
 	}

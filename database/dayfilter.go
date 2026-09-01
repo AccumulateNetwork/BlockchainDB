@@ -190,7 +190,11 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 	}
 
 	path := filepath.Join(directory, dayFilterName(group))
-	tmp := path + segTmpSuffix
+	// A temporary name of its own, not one derived from the group: two
+	// writers sharing a path interleave their bitmaps into one file,
+	// and a bloom missing bits denies keys it holds.  PackFinalized
+	// serializes packs, so this is the second lock on that door.
+	tmp := fmt.Sprintf("%s.%d%s", path, os.Getpid(), segTmpSuffix)
 	out, err := os.Create(tmp)
 	if err != nil {
 		return nil, err

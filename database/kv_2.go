@@ -304,7 +304,10 @@ func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
 // sealPermIfFull
 // Seal the Perm layer once its live tail reaches SealLimit keys, so
 // the unsealed tail (and the memory tracking it) stays bounded between
-// block boundaries.  The caller must hold the Mutex.
+// block boundaries.  The caller must hold the KV2 lock, shared or
+// exclusive: SealLimit is written only before the database is
+// published and under the exclusive lock in Open, and the layer
+// serializes its own seal.
 func (k *KV2) sealPermIfFull() (err error) {
 	if k.SealLimit <= 0 || k.PermKV.LiveCount() < k.SealLimit {
 		return nil
@@ -318,7 +321,8 @@ func (k *KV2) sealPermIfFull() (err error) {
 // rather than distinct keys.  A mutable layer leaves a record per
 // write, so a handful of hot keys rewritten in a loop would hold the
 // key count flat while the tail grew without bound -- and that tail is
-// replayed in full on every open.  The caller must hold the Mutex.
+// replayed in full on every open.  The caller must hold the KV2 lock,
+// shared or exclusive; see sealPermIfFull.
 func (k *KV2) sealDynaIfFull() (err error) {
 	if k.SealLimit <= 0 || k.DynaKV.LiveRecords() < uint64(k.SealLimit) {
 		return nil
