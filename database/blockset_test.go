@@ -583,3 +583,87 @@ func TestDayFiltersSkipWholeGroups(t *testing.T) {
 		require.Equal(t, values[k], v)
 	}
 }
+
+// TestPackSurvivesAFailedGroupFilter
+// Everything before the group filter is the pack's commit: the set is
+// fsynced, renamed, the directory synced, and the set is in the list.
+// The caller's next act is to drop the segments the set now holds.
+// Failing the pack for a filter that could not be written would abort
+// something that has already happened -- the shards would keep the
+// segments, and the retry would name a second set over the same blocks
+// with First above Last.
+func TestPackSurvivesAFailedGroupFilter(t *testing.T) {
+	dir := storeDir(t, "packfilterfail")
+	old := SetGroupBlocks
+	defer func() { setGroupBlocksForTest(old) }()
+	setGroupBlocksForTest(8)
+
+	kvs, keys, values := packedFixture(t, dir, 0xf1, 100, 3)
+	defer kvs.Close()
+	_, packed, err := kvs.PackFinalized(20)
+	require.NoError(t, err)
+	require.True(t, packed)
+
+	// Fail the FILTER and nothing else: a directory standing where the
+	// filter's file goes makes its rename fail while the set itself
+	// still writes normally.  (A read-only set directory would fail the
+	// set too, and a pack that cannot write its set SHOULD fail.)
+	blocked := filepath.Join(kvs.Sets.Directory, dayFilterName(0))
+	require.NoError(t, os.MkdirAll(filepath.Join(blocked, "in the way"), 0o755))
+
+	// The pack that closes out the first group must still succeed
+	_, packed, err = kvs.PackFinalized(40)
+	require.NoError(t, err, "a filter that cannot be written must not fail a committed pack")
+	require.True(t, packed)
+
+	require.NoError(t, os.RemoveAll(blocked))
+
+	// Every key is still readable, through sets with no group filter
+	for i, k := range keys {
+		v, err := kvs.GetDeep(k)
+		require.NoErrorf(t, err, "key %d after a pack whose filter failed", i)
+		require.Equal(t, values[k], v)
+	}
+
+	// And the next pack builds what the failed one could not
+	_, _, err = kvs.PackFinalized(60)
+	require.NoError(t, err)
+	require.NotEmpty(t, kvs.Sets.groupFilters(), "the next pack must build the missing filter")
+}
+
+// TestADayFilterRefusesADifferentGroupSize
+// SetGroupBlocks is not persisted, and a filter's file name records
+// only its group's index.  Reopening with a different size would
+// consult a filter built over one range while walking the sets of
+// another, and answer a definitive "not here" for keys it never saw --
+// the one answer a filter may never give.
+func TestADayFilterRefusesADifferentGroupSize(t *testing.T) {
+	dir := storeDir(t, "groupsize")
+	old := SetGroupBlocks
+	defer func() { setGroupBlocksForTest(old) }()
+	setGroupBlocksForTest(8)
+
+	kvs, keys, values := packedFixture(t, dir, 0xf2, 100, 3)
+	for _, upTo := range []uint64{20, 40, 60} {
+		_, _, err := kvs.PackFinalized(upTo)
+		require.NoError(t, err)
+	}
+	require.NotEmpty(t, kvs.Sets.groupFilters())
+	require.NoError(t, kvs.Close())
+
+	// Reopen with a different group size: the filters on disk describe
+	// ranges that are no longer their groups
+	setGroupBlocksForTest(32)
+	re, err := OpenKVShard(dir)
+	require.NoError(t, err, "a store must open even when its filters no longer match")
+	defer re.Close()
+	require.Empty(t, re.Sets.groupFilters(),
+		"a filter whose range is not its group must be refused, not consulted")
+
+	// And every key is still found, because the groups are walked
+	for i, k := range keys {
+		v, err := re.GetDeep(k)
+		require.NoErrorf(t, err, "key %d lost after the group size changed", i)
+		require.Equal(t, values[k], v)
+	}
+}

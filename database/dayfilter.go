@@ -50,23 +50,57 @@ const (
 	dayFilterPrefix = "day-"
 	dayFilterSuffix = ".flt"
 	dayFilterMagic  = 0x44415931 // "DAY1"
-	dayFilterHdr    = 40         // magic(4) version(4) first(8) last(8) keys(8) bloomBytes(8)... K in the tail
 	dayFilterVer    = 1
+
+	// dayFilterHdr: magic(4) version(4) groupBlocks(8) first(8)
+	// last(8) keys(8) bloomBytes(8) K(4).  The bloom follows.
+	dayFilterHdr = 52
 )
 
 // SetGroupBlocks is how many blocks one group of sets covers: 86,400,
 // a day at a block a second.  It is a block count rather than a
 // duration so that grouping is deterministic -- two nodes replaying
 // the same chain group the same sets, with no clock involved.
-var SetGroupBlocks uint64 = 86_400
+var SetGroupBlocks uint64 = DefaultSetGroupBlocks
+
+// DefaultSetGroupBlocks is what SetGroupBlocks starts at, and what a
+// zero falls back to
+const DefaultSetGroupBlocks = 86_400
+
+// DayFilterMaxBytes bounds one group filter's bitmap.
+//
+// The filter is sized for every key in its group, and a group is a
+// day: at 5,000 entries a block that is 432M keys, which at
+// BloomBitsPerKey would be ~648 MB held in one allocation while the
+// filter is built -- on the pack path, with every shard pinned.  Spec
+// 1.2 does not allow that, and a group filter is an accelerator, not
+// a record of anything.
+//
+// Past the bound the filter is built at the bound instead, which
+// costs false POSITIVES -- a group walked that need not have been --
+// and never a false negative.  A group whose keys need more than this
+// is a group whose filter would skip nothing anyway.
+var DayFilterMaxBytes uint64 = 32 << 20
 
 // setGroupBlocksForTest sets the group size; tests move the size
 // rather than the clock, because there is no clock to move.
 func setGroupBlocksForTest(n uint64) { SetGroupBlocks = n }
 
+// groupBlocks is SetGroupBlocks, never zero.  It is an exported var
+// with no checked setter, and setGroup divides by it -- a zero would
+// panic on every deep read and every pack, which is a long way from
+// where it was set.  Falling back to the default is the loud-enough
+// answer for a tunable that only a program can get wrong.
+func groupBlocks() uint64 {
+	if SetGroupBlocks == 0 {
+		return DefaultSetGroupBlocks
+	}
+	return SetGroupBlocks
+}
+
 // setGroup is the group a block belongs to: groups tile the block
 // space from 0, so a set's group is decided by its first block alone.
-func setGroup(block uint64) uint64 { return block / SetGroupBlocks }
+func setGroup(block uint64) uint64 { return block / groupBlocks() }
 
 // dayFilter is one finished group's filter, held on disk and probed
 // there -- the same residency rule the segments' filters follow
@@ -135,7 +169,14 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 			last = s.meta.Last
 		}
 	}
+	// Sized for the group's keys, but never past the bound: see
+	// DayFilterMaxBytes.  A filter over its design point has a higher
+	// false-positive rate, which costs a walk, and that is the failure
+	// this side may have.
 	bloom := NewBloomSizedForKeys(keys, 3)
+	if DayFilterMaxBytes > 0 && bloom.NumBytes > DayFilterMaxBytes {
+		bloom = newBloomSized(DayFilterMaxBytes*8/BloomBitsPerKey, BloomBitsPerKey, 3)
+	}
 	for _, s := range sets {
 		for shard := 0; shard < NumShards; shard++ {
 			err = s.forEachKey(shard, func(key [32]byte, _ *DBBKey) error {
@@ -163,16 +204,19 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 	var hdr [dayFilterHdr]byte
 	binary.BigEndian.PutUint32(hdr[:], dayFilterMagic)
 	binary.BigEndian.PutUint32(hdr[4:], dayFilterVer)
-	binary.BigEndian.PutUint64(hdr[8:], first)
-	binary.BigEndian.PutUint64(hdr[16:], last)
-	binary.BigEndian.PutUint64(hdr[24:], keys)
-	binary.BigEndian.PutUint64(hdr[32:], bloom.NumBytes)
+	// The group size the filter was built under.  Which sets belong to
+	// a group is derived from it, and it is not persisted anywhere
+	// else, so a filter that does not carry it could be consulted for
+	// sets it never saw after the size changed -- and answer a
+	// definitive "not here" for keys it never had, the one answer a
+	// filter may never give.
+	binary.BigEndian.PutUint64(hdr[8:], SetGroupBlocks)
+	binary.BigEndian.PutUint64(hdr[16:], first)
+	binary.BigEndian.PutUint64(hdr[24:], last)
+	binary.BigEndian.PutUint64(hdr[32:], keys)
+	binary.BigEndian.PutUint64(hdr[40:], bloom.NumBytes)
+	binary.BigEndian.PutUint32(hdr[48:], uint32(bloom.K))
 	if _, err = out.Write(hdr[:]); err != nil {
-		return nil, err
-	}
-	var kb [4]byte
-	binary.BigEndian.PutUint32(kb[:], uint32(bloom.K))
-	if _, err = out.Write(kb[:]); err != nil {
 		return nil, err
 	}
 	if _, err = out.Write(bloom.Map); err != nil {
@@ -193,7 +237,7 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 		return nil, err
 	}
 	return &dayFilter{group: group, first: first, last: last, path: path,
-		bloomOff: dayFilterHdr + 4, bloomBytes: bloom.NumBytes, bloomK: int(bloom.K)}, nil
+		bloomOff: dayFilterHdr, bloomBytes: bloom.NumBytes, bloomK: bloom.K}, nil
 }
 
 // openDayFilter reads a group filter's header.  The bloom stays on
@@ -204,7 +248,7 @@ func openDayFilter(path string) (f *dayFilter, err error) {
 		return nil, err
 	}
 	defer file.Close()
-	var hdr [dayFilterHdr + 4]byte
+	var hdr [dayFilterHdr]byte
 	if _, err = file.ReadAt(hdr[:], 0); err != nil {
 		return nil, err
 	}
@@ -219,14 +263,36 @@ func openDayFilter(path string) (f *dayFilter, err error) {
 	if _, err = fmt.Sscanf(name, "%d", &group); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	// Which sets belong to a group is derived from the group size, so a
+	// filter built under a different one may not cover the sets this
+	// store would consult it for -- and would then answer "not here"
+	// for keys it never saw, the one answer a filter may never give.
+	// It is refused, and its group is walked instead.
+	if size := binary.BigEndian.Uint64(hdr[8:]); size != SetGroupBlocks {
+		return nil, fmt.Errorf("%s was built at %d blocks to a group; this store uses %d",
+			path, size, SetGroupBlocks)
+	}
+	// A bloom size the file cannot hold is a corrupt header, and a huge
+	// one is worse than useless: ByteMask computes `v % (NumBytes<<8)`,
+	// so a value at or above 2^56 wraps the modulus to zero and
+	// divides by it.  Refuse it; the group is walked.
+	bloomBytes := binary.BigEndian.Uint64(hdr[40:])
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if bloomBytes > 1<<32 || int64(bloomBytes) != info.Size()-dayFilterHdr {
+		return nil, fmt.Errorf("%s claims a %d-byte filter in a %d-byte file",
+			path, bloomBytes, info.Size())
+	}
 	return &dayFilter{
 		group:      group,
-		first:      binary.BigEndian.Uint64(hdr[8:]),
-		last:       binary.BigEndian.Uint64(hdr[16:]),
+		first:      binary.BigEndian.Uint64(hdr[16:]),
+		last:       binary.BigEndian.Uint64(hdr[24:]),
 		path:       path,
-		bloomOff:   dayFilterHdr + 4,
-		bloomBytes: binary.BigEndian.Uint64(hdr[32:]),
-		bloomK:     int(binary.BigEndian.Uint32(hdr[dayFilterHdr:])),
+		bloomOff:   dayFilterHdr,
+		bloomBytes: bloomBytes,
+		bloomK:     int(binary.BigEndian.Uint32(hdr[48:])),
 	}, nil
 }
 
@@ -247,7 +313,11 @@ func loadDayFilters(directory string) (filters []*dayFilter, err error) {
 		}
 		f, err := openDayFilter(filepath.Join(directory, name))
 		if err != nil {
-			return nil, err
+			// A filter that cannot be trusted is not a broken store:
+			// its group is walked, which is what a group without a
+			// filter always was.  Keeping it would risk the one answer
+			// a filter may never give.
+			continue
 		}
 		filters = append(filters, f)
 	}

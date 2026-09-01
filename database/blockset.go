@@ -405,9 +405,19 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	// This set may have closed out the group before it: nothing can
 	// join a group once a set sits above it, so its filter can be
 	// built, once, and never touched again (issue #47).
-	if err = ss.closeFinishedGroups(setGroup(first)); err != nil {
-		return nil, err
-	}
+	//
+	// The error is DELIBERATELY dropped.  Everything above this line is
+	// the commit -- the set is fsynced, renamed, the directory synced,
+	// and the set is in the list -- and the caller's next act is to
+	// drop the segments the set now holds.  Failing here would abort a
+	// pack that has already happened: the shards would keep segments
+	// the committed set holds, and the retry would compute a new
+	// `first` from the set that landed while `last` stayed where it
+	// was, naming a second set file over the same blocks with First
+	// above Last.  A missing group filter costs a walk of that group's
+	// sets on a deep read, which is what happened before the filters
+	// existed, and the next pack builds it.
+	_ = ss.closeFinishedGroups(setGroup(first))
 	return set, nil
 }
 
@@ -424,16 +434,41 @@ func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 	for _, d := range ss.days {
 		have[d.group] = true
 	}
-	groups := map[uint64][]*blockSet{}
+	// The OLDEST group still missing a filter, and only that one.
+	//
+	// This runs inside PackFinalized's pin scope: every shard is
+	// pinned, so no file in any of the 512 shards can be reclaimed
+	// while it works, and it reads every key of every set in the
+	// groups it builds.  Building all of them in one call makes that
+	// unbounded -- a store upgraded to this build has no filters at
+	// all, so the first pack would read its entire history with the
+	// whole database pinned.  One group per pack is bounded by a
+	// group, and the groups are finite and only ever get built.
+	var oldest uint64
+	var sets []*blockSet
+	found := false
 	for _, s := range ss.sets {
 		g := setGroup(s.meta.First)
-		if g < current && !have[g] {
-			groups[g] = append(groups[g], s)
+		if g >= current || have[g] {
+			continue
+		}
+		if !found || g < oldest {
+			oldest, found = g, true
+		}
+	}
+	if found {
+		for _, s := range ss.sets {
+			if setGroup(s.meta.First) == oldest {
+				sets = append(sets, s)
+			}
 		}
 	}
 	ss.Mutex.Unlock()
+	if !found {
+		return nil
+	}
 
-	for g, sets := range groups {
+	for _, g := range []uint64{oldest} {
 		f, err := writeDayFilter(ss.Directory, g, sets)
 		if err != nil {
 			return err
@@ -441,9 +476,18 @@ func (ss *SetStore) closeFinishedGroups(current uint64) (err error) {
 		if f == nil {
 			continue
 		}
+		// Copy on write: a reader walks the slice groupFilters handed
+		// it without the lock, and appending in place then sorting
+		// would reorder the array underneath that walk whenever the
+		// append does not reallocate.  The sets list gets away with
+		// append alone because it only ever grows at the end and is
+		// never reordered; this one is sorted.
 		ss.Mutex.Lock()
-		ss.days = append(ss.days, f)
-		sort.Slice(ss.days, func(i, j int) bool { return ss.days[i].group < ss.days[j].group })
+		days := make([]*dayFilter, len(ss.days), len(ss.days)+1)
+		copy(days, ss.days)
+		days = append(days, f)
+		sort.Slice(days, func(i, j int) bool { return days[i].group < days[j].group })
+		ss.days = days
 		ss.Mutex.Unlock()
 	}
 	return nil
