@@ -374,6 +374,12 @@ run is still in place and discards its output if not.
   the group out, held on disk and probed there; a group with no filter
   — the one being filled, or one whose filter could not be built — is
   walked, which is correct and merely slower.
+- **A cold read takes no lock.**  The set store publishes its sets and
+  its group filters as one immutable snapshot, replaced wholesale, so
+  a deep read loads it atomically and walks it — and sees a filter
+  only alongside the sets it was built from.  Reading two slice
+  headers under one exclusive global mutex put every cold read of all
+  512 shards through the same lock.
 - **A pack pins, it does not lock.**  Each shard's segments are pinned
   and its list copied (`historyBelow`), the set is built by reading
   those files, and only then does `DropBelow` remove them — so a pin
