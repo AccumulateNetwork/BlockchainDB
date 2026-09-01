@@ -673,3 +673,53 @@ func TestShardsCommitWhileAPackIsInFlight(t *testing.T) {
 	}
 	require.NoError(t, kvs.Close())
 }
+
+// TestConcurrentPacksDoNotCorruptAGroupFilter
+// Every guard in PackFinalized is a check-then-act on state another
+// pack can change.  Two calls read the same watermark, pack the same
+// segments into overlapping sets, and build the same group's filter --
+// and a filter built by two interleaved writers has bits missing.  A
+// bloom missing bits DENIES keys it holds, and a denial skips the
+// group's sets without walking them, so such a file is a permanent
+// silent not-found that survives restart.  Packs are serialized
+// (issue #47).
+func TestConcurrentPacksDoNotCorruptAGroupFilter(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	old := SetGroupBlocks
+	defer func() { setGroupBlocksForTest(old) }()
+	setGroupBlocksForTest(8)
+
+	kvs, keys, values := packedFixture(t, dir, 84, 100, 3)
+	defer os.RemoveAll(dir)
+	defer kvs.Close()
+
+	// Several packs at once, all racing for the same watermarks
+	var wg sync.WaitGroup
+	for _, upTo := range []uint64{20, 20, 40, 40, 60, 60} {
+		wg.Add(1)
+		go func(h uint64) {
+			defer wg.Done()
+			_, _, _ = kvs.PackFinalized(h) // Losers report nothing packed
+		}(upTo)
+	}
+	wg.Wait()
+
+	// The sets must be in block order and must not overlap: the group
+	// walk depends on a group's sets being contiguous
+	sets := kvs.Sets.Sets()
+	for i := 1; i < len(sets); i++ {
+		require.Greaterf(t, sets[i].First, sets[i-1].Last,
+			"set %d (%d..%d) overlaps set %d (%d..%d)",
+			i, sets[i].First, sets[i].Last, i-1, sets[i-1].First, sets[i-1].Last)
+	}
+	for i, s := range sets {
+		require.LessOrEqualf(t, s.First, s.Last, "set %d has First above Last (%d..%d)", i, s.First, s.Last)
+	}
+
+	// And no key was lost behind a filter built by two writers
+	for i, k := range keys {
+		v, err := kvs.GetDeep(k)
+		require.NoErrorf(t, err, "key %d lost after concurrent packs", i)
+		require.Equal(t, values[k], v)
+	}
+}
