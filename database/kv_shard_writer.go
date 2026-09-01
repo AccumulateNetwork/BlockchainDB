@@ -53,13 +53,13 @@ type ShardWriter struct {
 // NewShardWriter
 // Create a ShardWriter over this KVShard with the given number of
 // worker goroutines and per-worker queue depth.  workers is clamped to
-// [1, NumShards]; queueDepth to a minimum of 1.
+// [1, the database's shard count]; queueDepth to a minimum of 1.
 func (k *KVShard) NewShardWriter(workers, queueDepth int) *ShardWriter {
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > NumShards {
-		workers = NumShards
+	if n := len(k.Shards); workers > n {
+		workers = n
 	}
 	if queueDepth < 1 {
 		queueDepth = 1

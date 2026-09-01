@@ -178,7 +178,7 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 		bloom = newBloomSized(DayFilterMaxBytes*8/BloomBitsPerKey, BloomBitsPerKey, 3)
 	}
 	for _, s := range sets {
-		for shard := 0; shard < NumShards; shard++ {
+		for shard := 0; shard < s.shards; shard++ {
 			err = s.forEachKey(shard, func(key [32]byte, _ *DBBKey) error {
 				bloom.Set(key)
 				return nil
