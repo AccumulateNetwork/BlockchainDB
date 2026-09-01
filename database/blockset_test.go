@@ -674,3 +674,65 @@ func TestADayFilterRefusesADifferentGroupSize(t *testing.T) {
 		require.Equal(t, values[k], v)
 	}
 }
+
+// TestRecoveryDropsASegmentTheSetAlreadyHolds
+// DropBelow removes a packed segment from history.  One can be in the
+// ACTIVE tier instead: a segment whose unlink a crash interrupted is
+// named by no manifest and above nothing, so recoverOrphans adopts it
+// as an interrupted seal, and the block height it carries then puts it
+// inside the window, where the drop does not reach.  The shard
+// resurrects a segment the set already holds (issue #80).
+//
+// recoverOrphans cannot settle this itself: it runs before a cold
+// store is attached, so its watermark rule has nothing to ask.
+func TestRecoveryDropsASegmentTheSetAlreadyHolds(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), t.Name())
+	kvs, keys, values := packedFixture(t, dir, 0xb4, 4, 60)
+	defer os.RemoveAll(dir)
+	// Age past every block and pack ALL of them, so the shards keep no
+	// segment at all.  That is what makes the restored file an orphan
+	// above nothing: with any segment left, recoverOrphans sees it as
+	// superseded by a newer one and deletes it on the old rule.
+	ageOutShards(t, kvs, 5)
+	_, err := kvs.MergeFinalized(5)
+	require.NoError(t, err)
+
+	// Keep a copy of a segment about to be packed away, so it can be
+	// put back the way an interrupted unlink leaves one
+	shardIdx := kvs.ShardIndex(keys[0][:])
+	segs := kvs.Shards[shardIdx].PermKV.sealedSegments()
+	require.NotEmpty(t, segs, "the shard must hold a segment to pack")
+	dataPath, indexPath := segs[0].dataPath, segs[0].indexPath
+	data, err := os.ReadFile(dataPath)
+	require.NoError(t, err)
+	index, err := os.ReadFile(indexPath)
+	require.NoError(t, err)
+
+	_, packed, err := kvs.PackFinalized(5)
+	require.NoError(t, err)
+	require.True(t, packed)
+	require.Empty(t, kvs.Shards[shardIdx].PermKV.sealedSegments(),
+		"the shard must keep no segment, or the old superseded rule settles this")
+	require.NoError(t, kvs.Close())
+
+	// The crash: the manifest commit landed, the unlink did not
+	require.NoError(t, os.WriteFile(dataPath, data, 0o644))
+	require.NoError(t, os.WriteFile(indexPath, index, 0o644))
+
+	reopened, err := OpenKVShard(dir)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	_, err = os.Stat(dataPath)
+	require.Truef(t, os.IsNotExist(err),
+		"%s was adopted back; the set already holds every key in it", filepath.Base(dataPath))
+	require.Empty(t, reopened.Shards[shardIdx].PermKV.sealedSegments(),
+		"the shard must serve those keys from the set, not from a resurrected segment")
+
+	// And nothing was lost with it: the set answers for those keys
+	for i, k := range keys {
+		v, err := reopened.GetDeep(k)
+		require.NoErrorf(t, err, "key %d after the drop", i)
+		require.Equal(t, values[k], v)
+	}
+}

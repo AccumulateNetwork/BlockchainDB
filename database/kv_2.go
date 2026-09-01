@@ -231,7 +231,14 @@ func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
 }
 
 // GetPerm
-// Get a k/v from the PermKV db.  Doesn't check the DynaKV.
+// Get a k/v from the PermKV db, from its WINDOW.  Doesn't check the
+// DynaKV.
+//
+// Windowed, like every protocol read of the permanent layer (spec
+// 1.3): a permanent record older than the last N to 2N blocks reads
+// as absent here.  Nothing in the name says so, which is why it is
+// said here -- ask GetPermDeep for the permanent copy of an old
+// record.  GetDeep is not that question: it resolves Dyna first.
 func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
@@ -240,6 +247,17 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 		return nil, err
 	}
 	return value, nil
+}
+
+// GetPermDeep
+// Get a k/v from the PermKV db wherever it is, history and packed sets
+// included.  The permanent layer's own deep read: GetDeep answers the
+// database's question, Dyna first, which is the wrong one when what
+// is wanted is what the permanent layer holds.
+func (k *KV2) GetPermDeep(key [32]byte) (value []byte, err error) {
+	k.Mutex.RLock()
+	defer k.Mutex.RUnlock()
+	return k.PermKV.GetDeep(key)
 }
 
 // Get
@@ -251,6 +269,15 @@ func (k *KV2) GetPerm(key [32]byte) (value []byte, err error) {
 // its window; permanent data below it is reached explicitly, by
 // GetDeep, because that is the layer that grows without limit and the
 // per-miss history probing was costing 23% of a validator's CPU.
+//
+// It reads the two layers under a SHARED lock (issue #66), so it is
+// not atomic against a concurrent Put across them: a Put can install
+// the dynamic value between this call's two lookups, and the
+// permanent one is returned.  The result is still a value that was
+// current at some point during the call -- equivalent to the Get
+// having happened before the Put -- but the exclusive lock used to
+// serialize the two outright, and callers that need that must
+// serialize themselves.
 func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()

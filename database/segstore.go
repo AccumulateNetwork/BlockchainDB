@@ -1390,16 +1390,20 @@ func (s *SegmentStore) recoverOrphans(all []*segment) (segs []*segment, adopted 
 			continue
 		}
 		// A shard whose segments were packed into a block set commits a
-		// manifest naming none of them; a crash before the unlinks
-		// leaves files above nothing at all.  The set holds those keys
-		// now, so the cold watermark settles them as the manifest would
-		// have (issue #52).
-		if s.cold != nil {
-			if last, ok := s.cold.watermark(); ok && height <= last {
-				drop(fmt.Sprintf("recoverOrphans-packed(watermark=%d)", last))
-				continue
-			}
-		}
+		// manifest naming none of them, and a crash before the unlinks
+		// leaves files above nothing at all -- so the rules above do
+		// not settle them and they are adopted.
+		//
+		// Nothing is done about that HERE, deliberately.  Recovery runs
+		// before a cold store is attached (OpenKVShard opens the shards
+		// first), so this cannot ask what the sets hold; a check
+		// against s.cold would be a branch that never runs, implying a
+		// guarantee it does not provide.  What settles them is the drop
+		// the shard set performs once its sets ARE attached, and the
+		// adopted segment is in history by then, because the shared
+		// block record has already put the store's block far above it
+		// (issue #80).  TestRecoveryDropsASegmentTheSetAlreadyHolds
+		// pins the outcome rather than the mechanism.
 		hash, count, err := s.identify(path)
 		if err != nil {
 			return all, 0, err
