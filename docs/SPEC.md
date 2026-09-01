@@ -135,7 +135,9 @@ window (MinFilterBlocks).
   day at a block a second) and each FINISHED group carries a filter
   over every key in it, so a deep search skips a whole group in one
   probe instead of walking its sets — ~451 probes after a year rather
-  than ~31,500, and the walk stops tracking chain age.  That deep
+  than ~31,500.  What stops growing is the PROBING; the walk still
+  visits the set list, which costs no I/O and is off the protocol
+  path.  That deep
   search is API-level work, not protocol work (#47).
 - Perm accumulates **no garbage** — values are immutable — so the perm
   layer is never compacted, only merged and packed.
@@ -149,8 +151,10 @@ window (MinFilterBlocks).
   newer segments over older, and within a merge the newest input copy
   of a key is the one that survives.
 - The dynamic layer's total size must converge to O(live keys): a
-  bounded key set rewritten forever may not grow the disk forever
-  (#65 is the open violation).
+  bounded key set rewritten forever may not grow the disk forever.
+  A segment that grows past one pass's budget would otherwise freeze
+  with its garbage in it, so a deeper fold is allowed when the
+  ordinary pass has nothing to do (#65, 2.7).
 
 ### 1.6 Tiers and locks
 
@@ -246,7 +250,7 @@ Segment files: `seg-<height>-<seq>.dat` (records: 40-byte header —
 
 ### 2.2 The protocol path (1.2, 1.3)
 
-- `SegmentStore.Put` → `putUnlessPresent` (`segstore.go:1687`).  A
+- `SegmentStore.Put` → `putUnlessPresent` (`segstore.go:1897`).  A
   mutable store appends blind.  An immutable store probes the rolling
   filters: **not in the window → write immediately** (the common case,
   O(1)); a filter hit walks the active tier under the Mutex, and only
@@ -254,7 +258,7 @@ Segment files: `seg-<height>-<seq>.dat` (records: 40-byte header —
   under its own lock, retakes, and re-checks by epoch (1.6).  Same
   value is an idempotent no-op; a different value is `ErrImmutable`
   (`KV2.Put` routes that key to Dyna instead).
-- `Get` (`segstore.go:1537`): live map → filter probe → active
+- `Get` (`segstore.go:1710`): live map → filter probe → active
   segments newest-first (resident bloom, then on-disk binary search)
   → history newest-first → packed sets.  The filters settle only the
   window; a miss below it walks blocks by their own filters (1.4).
@@ -273,7 +277,7 @@ Segment files: `seg-<height>-<seq>.dat` (records: 40-byte header —
 
 ### 2.3 Seal (1.7, 1.8)
 
-`seal` (`segstore.go:2112`): mint `(height, seq)` via `nextKeyAt`,
+`seal` (`segstore.go:2322`): mint `(height, seq)` via `nextKeyAt`,
 then `promoteLiveFile` — flush, finish the header, fsync, and
 **hard-link** the live file to its segment name.  No record is copied
 (#60); a shadowed tail keeps its dead bytes and compaction reclaims
@@ -345,10 +349,13 @@ run is still in place and discards its output if not.
   replace any existing file — a taken name skips the pass, audibly
   (#61).  A segment that grows past the budget would otherwise freeze
   for good, so when the ordinary pass has nothing to do one deeper
-  fold is allowed, bounded by `CompactDeepPassRecords`: it folds one
-  pair, still only if the ratio says it is worth it, and the frozen
-  segments halve with each one, so the layer converges to its live key
-  set instead of holding frozen garbage forever (#65).
+  fold is allowed, bounded by `CompactDeepPassRecords`.  It is the
+  same choice under a larger budget — a suffix where one fits, a pair
+  where it does not — still gated by the ratio, and each fold leaves
+  one segment where there were several, so the layer converges to its
+  live key set instead of holding frozen garbage forever.  Once
+  segments exceed half the ordinary budget the deep pass is what runs
+  on every call, not a rarity, and its cost is the larger bound (#65).
 - **Perm window merge** — `MergeBelow` → `concatSegments`: byte-
   verbatim body copies, indexes shifted by their body's base, one
   identity after the run's newest (1.4).  The run is chosen by the
@@ -387,7 +394,7 @@ run is still in place and discards its output if not.
 
 ### 2.8 Crash recovery (1.8)
 
-`load()` (`segstore.go:773`): read both manifests (fail-fast if a
+`load()` (`segstore.go:860`): read both manifests (fail-fast if a
 named file is missing), open the union, sweep orphans
 (`recoverOrphans`), derive tiers from the block height and window
 (1.6), rebuild handoff state from what each manifest names, rewrite
