@@ -25,9 +25,20 @@ import (
 //
 // Sharding pays where a single store's lock IS the bottleneck, which
 // is a much higher rate than that.  So this is a number to set from
-// the rate a database will actually see, and the default is the one
-// the store was built with rather than a recommendation.
-const DefaultNumShards = 512
+// the rate a database will actually see (NewKVShardN).
+//
+// The default is EIGHT.  From one shard to eight the median commit is
+// flat within noise -- 6.8, 7.4, 7.6 and 8.1 ms -- and eight has the
+// tightest tail of anything measured, a p99 of 13.2 ms against 23-30
+// for a single store, which is what a little parallelism buys: a
+// writer waits behind fewer others.  Above sixteen every axis rises
+// together.  The differences at the low end are small enough to be
+// other variables in the test rather than the shard count, and
+// separating them would take hours of running; eight is chosen for
+// the tail, and because it leaves room to grow into.
+//
+// See docs/design/shard-count.md for the measurement.
+const DefaultNumShards = 8
 
 // indexShards is the byte offset of the 32-bit field in a key that
 // selects its shard

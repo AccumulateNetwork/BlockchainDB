@@ -117,12 +117,21 @@ the partition. It was not the dominant cost here — a control run at
 boundary seals every shard regardless — but it is the wrong number by
 construction.
 
+## The decision
+
+**Eight shards, by default.** The differences from one to eight are
+small enough to be other variables in the test rather than the shard
+count, and separating them would take hours of running rather than
+minutes; eight is chosen for the tail — a p99 of 13.2 ms against
+23–30 for a single store — and because it leaves room to grow into
+without reaching the range where the costs start.
+
 ## What this changed
 
-`NumShards` was a compile-time constant. It is now
-`DefaultNumShards`, with `NewKVShardN` taking the count, because the
-right value is a property of a deployment's rate rather than of the
-build.
+`NumShards` was a compile-time constant of 512. It is now
+`DefaultNumShards`, eight, with `NewKVShardN` taking the count,
+because the right value is a property of a deployment's rate rather
+than of the build.
 
 The count is fixed for the life of a database: keys route by hash
 modulo it, so reopening with a different one sends every key to a
