@@ -205,7 +205,9 @@ window (MinFilterBlocks).
 
 ### 1.9 Sharding
 
-- Keys route by hash to **512 shards** for parallel ingest.  **Both
+- Keys route by hash to a **configurable number of shards** for
+  parallel ingest — eight by default, set from the rate a database
+  will see (docs/design/shard-count.md), and fixed for its life.  **Both
   layers shard** — perm ingest needs the parallelism as much as dyna;
   content-addressed keys give near-perfect balance.  (The retired idea
   of un-sharding perm valued only compaction; see #62.)

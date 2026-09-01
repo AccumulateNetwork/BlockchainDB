@@ -194,7 +194,7 @@ func (k *KVShard) ImportBlock(blockDir string) (count uint64, err error) {
 
 	// Verify everything before adopting anything
 	for _, s := range m.Segments {
-		if s.Shard < 0 || s.Shard >= NumShards {
+		if s.Shard < 0 || s.Shard >= len(k.Shards) {
 			return 0, fmt.Errorf("manifest references invalid shard %d", s.Shard)
 		}
 		if err = VerifySegmentFile(filepath.Join(blockDir, s.File), s.Hash); err != nil {

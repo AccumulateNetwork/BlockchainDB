@@ -104,7 +104,12 @@ type setEntry struct {
 type blockSet struct {
 	meta SetMeta
 	path string
-	dir  []setEntry // One per shard
+
+	// shards is how many the set was written for, from its header: a
+	// database's count is fixed at creation, so this is a property of
+	// the file, not of the build reading it.
+	shards int
+	dir    []setEntry // One per shard
 
 	// The set's filter stays ON DISK.  A set covers a whole finished
 	// period -- every key of every shard -- so its filter is the
@@ -279,8 +284,12 @@ func setFileName(first, last uint64) string {
 // -- shards[i] is shard i's segments, oldest first, possibly none --
 // and commit it.  first and last are the blocks it covers.
 func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSet, err error) {
-	if len(shards) != NumShards {
-		return nil, fmt.Errorf("block set needs %d shards, given %d", NumShards, len(shards))
+	// The set is written for the shard count it is given, and records
+	// it: a database's count is fixed at creation, and a set built for
+	// one count is unreadable under another (openBlockSet).
+	nShards := len(shards)
+	if nShards == 0 {
+		return nil, fmt.Errorf("block set needs at least one shard")
 	}
 	if newest, ok := ss.Newest(); ok && first <= newest.Last {
 		return nil, fmt.Errorf("block set %d..%d overlaps the newest set, %d..%d",
@@ -297,9 +306,9 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	// Pass one: lay out every shard's bodies and count its distinct keys,
 	// so the directory, the index region and the bloom can all be sized
 	// before anything is written.  Nothing per key is held (issue #59).
-	dir := make([]setEntry, NumShards)
-	sizes := make([][]int64, NumShards)
-	bases := make([][]uint64, NumShards)
+	dir := make([]setEntry, nShards)
+	sizes := make([][]int64, nShards)
+	bases := make([][]uint64, nShards)
 	var keys, bodies uint64
 	for i, segs := range shards {
 		if len(segs) == 0 {
@@ -318,10 +327,10 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 		bodies += size
 	}
 	bloom := NewBloomSizedForKeys(keys, 3)
-	dataStart := uint64(setHdrSize) + NumShards*setDirEntSize + keys*DBKeyFullSize + bloom.NumBytes
+	dataStart := uint64(setHdrSize) + uint64(nShards)*setDirEntSize + keys*DBKeyFullSize + bloom.NumBytes
 
-	dirBytes := make([]byte, 0, NumShards*setDirEntSize)
-	indexOff := uint64(setHdrSize) + NumShards*setDirEntSize
+	dirBytes := make([]byte, 0, nShards*setDirEntSize)
+	indexOff := uint64(setHdrSize) + uint64(nShards)*setDirEntSize
 	for i := range dir {
 		if dir[i].count > 0 {
 			dir[i].dataOff += dataStart
@@ -337,7 +346,7 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	var header [setHdrSize]byte
 	binary.BigEndian.PutUint32(header[0:], setMagic)
 	binary.BigEndian.PutUint32(header[4:], setVersion)
-	binary.BigEndian.PutUint32(header[8:], NumShards)
+	binary.BigEndian.PutUint32(header[8:], uint32(nShards))
 	binary.BigEndian.PutUint32(header[12:], uint32(bloom.K))
 	binary.BigEndian.PutUint64(header[16:], first)
 	binary.BigEndian.PutUint64(header[24:], last)
@@ -420,12 +429,13 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	}
 
 	set = &blockSet{
-		meta: SetMeta{First: first, Last: last, File: name, Keys: keys},
-		path: path,
-		dir:  dir,
+		meta:   SetMeta{First: first, Last: last, File: name, Keys: keys},
+		path:   path,
+		shards: nShards,
+		dir:    dir,
 		// The filter this build just wrote is left on disk with the
 		// rest of the set, and probed there (issue #64)
-		bloomOff:   int64(setHdrSize) + NumShards*setDirEntSize + int64(keys)*DBKeyFullSize,
+		bloomOff:   int64(setHdrSize) + int64(nShards)*setDirEntSize + int64(keys)*DBKeyFullSize,
 		bloomBytes: bloom.NumBytes,
 		bloomK:     bloom.K,
 	}
@@ -552,10 +562,20 @@ func openBlockSet(path string) (set *blockSet, err error) {
 	if v := binary.BigEndian.Uint32(header[4:]); v != setVersion {
 		return nil, fmt.Errorf("%s is block set format version %d; this build reads version %d", path, v, setVersion)
 	}
-	if shards := binary.BigEndian.Uint32(header[8:]); shards != NumShards {
-		return nil, fmt.Errorf("%s was written for %d shards; this build has %d", path, shards, NumShards)
+	// The shard count comes from the file, so the file has to be able
+	// to hold what it claims: the directory alone is 32 bytes a shard,
+	// and a corrupt field would otherwise be believed and allocated
+	// from.
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-	set = &blockSet{path: path}
+	nShards := int(binary.BigEndian.Uint32(header[8:]))
+	if nShards <= 0 || int64(setHdrSize)+int64(nShards)*setDirEntSize > info.Size() {
+		return nil, fmt.Errorf("%s claims %d shards, which a %d-byte file cannot hold",
+			path, nShards, info.Size())
+	}
+	set = &blockSet{path: path, shards: nShards}
 	set.meta.File = filepath.Base(path)
 	set.meta.First = binary.BigEndian.Uint64(header[16:])
 	set.meta.Last = binary.BigEndian.Uint64(header[24:])
@@ -566,11 +586,11 @@ func openBlockSet(path string) (set *blockSet, err error) {
 		return nil, fmt.Errorf("%s has no bloom filter", path)
 	}
 
-	raw := make([]byte, NumShards*setDirEntSize)
+	raw := make([]byte, nShards*setDirEntSize)
 	if _, err = f.ReadAt(raw, setHdrSize); err != nil {
 		return nil, err
 	}
-	set.dir = make([]setEntry, NumShards)
+	set.dir = make([]setEntry, nShards)
 	for i := range set.dir {
 		e := raw[i*setDirEntSize:]
 		set.dir[i] = setEntry{
@@ -582,7 +602,7 @@ func openBlockSet(path string) (set *blockSet, err error) {
 	}
 
 	// The filter is left where it is; see blockSet (issue #64)
-	set.bloomOff = int64(setHdrSize) + NumShards*setDirEntSize + int64(set.meta.Keys)*DBKeyFullSize
+	set.bloomOff = int64(setHdrSize) + int64(nShards)*setDirEntSize + int64(set.meta.Keys)*DBKeyFullSize
 	set.bloomBytes = bloomBytes
 	set.bloomK = bloomK
 	return set, nil

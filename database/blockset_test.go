@@ -279,8 +279,15 @@ func TestPackedKeysStayImmutable(t *testing.T) {
 	}
 	reopened, err := OpenKVShard(dir)
 	require.NoError(t, err)
-	shard := reopened.Shards[ShardIndex(keys[0][:])]
-	require.Equal(t, 0, len(shard.PermKV.sealedSegments()), "the packed key's shard holds it in no segment now")
+	shard := reopened.Shards[reopened.ShardIndex(keys[0][:])]
+	// The set holds the key now, and no segment of its shard does.
+	// (Not "the shard holds no segments": how many a shard keeps
+	// depends on how many there are, and this test is about one key.)
+	for _, seg := range shard.PermKV.sealedSegments() {
+		_, found, err := seg.lookup(keys[0])
+		require.NoError(t, err)
+		require.Falsef(t, found, "%s still holds the packed key", seg.meta.File)
+	}
 
 	packedKey := keys[0]
 	other := append([]byte("changed-"), values[packedKey]...)

@@ -9,21 +9,61 @@ import (
 	"sync"
 )
 
-const NumShards = 512
+// DefaultNumShards is how many shards a database is given when the
+// caller does not say.
+//
+// The right number is the one that makes a shard's files worth
+// writing.  Keys route by hash, so a shard sees its share of the
+// rate: at 512 shards and 500 tx/s a shard takes ~13 records a block,
+// and a merge of 20 blocks is a file of ~250 records -- a few tens of
+// kilobytes carrying an inode, an index, a bloom and its share of the
+// fsyncs.  Measured against one store at that rate, 512 shards cost
+// 7.6x the commit latency (7.6 ms to 57.8 ms), 110x the files and 4x
+// the memory, and bought nothing, because at 500 tx/s no store's lock
+// is contended.  The cost is monotonic in the count: 32 shards is
+// 12.1 ms, 64 is 16.6, 128 is 23.2.
+//
+// Sharding pays where a single store's lock IS the bottleneck, which
+// is a much higher rate than that.  So this is a number to set from
+// the rate a database will actually see (NewKVShardN).
+//
+// The default is EIGHT.  From one shard to eight the median commit is
+// flat within noise -- 6.8, 7.4, 7.6 and 8.1 ms -- and eight has the
+// tightest tail of anything measured, a p99 of 13.2 ms against 23-30
+// for a single store, which is what a little parallelism buys: a
+// writer waits behind fewer others.  Above sixteen every axis rises
+// together.  The differences at the low end are small enough to be
+// other variables in the test rather than the shard count, and
+// separating them would take hours of running; eight is chosen for
+// the tail, and because it leaves room to grow into.
+//
+// See docs/design/shard-count.md for the measurement.
+const DefaultNumShards = 8
 
 // indexShards is the byte offset of the 32-bit field in a key that
 // selects its shard
 const indexShards = 4
 
-// ShardIndex
-// Returns the shard a key routes to
-func ShardIndex(key []byte) int {
-	return int(binary.BigEndian.Uint32(key[indexShards:]) % NumShards)
+// ShardIndexN
+// The shard a key routes to, out of n
+func ShardIndexN(key []byte, n int) int {
+	return int(binary.BigEndian.Uint32(key[indexShards:]) % uint32(n))
 }
 
+// ShardIndex
+// The shard a key routes to in a database of DefaultNumShards.  A
+// database with any other count must ask it, not this
+// (KVShard.ShardIndex).
+func ShardIndex(key []byte) int {
+	return ShardIndexN(key, DefaultNumShards)
+}
+
+// ShardIndex is the shard a key routes to in THIS database
+func (k *KVShard) ShardIndex(key []byte) int { return ShardIndexN(key, len(k.Shards)) }
+
 // KVShard
-// A sharded KV database.  Keys route to one of NumShards KV2 instances
-// by ShardIndex.
+// A sharded KV database.  Keys route to one of its KV2 instances by
+// ShardIndex, and how many there are is fixed when it is created.
 //
 // Concurrency: KVShard methods are safe for concurrent use.  The Shards
 // array is fixed after creation, and each KV2 serializes access with its
@@ -34,7 +74,13 @@ func ShardIndex(key []byte) int {
 // history lock, and run alongside the commits (issue #57).
 type KVShard struct {
 	Directory string
-	Shards    [NumShards]*KV2
+
+	// Shards is fixed once the database is created.  How many there
+	// are is recorded by the shard directories themselves, which is
+	// what a reopen counts: a database opened with a different number
+	// would route every key to a different shard and answer "not
+	// found" for data that is on disk.
+	Shards []*KV2
 
 	// Sets holds the finalized Perm data that has left the shards: one
 	// block-set file per completed set of blocks, packed from every
@@ -64,6 +110,36 @@ func (k *KVShard) attachSets() (err error) {
 	return nil
 }
 
+// countShardDirs is how many shards a database on disk has: the
+// Shard%04d directories it was created with, which must be a complete
+// run from zero.  A gap means a directory was lost, and routing over
+// what is left would put keys in the wrong shards.
+func countShardDirs(directory string) (n int, err error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return 0, err
+	}
+	seen := map[int]bool{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		var i int
+		if _, err := fmt.Sscanf(e.Name(), "Shard%04d", &i); err == nil && i >= 0 {
+			seen[i] = true
+		}
+	}
+	if len(seen) == 0 {
+		return 0, fmt.Errorf("%s holds no shard directories", directory)
+	}
+	for i := 0; i < len(seen); i++ {
+		if !seen[i] {
+			return 0, fmt.Errorf("%s is missing shard %d of %d", directory, i, len(seen))
+		}
+	}
+	return len(seen), nil
+}
+
 func (k *KVShard) ShardDir(index int) string {
 	dirname := fmt.Sprintf("Shard%04d", index)      // Shards are coded by name
 	shardDir := filepath.Join(k.Directory, dirname) // Create the path
@@ -75,6 +151,17 @@ func (k *KVShard) ShardDir(index int) string {
 func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 	kVShard = new(KVShard)
 	kVShard.Directory = directory
+
+	// How many shards this database has is what it was created with,
+	// and the shard directories are the record of it.  Counting them
+	// is what keeps a database from being reopened with a different
+	// number and routing every key somewhere else -- which reports
+	// data that is on disk as absent, silently.
+	shards, err := countShardDirs(directory)
+	if err != nil {
+		return nil, err
+	}
+	kVShard.Shards = make([]*KV2, shards)
 
 	for i := range kVShard.Shards {
 		shardDir := kVShard.ShardDir(i)
@@ -88,6 +175,17 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 	}
 	if kVShard.Sets, err = OpenSetStore(kVShard.setDir()); err != nil {
 		return nil, err
+	}
+	// A set is written for a shard count and its directory is indexed
+	// by shard, so a set built for a different count is not readable
+	// here -- every shard would read another shard's region.  The
+	// database's count is fixed at creation, so this can only happen
+	// if sets were moved between databases.
+	for _, set := range kVShard.Sets.snapshot() {
+		if set.shards != shards {
+			return nil, fmt.Errorf("%s was packed for %d shards; this database has %d",
+				set.meta.File, set.shards, shards)
+		}
 	}
 	if err = kVShard.attachSets(); err != nil {
 		return nil, err
@@ -114,13 +212,33 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 // reopen one.  sealLimit is recorded in each shard's manifest, so
 // OpenKVShard restores it.
 func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
+	return NewKVShardN(directory, DefaultNumShards, sealLimit)
+}
+
+// NewKVShardN
+// Create a sharded database with a chosen number of shards.
+//
+// The count is fixed for the life of the database: keys route by
+// hash modulo it, so a database reopened with a different one sends
+// every key to a different shard and reports data that is on disk as
+// absent.  It is not written into a manifest because it does not need
+// to be -- the shard directories ARE the record, and OpenKVShard
+// counts them.
+//
+// How many to ask for is a question about rate, not about size; see
+// DefaultNumShards.
+func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	if shards < 1 {
+		return nil, fmt.Errorf("a database needs at least one shard, asked for %d", shards)
+	}
 	os.RemoveAll(directory)                                    // Get rid of any existing directory
 	if err = os.MkdirAll(directory, os.ModePerm); err != nil { // Make the directory
 		return nil, err
 	}
 
-	kvs = new(KVShard)          // Create a new sharded directory
-	kvs.Directory = directory   // Keep the directory
+	kvs = new(KVShard)        // Create a new sharded directory
+	kvs.Directory = directory // Keep the directory
+	kvs.Shards = make([]*KV2, shards)
 	for i := range kvs.Shards { // Then create all the shards
 		shardDir := kvs.ShardDir(i)
 		if kvs.Shards[i], err = NewKV2(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
@@ -477,7 +595,7 @@ func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err e
 	if newest, ok := k.Sets.Newest(); ok && height <= newest.Last+1 {
 		return meta, false, nil // Everything below is already packed
 	}
-	shards := make([][]*segment, NumShards)
+	shards := make([][]*segment, len(k.Shards))
 	last, any := uint64(0), false
 	for i, shard := range k.Shards {
 		if err = shard.Open(); err != nil {
