@@ -96,7 +96,7 @@ func (b *BFile) Close() (err error) {
 	if err = b.Flush(); err != nil {
 		return err
 	}
-	if err = b.File.Sync(); err != nil {
+	if err = fsync(b.File); err != nil {
 		b.File.Close()
 		b.File = nil
 		return err
@@ -242,5 +242,5 @@ func syncDir(directory string) error {
 		return err
 	}
 	defer d.Close()
-	return d.Sync()
+	return fsync(d)
 }

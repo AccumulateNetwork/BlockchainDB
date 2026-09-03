@@ -226,7 +226,7 @@ func writeDayFilter(directory string, group uint64, sets []*blockSet) (f *dayFil
 	if _, err = out.Write(bloom.Map); err != nil {
 		return nil, err
 	}
-	if err = out.Sync(); err != nil { // Durable before it is named
+	if err = fsync(out); err != nil { // Durable before it is named
 		return nil, err
 	}
 	if err = out.Close(); err != nil {

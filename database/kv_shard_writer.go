@@ -103,7 +103,7 @@ func (w *ShardWriter) run(q chan putReq) {
 // on the same worker (per-key write ordering) and a worker's shards are
 // touched by no other worker.
 func (w *ShardWriter) route(key [32]byte) int {
-	return ShardIndex(key[:]) % len(w.queues)
+	return w.kvs.ShardIndex(key[:]) % len(w.queues)
 }
 
 // PutPerm
