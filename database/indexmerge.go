@@ -234,7 +234,7 @@ func (iw *indexWriter) finish() (err error) {
 	if err = iw.w.Flush(); err != nil {
 		return err
 	}
-	if err = iw.file.Sync(); err != nil {
+	if err = fsync(iw.file); err != nil {
 		return err
 	}
 	if err = iw.file.Close(); err != nil {

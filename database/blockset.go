@@ -413,7 +413,7 @@ func (ss *SetStore) build(first, last uint64, shards [][]*segment) (set *blockSe
 	if err = bw.Flush(); err != nil {
 		return nil, err
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		return nil, err
 	}
 	if err = f.Close(); err != nil {

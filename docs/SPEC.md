@@ -170,6 +170,12 @@ window (MinFilterBlocks).
     the store lock, walks under the history lock, retakes, re-checks).
   - Maintenance takes History exclusively only to *swap* — splice a
     list and commit a manifest — never for the length of a copy.
+  - **The protocol path never holds a tier lock across a barrier.**  A
+    seal cuts the tail under the lock and syncs, names and commits it
+    with the lock released; reads meanwhile answer from the cut tail.
+    Holding the lock across the fsyncs held every read of the shard
+    for the length of them, and capped an 8-node network at ~80 tx/s
+    with its CPUs idle (#84).
 - Segments cross tiers by **handoff** at the window boundary; a
   handoff is bookkeeping, it moves no bytes.
 
@@ -212,8 +218,10 @@ window (MinFilterBlocks).
   content-addressed keys give near-perfect balance.  (The retired idea
   of un-sharding perm valued only compaction; see #62.)
 - Per-shard work first, cross-shard work later: shards seal, merge and
-  compact independently; the pack tier consolidates across shards once
-  a window is finished everywhere.
+  compact independently, and **concurrently** — a block boundary seals
+  every shard at once, so it costs one seal's barriers, not the sum of
+  the set's (#84); the pack tier consolidates across shards once a
+  window is finished everywhere.
 - A block boundary commits **once per shard set**, not once per shard
   (the shared block record); shards that took no writes cost nothing
   at the boundary (#32).
@@ -279,17 +287,30 @@ Segment files: `seg-<height>-<seq>.dat` (records: 40-byte header —
 
 ### 2.3 Seal (1.7, 1.8)
 
-`seal` (`segstore.go:2322`): mint `(height, seq)` via `nextKeyAt`,
-then `promoteLiveFile` — flush, finish the header, fsync, and
-**hard-link** the live file to its segment name.  No record is copied
-(#60); a shadowed tail keeps its dead bytes and compaction reclaims
-them later.  The link is exclusive: a taken name is skipped
-(`seal-remint` audit) and the next free sequence is taken — a seal and
-a suffix compaction can race to mint the same identity when the
-active tier is empty, and the exclusive claim turns that from silent
-overwrite into a re-mint (#61).  The index is built from the live map;
-the manifest commit that follows is the sole durability barrier
-(two fsyncs total; #33 tracks the remainder).
+Two halves (`seal.go`), so that no read waits on a barrier (1.6, #84).
+`cutTail`, under `commitMu` and the Mutex: mint `(height, seq)` via
+`nextKeyAt`, flush the tail, finish its header, rename the file aside
+to `sealing.dat`, start a fresh tail.  No barrier.  Reads then find
+the cut tail's records through `SegmentStore.sealing`, between the
+live tail and the segments; writes land in the next block's tail.
+`promote`, under `commitMu` alone: fsync the cut file while its index
+is built from the map and fsynced beside it, then **hard-link** the
+file to its segment name.  No record is copied (#60); a shadowed tail
+keeps its dead bytes and compaction reclaims them later.  The link is
+exclusive: a taken name is skipped (`seal-remint` audit) and the next
+free sequence is taken — a seal and a suffix compaction can race to
+mint the same identity when the active tier is empty, and the
+exclusive claim turns that from silent overwrite into a re-mint
+(#61).  `commit`: retake the Mutex to put the segment in the active
+tier, advance the block and build the manifest; release it, and
+commit.  Four barriers, three deep — data alongside index, then the
+manifest's tmp, then the directory — counted by `FsyncCount` and
+pinned by `TestSealBarrierCount` (#33 tracks what remains).
+`KV2.Seal` holds the shard's lock for both layers' cuts only and
+finishes the Perm seal and the Dyna sync side by side;
+`KVShard.SealBlock` seals the shards concurrently.  A crash between
+the halves leaves `sealing.dat`, which `recoverSealingTail` folds
+back into the live tail on open (2.8).
 
 ### 2.4 Manifests (1.8)
 
@@ -297,7 +318,10 @@ Two per store (#58): `segments.json` (active tier + unrecorded
 handoffs; settings; block height) and `history.json` (everything
 older).  The protocol path commits only the active manifest, so its
 size is bounded by the window.  `commitJSON` = tmp + fsync + rename +
-directory fsync.  `StoreFormatVersion` (4) is checked strictly (1.10).
+directory fsync.  An active commit is built under the Mutex
+(`buildManifest`) and written without it (`commitManifest`), under
+`commitMu`, which serializes every active commit.  `StoreFormatVersion`
+(4) is checked strictly (1.10).
 
 ### 2.5 Filters (1.3)
 
@@ -317,7 +341,9 @@ may cost a pointless walk, never a false "absent" (#35).
 ### 2.6 Tiers, handoffs, deferred deletion (1.6, 1.8)
 
 Two-tier locking per #57: `Mutex` (active), `History` (RW), `maint`
-(serializes maintenance).  `advanceBlock` → `handoffBelowWindow` moves
+(serializes maintenance), and `commitMu` (serializes seals, syncs and
+active commits; order: `commitMu`, then `Mutex`; #84).
+`advanceBlock` → `handoffBelowWindow` moves
 window-departed segments to history as handoffs; the next history
 commit records them, the next active commit stops naming them.
 Deletion is deferred through `retireAfterActiveCommit` and an unlink
@@ -403,7 +429,10 @@ run is still in place and discards its output if not.
 ### 2.8 Crash recovery (1.8)
 
 `load()` (`segstore.go:860`): read both manifests (fail-fast if a
-named file is missing), open the union, sweep orphans
+named file is missing), open the union, fold a tail an interrupted
+seal left cut back into the live tail (`recoverSealingTail` — unless
+the file already has its segment name, in which case it is an orphan
+and the staging name is dropped), sweep orphans
 (`recoverOrphans`), derive tiers from the block height and window
 (1.6), rebuild handoff state from what each manifest names, rewrite
 only the manifest that disagrees with its tier, replay the live tail

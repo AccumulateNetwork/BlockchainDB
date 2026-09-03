@@ -388,14 +388,42 @@ func (k *KV2) sealDynaIfFull() (err error) {
 // tier a commit writes (issue #57).  No manifest is written for it:
 // the next Dyna seal records the block, and a reopened layer that is
 // a few blocks behind simply hands the same segments off again.
+//
+// The shard's lock is held for the CUT alone -- the Perm tail cut at
+// the block boundary, the Dyna tail flushed, the Dyna block advanced
+// -- which is a few syscalls and no barrier.  The barriers, one
+// layer's alongside the other's, run with the lock released: a Get of
+// the shard meanwhile reads the cut tail where it stands, and a Put
+// lands in the next block's tail.  Holding the lock across them held
+// every read of the shard for the length of five fsyncs, and every
+// transaction that validated against a sealing shard waited the seal
+// out (issue #84; the two halves are seal.go's).
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
-	defer k.Mutex.Unlock()
-	meta, err = k.PermKV.Seal(height)
-	if syncErr := k.DynaKV.Sync(); err == nil {
-		err = syncErr
+	perm, err := k.PermKV.beginSeal(height)
+	if err != nil {
+		k.Mutex.Unlock()
+		return meta, err
 	}
+	dyna, dynaErr := k.DynaKV.beginSync()
 	k.DynaKV.AdvanceBlock(height + 1)
+	k.Mutex.Unlock()
+
+	// Both halves finish regardless of the other: a failure to sync
+	// Dyna must not leave Perm cut and unsealed, nor the reverse
+	var wg sync.WaitGroup
+	if dyna != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dynaErr = dyna.finish()
+		}()
+	}
+	meta, err = perm.finish()
+	wg.Wait()
+	if err == nil {
+		err = dynaErr
+	}
 	return meta, err
 }
 

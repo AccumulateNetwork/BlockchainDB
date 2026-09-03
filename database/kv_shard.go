@@ -439,7 +439,7 @@ func (k *KVShard) writeBlockHeight(height uint64) (err error) {
 		f.Close()
 		return err
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		f.Close()
 		return err
 	}
@@ -498,13 +498,37 @@ func (k *KVShard) useSharedBlockRecord() {
 // rather than a manifest commit of its own (issue #32).  It is written
 // before this returns, and so before any write belonging to the next
 // block, which is what a shard needs it for.
+//
+// The shards seal CONCURRENTLY.  Each shard's seal is its own files in
+// its own directory under its own locks, and what a seal costs is
+// barriers -- ~17 ms each on a validator's disk -- so eight sealed one
+// after another cost eight times what eight sealed together do: a
+// journal commits what every waiting fsync asked for at once.
+// Measured before this, a 1 s block spent 0.7-0.8 s here (issue #84).
+// Every shard is attempted whatever the others do -- a seal is not a
+// thing to leave half the set without -- and the first failure, by
+// shard order, is what is reported.  The block record is written only
+// when every shard sealed, since it says they all did.
 func (k *KVShard) SealBlock(height uint64) (err error) {
+	errs := make([]error, len(k.Shards))
+	var wg sync.WaitGroup
 	for i, shard := range k.Shards {
-		if err = shard.Open(); err != nil {
-			return fmt.Errorf("shard %d: %w", i, err)
-		}
-		if _, err = shard.Seal(height); err != nil {
-			return fmt.Errorf("shard %d: %w", i, err)
+		wg.Add(1)
+		go func(i int, shard *KV2) {
+			defer wg.Done()
+			if err := shard.Open(); err != nil {
+				errs[i] = fmt.Errorf("shard %d: %w", i, err)
+				return
+			}
+			if _, err := shard.Seal(height); err != nil {
+				errs[i] = fmt.Errorf("shard %d: %w", i, err)
+			}
+		}(i, shard)
+	}
+	wg.Wait()
+	for _, err = range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return k.writeBlockHeight(height + 1)

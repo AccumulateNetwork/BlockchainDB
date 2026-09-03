@@ -3,7 +3,8 @@
 Status: implemented and crash-tested (`database/crash_test.go`),
 2026-08-24; retargeted from the v1 kfile layer to `SegmentStore` when
 v1 was removed, and three defects it then surfaced fixed, 2026-08-25.
-Tracks issue #5.
+The seal split into a cut under the lock and barriers off it,
+2026-09-03 (issue #84).  Tracks issue #5.
 
 ## The contract
 
@@ -40,7 +41,11 @@ came back holding chain elements newer than the heads that index them:
 the two layers disagreed about where the block ended.
 
 `KV2.Seal` now seals Perm and **syncs** Dyna: flush the live tail,
-fsync it, done.  Syncing rather than sealing is deliberate — cutting a
+fsync it, done.  The shard's lock is held for the cut of both layers
+and released before either's barrier: the Perm data fsync, its index
+fsync and the Dyna fsync are in flight together, and a `Get` of the
+shard meanwhile reads the cut tail where it stands (issue #84).
+Syncing rather than sealing is deliberate — cutting a
 Dyna segment per block per shard would buy nothing (no peer receives
 one) and cost a seal's hash and manifest commit every block.  No
 manifest is written either, because the live tail is recovered by
@@ -90,7 +95,8 @@ state survives until the new state is durable:
 
 | operation | mechanism |
 |---|---|
-| seal | renames `live.dat` itself, always: the header is filled in, the file fsynced, then renamed into place, so no record is copied and a `.dat` on disk is complete by construction. A mutable tail's overwritten records ride along dead — the index, built from the live map, lands every lookup on the newest copy, and compaction reclaims the rest off the protocol lock. (Sealing used to rewrite a shadowed tail with one pread per record under the store lock: 10–15 s pauses every few blocks at a 100k-record tail, issue #60) |
+| seal | renames `live.dat` itself, always: the header is filled in, the file renamed aside to `sealing.dat` under the store lock (the *cut*), then — with the lock released — fsynced and hard-linked into place, so no record is copied and a `.dat` on disk is complete by construction. A mutable tail's overwritten records ride along dead — the index, built from the live map, lands every lookup on the newest copy, and compaction reclaims the rest off the protocol lock. (Sealing used to rewrite a shadowed tail with one pread per record under the store lock: 10–15 s pauses every few blocks at a 100k-record tail, issue #60) |
+| cut tail | a `sealing.dat` on open is a seal the crash caught between its cut and its link. If the same file already has a segment name, the crash fell between the link and the removal of the staging name: the segment is an orphan above everything named and is adopted, and the staging name is dropped so its records are not replayed as well. Otherwise the file's records are the live tail's, older than anything in `live.dat`, and never fsynced: `recoverSealingTail` cuts it at its last whole record, appends `live.dat`'s whole records, and makes it `live.dat` — the tail exactly as it would have been had the seal never started (`TestInterruptedSealFoldsTheCutTailBack`, `TestInterruptedSealDropsATornCutTail`, `TestInterruptedSealAfterTheLinkIsAdopted`) |
 | manifest commit | `segments.json.tmp` + rename for the active tier, `history.json.tmp` + rename for history; each is the single point at which its tier's operation becomes real — a seal or import for the active manifest, a merge, compaction or drop for the history manifest (issue #57) |
 | a segment between the manifests | the window rolling past a segment moves it to history in memory and writes nothing.  The active manifest keeps naming it until a history commit names it, and only the active commit after that stops; so every sealed segment is named by at least one manifest on disk at every moment, and open reads both and takes the union.  A merge's inputs that the active manifest might still name are deleted only after the next active commit (`TestHandoffSurvivesACrash`, three crash points) |
 | compaction | rewrites a run of history segments into one holding the newest record per key, then commits it with one history-manifest rename (issue #19) — there is no window in which keys and values disagree.  It never touches a segment inside the window: a record last written in the last N to 2N blocks is the protocol's (issue #57) |
@@ -103,7 +109,7 @@ state survives until the new state is durable:
 | merge of finalized segments | the merged segment is written, fsynced and renamed before the manifest names it, at an identity *below* the manifest's newest, so an uncommitted one is deleted by `recoverOrphans` while the originals it would replace are still named (issue #47) |
 | key filters | saved to `filters.dat` (tmp file, fsync, rename, directory fsync) at close, and the manifest written straight after carries the claim of what they cover: the window's start, the newest segment in it, and the count of segments covered.  Every other manifest commit clears the claim, and on open any doubt -- an adopted orphan, a dropped segment, a different window -- rebuilds from the segments inside the window (issue #44) |
 | block-set file | written to `sets/set-….bset.tmp`, fsynced, renamed, and the set directory fsynced: the rename is the commit.  A `.tmp` left by a crash is deleted on open.  Only after that commit do the shards drop the segments the set holds, each with a history-manifest commit of its own (two barriers, off the protocol path, sixteen shards at a time), and the files are deleted only after it.  A crash before a shard's drop leaves its history manifest naming whole, intact segments that the set also holds; on open the shard set drops them again (`TestPackFinalizedSurvivesACrashBeforeTheShardsCommit`).  Nothing is ever in only one place until the second place is durable |
-| one barrier per operation | a seal renames up to three files into the same directory -- the sealed data file, its index, then the manifest -- and fsyncs that directory once, at the manifest commit. One directory fsync commits every name change made in it, and the renames are issued in order, so the manifest can never become durable ahead of the data file it names. Each file's own fsync is still taken before its rename: that is what makes a published name always point at durable contents. Six barriers a seal became four, measured 36 ms to 24.6 ms (issue #33) |
+| one barrier per operation | a seal renames up to three files into the same directory -- the sealed data file, its index, then the manifest -- and fsyncs that directory once, at the manifest commit. One directory fsync commits every name change made in it, and the renames are issued in order, so the manifest can never become durable ahead of the data file it names. Each file's own fsync is still taken before its rename: that is what makes a published name always point at durable contents. Six barriers a seal became four, measured 36 ms to 24.6 ms (issue #33); the four now run three deep — the data and index fsyncs together, then the manifest's, then the directory's — with no store lock held, and the shards of a set seal at once, so a block boundary waits for one shard's depth rather than the sum of the set's forty (issue #84; `TestSealBarrierCount` pins the count) |
 | operations on a closed store | `Close` drops the sealed segment list but keeps the live map, so reads and writes refuse with `errStoreClosed` rather than running against half a store |
 
 ## Recovery by replay

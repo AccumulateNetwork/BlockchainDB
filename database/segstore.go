@@ -552,6 +552,21 @@ type SegmentStore struct {
 	// over if the window rolled in between.  Under Mutex.
 	epoch uint64
 
+	// commitMu serialises what changes the active tier's on-disk state
+	// and commits it: seals, syncs, imports, Close and Open.  A seal
+	// holds it from the cut to the manifest commit, which is how one
+	// seal's barriers run with the Mutex released and no other commit
+	// interleaves (seal.go).  Order: commitMu, then Mutex.  The
+	// protocol path takes it only to seal or to sync; a Get never
+	// does, so a read never waits on a barrier (issue #84).
+	commitMu sync.Mutex
+
+	// sealing is the tail a seal has cut and not yet named: readers
+	// consult it between the live tail and the segments, which is
+	// where its records stand in age.  Under Mutex; set by cutTail and
+	// cleared when its segment joins active (seal.go).
+	sealing *sealingTail
+
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
@@ -793,6 +808,8 @@ func OpenSegmentStore(directory string) (store *SegmentStore, err error) {
 // Record the live-tail bound in the manifest so a reopened store
 // reports the value it was built with rather than a default.
 func (s *SegmentStore) SetSealLimit(limit uint64) (err error) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	if err = s.checkOpen(); err != nil {
@@ -834,6 +851,8 @@ func (s *SegmentStore) Open() (err error) {
 	if !s.closed.Load() {
 		return nil // No lock: see closed
 	}
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	if !s.closed.Load() {
@@ -863,6 +882,7 @@ func (s *SegmentStore) load() (err error) {
 	s.historyNewest, s.historyAny = SegmentMeta{}, false
 	s.handoffs, s.retireAfterActiveCommit = nil, nil // The manifests being read are the truth again
 	s.liveRecords = 0
+	s.sealing = nil
 
 	m, err := s.readManifest()
 	if err != nil {
@@ -918,6 +938,11 @@ func (s *SegmentStore) load() (err error) {
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[j].meta.after(all[i].meta) })
 
+	// A tail cut by a seal the crash interrupted goes back to being the
+	// live tail before anything else is decided (seal.go)
+	if err = s.recoverSealingTail(); err != nil {
+		return err
+	}
 	all, adopted, err := s.recoverOrphans(all)
 	if err != nil {
 		return err
@@ -1315,7 +1340,7 @@ func (s *SegmentStore) openLive() (err error) {
 		if err = s.liveFile.File.Truncate(int64(offset)); err != nil {
 			return err
 		}
-		if err = s.liveFile.File.Sync(); err != nil {
+		if err = fsync(s.liveFile.File); err != nil {
 			return err
 		}
 		s.liveFile.EOD = offset
@@ -1512,10 +1537,34 @@ func (s *SegmentStore) readHistoryManifest() (m *HistoryManifest, err error) {
 //
 // What it names is the active tier plus the handoffs no history commit
 // has recorded yet; what it takes with it is the handoffs one has, and
-// the files history left for this commit to delete.  Both are read
-// before the manifest is built, so a handoff or a retirement that
-// arrives while the file is being written waits for the next commit.
+// the files history left for this commit to delete.  The caller must
+// hold commitMu and the Mutex, or the only reference; a seal or a
+// sync uses the two halves, buildManifest and commitManifest, so as
+// to hold the Mutex for the first only (seal.go).
 func (s *SegmentStore) writeManifest() (err error) {
+	return s.commitManifest(s.buildManifest())
+}
+
+// manifestCommit is an active manifest built under the Mutex and not
+// yet committed: what it names, and the bookkeeping the commit
+// settles once it is durable.  A seal or a sync builds one under the
+// Mutex and commits it without, so that the commit's barriers hold
+// up no reader (seal.go); the caller holds commitMu throughout, so
+// no other commit can slip between the build and the commit.
+type manifestCommit struct {
+	m        StoreManifest
+	recorded []*segment // Handoffs a history commit has recorded: this commit stops naming them
+	retire   []string   // Files history left for this commit to delete
+}
+
+// buildManifest is the half of a manifest commit that reads the
+// store: the caller must hold the Mutex (and commitMu, or the only
+// reference).  It names the active tier plus the handoffs no history
+// commit has recorded yet, and notes the handoffs one has and the
+// files history left for this commit to delete.  Both are read here,
+// so a handoff or a retirement that arrives while the file is being
+// written waits for the next commit.
+func (s *SegmentStore) buildManifest() (c manifestCommit) {
 	// The coverage claim is true only of the manifest written directly
 	// after the filters were saved.  Everything else that writes a
 	// manifest -- a seal, an import -- has changed the segment set, so
@@ -1523,36 +1572,42 @@ func (s *SegmentStore) writeManifest() (err error) {
 	defer func() { s.filterValid = false }()
 
 	s.handoffMu.Lock()
-	var unrecorded, recorded []*segment
+	var unrecorded []*segment
 	for _, h := range s.handoffs {
 		if h.recorded {
-			recorded = append(recorded, h.seg)
+			c.recorded = append(c.recorded, h.seg)
 		} else {
 			unrecorded = append(unrecorded, h.seg)
 		}
 	}
-	retire := append([]string(nil), s.retireAfterActiveCommit...)
+	c.retire = append([]string(nil), s.retireAfterActiveCommit...)
 	s.handoffMu.Unlock()
 
-	m := StoreManifest{Version: StoreFormatVersion,
+	c.m = StoreManifest{Version: StoreFormatVersion,
 		Mutable: s.Mutable, SealLimit: s.SealLimit, FilterBlocks: s.FilterBlocks,
 		BlockHeight: s.blockHeight, FilterDemand: s.demand}
 	if s.filterValid {
-		m.FilterValid = true
-		m.FilterStart, m.FilterHeight = s.filterSaved.Start, s.filterSaved.Height
-		m.FilterSeq, m.FilterSegments = s.filterSaved.Seq, s.filterSaved.Segments
+		c.m.FilterValid = true
+		c.m.FilterStart, c.m.FilterHeight = s.filterSaved.Start, s.filterSaved.Height
+		c.m.FilterSeq, c.m.FilterSegments = s.filterSaved.Seq, s.filterSaved.Segments
 	}
 	for _, seg := range unrecorded { // Older than anything active
-		m.Segments = append(m.Segments, seg.meta)
+		c.m.Segments = append(c.m.Segments, seg.meta)
 	}
 	for _, seg := range s.active {
-		m.Segments = append(m.Segments, seg.meta)
+		c.m.Segments = append(c.m.Segments, seg.meta)
 	}
-	if err = commitJSON(s.Directory, segManifestName, &m); err != nil {
+	return c
+}
+
+// commitManifest is the half of a manifest commit that waits on the
+// disk: the caller must hold commitMu and need not hold the Mutex.
+func (s *SegmentStore) commitManifest(c manifestCommit) (err error) {
+	if err = commitJSON(s.Directory, segManifestName, &c.m); err != nil {
 		return err
 	}
-	anames := make([]string, 0, len(m.Segments))
-	for _, sm := range m.Segments {
+	anames := make([]string, 0, len(c.m.Segments))
+	for _, sm := range c.m.Segments {
 		anames = append(anames, sm.File)
 	}
 	auditUnlink(s.Directory, "ACTIVE-COMMIT["+strings.Join(anames, ",")+"]")
@@ -1564,7 +1619,7 @@ func (s *SegmentStore) writeManifest() (err error) {
 	kept := s.handoffs[:0]
 	for _, h := range s.handoffs {
 		done := false
-		for _, seg := range recorded {
+		for _, seg := range c.recorded {
 			if h.seg == seg {
 				done = true
 			}
@@ -1574,9 +1629,9 @@ func (s *SegmentStore) writeManifest() (err error) {
 		}
 	}
 	s.handoffs = kept
-	s.retireAfterActiveCommit = s.retireAfterActiveCommit[len(retire):]
+	s.retireAfterActiveCommit = s.retireAfterActiveCommit[len(c.retire):]
 	s.handoffMu.Unlock()
-	s.unlinkLater("handoff-drop-after-active-commit", retire...)
+	s.unlinkLater("handoff-drop-after-active-commit", c.retire...)
 	return nil
 }
 
@@ -1627,7 +1682,7 @@ func commitJSON(directory, name string, m any) (err error) {
 		f.Close()
 		return err
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		f.Close()
 		return err
 	}
@@ -1793,6 +1848,20 @@ func (s *SegmentStore) findActive(key [32]byte, count bool) (value []byte, inWin
 			s.stats.liveHit.Add(1)
 		}
 		return value, true, true, nil
+	}
+	// A tail cut by a seal still in flight: older than the live tail,
+	// newer than any segment, and not yet a segment (seal.go)
+	if t := s.sealing; t != nil {
+		if dbb, ok := t.entries[key]; ok {
+			value = make([]byte, dbb.Length)
+			if err = t.file.ReadAt(dbb.Offset, value); err != nil {
+				return nil, false, false, err
+			}
+			if count {
+				s.stats.liveHit.Add(1)
+			}
+			return value, true, true, nil
+		}
 	}
 	inWindow = s.filterTest(key)
 	if !inWindow {
@@ -2190,6 +2259,16 @@ func (s *SegmentStore) beginIterate() (segs []*segment, live map[[32]byte][]byte
 	// still being appended to -- so its values are copied out under the
 	// lock rather than read during the iteration
 	live = make(map[[32]byte][]byte, len(s.live))
+	if t := s.sealing; t != nil { // A cut tail, older: the live tail overrides it below
+		for key, dbb := range t.entries {
+			value := make([]byte, dbb.Length)
+			if err = t.file.ReadAt(dbb.Offset, value); err != nil {
+				s.Mutex.RUnlock()
+				return nil, nil, nil, err
+			}
+			live[key] = value
+		}
+	}
 	for key, dbb := range s.live {
 		value := make([]byte, dbb.Length)
 		if err = s.liveFile.ReadAt(dbb.Offset, value); err != nil {
@@ -2233,178 +2312,6 @@ func (s *SegmentStore) AdvanceBlock(height uint64) {
 	s.advanceBlock(height)
 }
 
-// Sync
-// Make the live tail durable without sealing it: flush the buffer and
-// fsync the file, so every record written so far survives a power loss.
-//
-// This is the durability point for a store that is not being sealed.
-// Sealing is the other one, and it is the only one the Perm layer
-// needs, because a block boundary seals its whole tail.  The Dyna
-// layer is not sealed at a block boundary -- its segments are local,
-// not a peer's unit of sync -- so without this its newest writes sat
-// in a 32 KB buffer until the tail filled, and a crash restarted the
-// node with permanent records newer than the mutable state that
-// indexes them (issue #29).
-//
-// No manifest is written: the manifest names sealed segments, and the
-// live tail is recovered by replaying the file itself.  A tail
-// fsynced mid-record is fine -- open truncates a torn record and
-// replay resumes on the boundary before it.
-//
-// Sync is a no-op on a tail that has taken no writes since the last
-// one, so the shards a block did not touch cost nothing.
-func (s *SegmentStore) Sync() (err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.sync()
-}
-
-// sync is Sync; the caller must hold the Mutex
-func (s *SegmentStore) sync() (err error) {
-	if err = s.checkOpen(); err != nil {
-		return err
-	}
-	if s.liveDirty {
-		if err = s.liveFile.Flush(); err != nil {
-			return err
-		}
-		if err = s.liveFile.File.Sync(); err != nil {
-			return err
-		}
-		s.liveDirty = false
-	}
-	// A layer that is synced rather than sealed at the block boundary
-	// -- the Dyna layer -- may go many blocks between active commits,
-	// and history is waiting on the next one to finish a handoff or to
-	// delete the inputs of a compaction the active manifest still
-	// names.  Commit one here when there is anything to finish: two
-	// barriers, once per compaction, at a boundary that already pays
-	// for a sync.  Otherwise a compacted layer keeps its old
-	// generations on disk until its tail next fills.
-	s.handoffMu.Lock()
-	finish := len(s.retireAfterActiveCommit) > 0
-	for _, h := range s.handoffs {
-		finish = finish || h.recorded
-	}
-	s.handoffMu.Unlock()
-	if finish {
-		return s.writeManifest()
-	}
-	return nil
-}
-
-// SealNext
-// Seal the live tail without a block boundary, to bound the tail when
-// it fills mid-block.  The segment is tagged with the block currently
-// being accumulated and takes the next sequence within it, so an
-// auto-seal never consumes a block number (issue #27).
-func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.seal(s.blockHeight, false)
-}
-
-// Seal
-// Seal the live tail into an immutable segment at the given height and
-// start a fresh tail.  Sealing is the store's durability point.
-//
-// When the tail holds no shadowed records -- the usual case for an
-// immutable store -- the file is renamed into place rather than
-// copied, so sealing costs a header write, an index build, and a hash.
-// Sealing at a block boundary also advances the block the live tail
-// accumulates into, so the auto-seals that follow are tagged with the
-// next block rather than the one just closed.
-func (s *SegmentStore) Seal(height uint64) (meta SegmentMeta, err error) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	return s.seal(height, true)
-}
-
-// seal is Seal; the caller must hold the Mutex.  blockBoundary marks
-// the seal as closing `height` rather than merely bounding the tail
-// inside it.
-func (s *SegmentStore) seal(height uint64, blockBoundary bool) (meta SegmentMeta, err error) {
-	if err = s.checkOpen(); err != nil {
-		return meta, err
-	}
-	if blockBoundary && s.blockHeight > height {
-		return meta, fmt.Errorf("block %d is already closed; now accumulating block %d", height, s.blockHeight)
-	}
-	seq, err := s.nextKeyAt(height)
-	if err != nil {
-		return meta, err
-	}
-	if len(s.live) == 0 {
-		// Nothing to seal, but a block boundary still closes the block:
-		// the next writes belong to the block after this one
-		if blockBoundary && s.blockHeight <= height {
-			s.advanceBlock(height + 1)
-			if s.ExternalBlockRecord {
-				return meta, nil // Recorded once for the whole shard set
-			}
-			return meta, s.writeManifest()
-		}
-		return meta, nil
-	}
-
-	// The live file is promoted as it stands -- an fsync and a rename,
-	// never a rewrite.  A mutable tail holds shadowed records
-	// (overwrites), and sealing used to rewrite it to drop them: one
-	// pread per record, under the store lock, inside the Put that
-	// tipped SealLimit.  At 100,000 records that was a ~98 MB tail read
-	// back a syscall at a time every few blocks, and every node paused
-	// 10-15 s while 71 goroutines queued on the lock (issue #60).
-	//
-	// Nothing needs the rewrite.  The index is built from s.live, which
-	// already holds the newest offset for every key, so lookups land on
-	// the newest copy; the shadowed bytes ride along dead until
-	// CompactHistory -- whose job reclamation is, off this lock -- folds
-	// them away.  The seal's cost is the flush of what the tail's own
-	// buffer holds, one fsync, and a rename: bounded by a constant, not
-	// by SealLimit, which is the #57 invariant applied to the innermost
-	// part of the active tier.  (An immutable tail never shadows -- a
-	// duplicate put is refused or a no-op -- so the Perm layer loses
-	// nothing it ever had.)
-	sl, seq, err := s.promoteLiveFile(height, seq)
-	if err != nil {
-		return meta, err
-	}
-	dataName := segmentFileName(height, seq)
-	dataPath := filepath.Join(s.Directory, dataName)
-
-	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
-	if err = writeIndexFile(indexPath, sl.order, sl.entries); err != nil {
-		return meta, err
-	}
-
-	meta = SegmentMeta{Height: height, Seq: seq, File: dataName, Count: uint64(len(sl.order)), Hash: sl.hash}
-	seg, err := s.openSegment(meta)
-	if err != nil {
-		return meta, err
-	}
-	s.active = append(s.active, seg)
-	_ = seg.loadBloom() // Active: worth the memory (issue #64)
-	// The tail's keys are in every live filter already, and the segment
-	// they now sit in is inside the window by construction, so the
-	// filters cover it; advancing the block is what may roll them, and
-	// what may hand the oldest active segments to history
-	s.advanceBlock(height)
-	if blockBoundary {
-		s.advanceBlock(height + 1) // The next writes belong to the next block
-	}
-
-	if err = s.writeManifest(); err != nil { // Commit
-		return meta, err
-	}
-
-	// The sealed data is committed; start a fresh tail
-	s.live = make(map[[32]byte]*DBBKey)
-	if err = s.newLiveFile(); err != nil {
-		return meta, err
-	}
-	return meta, nil
-}
-
 // newestMeta
 // The newest sealed segment by (Height, Seq).  ok is false when the
 // store has no sealed segments, so that height 0 (a genesis block) is
@@ -2436,88 +2343,6 @@ func (s *SegmentStore) nextKeyAt(height uint64) (seq uint64, err error) {
 		return newest.Seq + 1, nil
 	}
 	return 0, nil
-}
-
-// sealed
-// What sealing produced: the segment's hash (empty in a mutable store,
-// which never transports a segment) and the index records for it.
-// Whoever writes the segment already knows where every value landed,
-// so the index is built from these rather than by reading the segment
-// back off disk.
-type sealed struct {
-	hash    string
-	order   [][32]byte
-	entries map[[32]byte]*DBBKey
-}
-
-// promoteLiveFile
-// Finish the live file's header, make it durable, and link it into
-// place as the sealed segment (height, seq) -- or the next free
-// sequence above it.  No record is copied.
-//
-// The seal is not the only identity minter: a compaction of history's
-// newest suffix names its output (historyNewest.Seq+1), and when the
-// active tier is empty that is exactly what nextKeyAt mints for the
-// seal.  The two race; the exclusive link turns what used to be a
-// silent overwrite (issue #61) into ErrExist here, and the seal takes
-// the sequence after -- correctly ordered, because the seal holds the
-// Mutex and anything that claimed the name is maintenance output at or
-// below it.  The caller must use the returned seq.
-func (s *SegmentStore) promoteLiveFile(height, seq uint64) (sl sealed, seqOut uint64, err error) {
-	count := s.liveRecords
-	if err = s.liveFile.Flush(); err != nil {
-		return sl, seq, err
-	}
-	var header [segDataHdrSize]byte
-	writeSegmentDataHeader(header[:], segKindSealed, count)
-	if err = s.liveFile.WriteAt(0, header[:]); err != nil {
-		return sl, seq, err
-	}
-	if err = s.liveFile.File.Sync(); err != nil {
-		return sl, seq, err
-	}
-	livePath := s.liveFile.Filename
-	if err = s.liveFile.File.Close(); err != nil {
-		return sl, seq, err
-	}
-	s.liveFile.File = nil
-	// Link, not rename: a rename would silently replace the file of a
-	// segment minted the same identity, turning the race above into
-	// data loss.  A taken name is skipped, audibly, and the squatter is
-	// never touched (issue #61).
-	var dataPath string
-	for {
-		dataPath = filepath.Join(s.Directory, segmentFileName(height, seq))
-		err = os.Link(livePath, dataPath)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return sl, seq, err
-		}
-		auditUnlink(s.Directory, fmt.Sprintf("seal-remint: %s is taken", segmentFileName(height, seq)))
-		seq++
-	}
-	if err = os.Remove(livePath); err != nil {
-		return sl, seq, err
-	}
-	// No directory fsync here: the manifest commit that ends this
-	// operation fsyncs the same directory, and that one barrier makes
-	// this rename durable too (see writeManifest)
-
-	// The rename moved no bytes, so the live tail's offsets are the
-	// sealed segment's offsets
-	sl.entries = s.live
-	sl.order = make([][32]byte, 0, len(s.live))
-	for key := range s.live {
-		sl.order = append(sl.order, key)
-	}
-	if !s.Mutable { // Immutable segments are transported; a peer verifies this
-		if sl.hash, _, err = hashAndCount(dataPath); err != nil {
-			return sl, seq, err
-		}
-	}
-	return sl, seq, nil
 }
 
 // DefaultCompactRatio
@@ -2891,7 +2716,7 @@ func (s *SegmentStore) writeMergedRun(run []*segment, height, seq uint64) (meta 
 	if err = bw.Flush(); err != nil {
 		return meta, nil, err
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		return meta, nil, err
 	}
 	if err = f.Close(); err != nil {
@@ -3054,7 +2879,7 @@ func (s *SegmentStore) concatSegments(segs []*segment, height, seq uint64) (meta
 	if err = bw.Flush(); err != nil {
 		return meta, nil, err
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		return meta, nil, err
 	}
 	if err = f.Close(); err != nil {
@@ -3332,6 +3157,8 @@ func (s *SegmentStore) sealedSegments() (segs []*segment) {
 // Importing a segment already present is a no-op, so an interrupted
 // sync resumes by re-running.
 func (s *SegmentStore) ImportSegmentFile(path string, meta SegmentMeta) (err error) {
+	s.commitMu.Lock() // It commits a manifest
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
@@ -3541,6 +3368,8 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 // Flush the live tail and release the segment files.  Records in the
 // live tail survive: they are replayed on open.
 func (s *SegmentStore) Close() (err error) {
+	s.commitMu.Lock() // Waits for a seal or a sync in flight
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	s.History.Lock() // Both, in the one order they may nest; not the protocol path
@@ -3574,6 +3403,19 @@ func (s *SegmentStore) Close() (err error) {
 		if err = s.liveFile.Close(); err != nil {
 			return err
 		}
+	}
+	if t := s.sealing; t != nil && t.file.File != nil {
+		// A seal that failed after its cut: the tail is at sealing.dat,
+		// and the next open folds it back into the live tail.  Made
+		// durable here, as the live tail is, so that a Close is the
+		// durability point for it too.
+		if err = fsync(t.file.File); err != nil {
+			return err
+		}
+		if err = t.file.File.Close(); err != nil {
+			return err
+		}
+		t.file.File = nil
 	}
 	for _, seg := range s.active {
 		seg.close()
@@ -3667,21 +3509,34 @@ func (r recordSort) Swap(i, j int) {
 // where each one's value sits in the data file.  Sealing and
 // compaction both know that as they write, so neither has to read the
 // segment back to index it.
+func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DBBKey) (err error) {
+	return writeIndexRecords(indexPath, indexRecords(order, entries))
+}
+
+// writeIndexFileTmp is writeIndexFile to a temporary path that the
+// caller renames once the data file has its name: a seal builds the
+// index before it knows the identity the exclusive link will give the
+// segment (seal.go).
+func writeIndexFileTmp(tmpPath string, order [][32]byte, entries map[[32]byte]*DBBKey) (err error) {
+	return writeIndexTmp(tmpPath, indexRecords(order, entries))
+}
+
+// indexRecords encodes and sorts a segment's index records.
 //
 // entries carry offsets into the data FILE, which is what every writer
 // has in hand -- the live tail's map, or the position it just wrote a
 // record at.  The index stores them relative to the body instead (see
 // segment.value), so the header's length comes off here, once, rather
 // than in every writer.
-func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DBBKey) (err error) {
-	buff := make([]byte, 0, len(order)*DBKeyFullSize)
+func indexRecords(order [][32]byte, entries map[[32]byte]*DBBKey) (buff []byte) {
+	buff = make([]byte, 0, len(order)*DBKeyFullSize)
 	for _, key := range order {
 		e := entries[key]
 		rel := DBBKey{Offset: e.Offset - segDataHdrSize, Length: e.Length}
 		buff = append(buff, rel.Bytes(key)...)
 	}
 	sort.Sort(recordSort(buff)) // Sorted by key, for binary search
-	return writeIndexRecords(indexPath, buff)
+	return buff
 }
 
 // writeIndexRecords
@@ -3689,6 +3544,21 @@ func writeIndexFile(indexPath string, order [][32]byte, entries map[[32]byte]*DB
 // body-relative: what a merge has in hand, since the sources' indexes
 // are already in this form and combining them never leaves the form.
 func writeIndexRecords(indexPath string, buff []byte) (err error) {
+	tmpPath := indexPath + segTmpSuffix
+	if err = writeIndexTmp(tmpPath, buff); err != nil {
+		return err
+	}
+	// No directory fsync: an index is derived data -- buildIndexFor
+	// reconstructs it from the .dat, which is what openSegment does
+	// when one is missing -- and the manifest commit that follows
+	// fsyncs this directory anyway
+	return os.Rename(tmpPath, indexPath)
+}
+
+// writeIndexTmp writes an index -- header, sorted records, bloom --
+// to a temporary path and fsyncs it, leaving the rename to the caller.
+// A failure removes the file.
+func writeIndexTmp(tmpPath string, buff []byte) (err error) {
 	count := uint64(len(buff) / DBKeyFullSize)
 	bloom := NewBloomSizedForKeys(count, 3)
 	for pos := 0; pos < len(buff); pos += DBKeyFullSize {
@@ -3697,7 +3567,6 @@ func writeIndexRecords(indexPath string, buff []byte) (err error) {
 		bloom.Set(key)
 	}
 
-	tmpPath := indexPath + segTmpSuffix
 	out, err := os.Create(tmpPath)
 	if err != nil {
 		return err
@@ -3724,7 +3593,7 @@ func writeIndexRecords(indexPath string, buff []byte) (err error) {
 	if _, err = out.Write(bloom.Map); err != nil {
 		return err
 	}
-	if err = out.Sync(); err != nil {
+	if err = fsync(out); err != nil {
 		return err
 	}
 	if err = out.Close(); err != nil {
@@ -3732,11 +3601,7 @@ func writeIndexRecords(indexPath string, buff []byte) (err error) {
 		return err
 	}
 	out = nil
-	// No directory fsync: an index is derived data -- buildIndexFor
-	// reconstructs it from the .dat, which is what openSegment does
-	// when one is missing -- and the manifest commit that follows
-	// fsyncs this directory anyway
-	return os.Rename(tmpPath, indexPath)
+	return nil
 }
 
 // identify
@@ -3805,7 +3670,7 @@ func copyFileSynced(src, dst string) (err error) {
 	if _, err = io.Copy(out, in); err != nil {
 		return err
 	}
-	if err = out.Sync(); err != nil {
+	if err = fsync(out); err != nil {
 		return err
 	}
 	if err = out.Close(); err != nil {
