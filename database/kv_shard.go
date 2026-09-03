@@ -281,7 +281,7 @@ func (k *KVShard) SetFilterBlocks(n uint64) (err error) {
 // PutDyna
 // Find the right shard, and put the key/value in the DynaKV in the shard
 func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
@@ -296,7 +296,7 @@ func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
 // PutPerm
 // Find the right shard, and put the key/value in the PermKV in the shard
 func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
@@ -311,7 +311,7 @@ func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
 // Put
 // Find the right shard, and put the key/value in said shard
 func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
@@ -326,7 +326,7 @@ func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 // GetDyna
 // Find the right shard, and extract the value from the DynaKV in the shard
 func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
@@ -341,7 +341,7 @@ func (k *KVShard) GetDyna(key [32]byte) (value []byte, err error) {
 // packed sets.  The explicit deep read (spec 1.3, 1.4) -- export and
 // query APIs -- never the protocol path, which stops at the window.
 func (k *KVShard) GetDeep(key [32]byte) (value []byte, err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil {
 		return
 	}
@@ -351,7 +351,7 @@ func (k *KVShard) GetDeep(key [32]byte) (value []byte, err error) {
 // GetPerm
 // Find the right shard, and extract the value from the PermKV in the shard
 func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
@@ -364,7 +364,7 @@ func (k *KVShard) GetPerm(key [32]byte) (value []byte, err error) {
 // Get
 // Find the right shard, and extract the value from said shard
 func (k *KVShard) Get(key [32]byte) (value []byte, err error) {
-	index := ShardIndex(key[:])
+	index := k.ShardIndex(key[:])
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
