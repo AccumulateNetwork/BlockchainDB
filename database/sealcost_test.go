@@ -21,7 +21,9 @@ import (
 // per shard, which is what a validator at a few hundred tx/s hands a
 // shard per block, followed by SealBlock.  A reader goroutine runs
 // Gets of earlier keys throughout, and records how long each took
-// while a SealBlock was in flight.
+// while a SealBlock was in flight and, separately, while none was:
+// the difference is what the seal costs a reader, and the second
+// figure is what the disk and the scheduler cost on their own.
 func TestSealBlockCost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("measurement; skipped in -short")
@@ -40,7 +42,7 @@ func TestSealBlockCost(t *testing.T) {
 	var knownMu sync.RWMutex
 
 	var sealing atomic.Bool
-	var readsDuringSeals []time.Duration
+	var readsDuringSeals, readsBetweenSeals []time.Duration
 	var readMu sync.Mutex
 	stop := make(chan struct{})
 	var readers sync.WaitGroup
@@ -69,11 +71,14 @@ func TestSealBlockCost(t *testing.T) {
 			start := time.Now()
 			_, _ = kvs.Get(key)
 			took := time.Since(start)
-			if inSeal && sealing.Load() {
-				readMu.Lock()
+			readMu.Lock()
+			switch {
+			case inSeal && sealing.Load():
 				readsDuringSeals = append(readsDuringSeals, took)
-				readMu.Unlock()
+			case !inSeal && !sealing.Load():
+				readsBetweenSeals = append(readsBetweenSeals, took)
 			}
+			readMu.Unlock()
 		}
 	}()
 
@@ -120,4 +125,5 @@ func TestSealBlockCost(t *testing.T) {
 	}
 	report("SealBlock, 8 shards", seals)
 	report("Get during a SealBlock", readsDuringSeals)
+	report("Get between SealBlocks", readsBetweenSeals) // The same reads with no seal in flight: what the disk and the scheduler cost on their own
 }
