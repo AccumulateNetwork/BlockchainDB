@@ -313,6 +313,8 @@ func (s *SegmentStore) FilterSizing() (capacity, peak uint64, fill []uint64) {
 // and a smaller N hands the oldest active segments to history as a
 // roll would.  Not the protocol path: it takes both locks.
 func (s *SegmentStore) SetFilterBlocks(n uint64) (err error) {
+	s.commitMu.Lock() // It commits a manifest
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	if err = s.checkOpen(); err != nil {

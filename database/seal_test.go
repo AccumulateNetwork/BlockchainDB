@@ -3,6 +3,7 @@ package blockchainDB
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -364,43 +365,209 @@ func TestInterruptedSealAfterTheLinkIsAdopted(t *testing.T) {
 	require.Equal(t, []byte("two"), v)
 }
 
-// TestSealFailureLeavesTheStoreReadableAndRecoverable
+// TestSealFailureIsResumedByTheNextSeal
 // A seal that fails after its cut leaves the tail staged.  Reads keep
-// working, the next seal says why it cannot proceed, and a close and
-// reopen recover the records.
-func TestSealFailureLeavesTheStoreReadableAndRecoverable(t *testing.T) {
+// working, the next seal finishes the staged one before cutting its
+// own, and nothing is sealed twice.
+func TestSealFailureIsResumedByTheNextSeal(t *testing.T) {
 	dir := storeDir(t, "sealfail")
 	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
+	defer store.Close()
 
 	kr := NewFastRandom([]byte{90})
 	k1 := kr.NextHash()
 	require.NoError(t, store.Put(k1, []byte("one")))
 	pending, err := store.beginSeal(1)
 	require.NoError(t, err)
-	// Make the link impossible: a directory squats on every name the
-	// remint loop would try is too much; a squatter on the index's
-	// staging name makes the index write fail instead
+	// A squatter on the index's staging name makes the index write
+	// fail, before the link
 	require.NoError(t, os.Mkdir(filepath.Join(dir, segSealingIndexTmp), 0o755))
 	_, err = pending.finish()
 	require.Error(t, err, "the seal must report the failure")
-	require.NoError(t, os.Remove(filepath.Join(dir, segSealingIndexTmp)))
+	require.NotNil(t, store.staged)
 
 	v, err := store.Get(k1)
 	require.NoError(t, err, "the cut tail is still readable after a failed seal")
 	require.Equal(t, []byte("one"), v)
-	_, err = store.Seal(1)
-	require.ErrorIs(t, err, errSealStaged)
+	_, err = store.Seal(2)
+	require.Error(t, err, "the squatter is still there: the resumed seal fails again")
+	require.NoError(t, os.Remove(filepath.Join(dir, segSealingIndexTmp)))
 
-	require.NoError(t, store.Close())
-	re, err := OpenSegmentStore(dir)
+	k2 := kr.NextHash()
+	require.NoError(t, store.Put(k2, []byte("two")))
+	meta, err := store.Seal(2)
+	require.NoError(t, err, "with the fault gone, the next seal resumes the staged one and then seals its own tail")
+	require.Nil(t, store.staged)
+	require.Equal(t, uint64(2), meta.Height)
+	require.Len(t, store.active, 2, "the staged seal at block 1, then this one")
+	require.Equal(t, uint64(1), store.active[0].meta.Height)
+	for k, want := range map[[32]byte]string{k1: "one", k2: "two"} {
+		v, err := store.Get(k)
+		require.NoError(t, err)
+		require.Equal(t, []byte(want), v)
+	}
+	_, err = os.Stat(filepath.Join(dir, segSealingName))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// TestSealFailureAfterTheLinkIsResumedWithoutALink
+// A failure after the cut file has its segment name must not link it
+// a second time on resume: the name it claimed is kept, and the file
+// keeps answering reads under it.
+func TestSealFailureAfterTheLinkIsResumedWithoutALink(t *testing.T) {
+	dir := storeDir(t, "sealfail-linked")
+	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
-	defer re.Close()
-	v, err = re.Get(k1)
+	defer store.Close()
+
+	kr := NewFastRandom([]byte{93})
+	k1 := kr.NextHash()
+	require.NoError(t, store.Put(k1, []byte("one")))
+	pending, err := store.beginSeal(1)
+	require.NoError(t, err)
+	// A squatter on the index's FINAL name: the link succeeds, the
+	// index rename after it fails
+	indexPath := filepath.Join(dir, strings.TrimSuffix(segmentFileName(1, 0), segDataSuffix)+segIndexSuffix)
+	require.NoError(t, os.Mkdir(indexPath, 0o755))
+	_, err = pending.finish()
+	require.Error(t, err)
+	require.Equal(t, filepath.Join(dir, segmentFileName(1, 0)), pending.dataPath, "linked before the failure")
+	_, err = os.Stat(filepath.Join(dir, segSealingName))
+	require.ErrorIs(t, err, os.ErrNotExist, "the staging name went with the link")
+
+	v, err := store.Get(k1)
+	require.NoError(t, err, "still readable through the file under its new name")
+	require.Equal(t, []byte("one"), v)
+
+	require.NoError(t, os.Remove(indexPath))
+	_, err = store.Seal(2)
+	require.NoError(t, err)
+	require.Len(t, store.active, 1, "block 2 was empty; the resumed seal is the one segment")
+	require.Equal(t, SegmentMeta{Height: 1, Seq: 0}, SegmentMeta{Height: store.active[0].meta.Height, Seq: store.active[0].meta.Seq})
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var dataFiles []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), segFilePrefix) && strings.HasSuffix(e.Name(), segDataSuffix) {
+			dataFiles = append(dataFiles, e.Name())
+		}
+	}
+	require.Equal(t, []string{segmentFileName(1, 0)}, dataFiles, "one name, not a second link at the next sequence")
+	v, err = store.Get(k1)
 	require.NoError(t, err)
 	require.Equal(t, []byte("one"), v)
-	_, err = re.Seal(1)
-	require.NoError(t, err, "sealing works again once the tail is recovered")
+}
+
+// TestKV2SealSyncsDynaWhenThePermCutFails
+// A Perm cut that is refused -- re-sealing a closed block -- must not
+// cost the Dyna layer its sync: the boundary covers both layers
+// (issue #29), whatever either says.
+func TestKV2SealSyncsDynaWhenThePermCutFails(t *testing.T) {
+	dir := storeDir(t, "kv2-permfail")
+	kv, err := NewKV2(dir, 1000)
+	require.NoError(t, err)
+	defer kv.Close()
+
+	kr := NewFastRandom([]byte{94})
+	_, err = kv.PutPerm(kr.NextHash(), []byte("p"))
+	require.NoError(t, err)
+	_, err = kv.Seal(1)
+	require.NoError(t, err)
+	_, err = kv.PutDyna(kr.NextHash(), []byte("d"))
+	require.NoError(t, err)
+	require.True(t, kv.DynaKV.liveDirty)
+
+	before := FsyncCount()
+	_, err = kv.Seal(0)
+	require.Error(t, err, "block 0 is closed")
+	require.False(t, kv.DynaKV.liveDirty, "the Dyna tail was synced regardless")
+	require.Equal(t, uint64(1), FsyncCount()-before, "the Dyna tail's one barrier")
+	require.Equal(t, uint64(2), kv.DynaKV.BlockHeight(), "and the Dyna block advanced regardless")
+}
+
+// TestRecoveryFoldIsIdempotent
+// A crash after the fold's rename landed but before the staging name
+// was removed leaves live.dat already holding the staged records.  The
+// next open must recognise that and not fold them in twice.
+func TestRecoveryFoldIsIdempotent(t *testing.T) {
+	dir := storeDir(t, "fold-twice")
+	store, err := NewSegmentStore(dir, true)
+	require.NoError(t, err)
+	kr := NewFastRandom([]byte{95})
+	k1, k2 := kr.NextHash(), kr.NextHash()
+	require.NoError(t, store.Put(k1, []byte("one")))
+	pending, err := store.beginSeal(1)
+	require.NoError(t, err)
+	defer pending.release()
+	require.NoError(t, store.Put(k2, []byte("two")))
+	require.NoError(t, store.liveFile.Flush())
+
+	staged, err := os.ReadFile(filepath.Join(dir, segSealingName))
+	require.NoError(t, err)
+	re, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), re.LiveRecords())
+	require.NoError(t, re.Close())
+
+	// The crash: the fold landed, the removal of sealing.dat did not
+	require.NoError(t, os.WriteFile(filepath.Join(dir, segSealingName), staged, 0o644))
+	re2, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer re2.Close()
+	require.Equal(t, uint64(2), re2.LiveRecords(), "the staged records are in the tail once")
+	_, err = os.Stat(filepath.Join(dir, segSealingName))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	for k, want := range map[[32]byte]string{k1: "one", k2: "two"} {
+		v, err := re2.Get(k)
+		require.NoError(t, err)
+		require.Equal(t, []byte(want), v)
+	}
+}
+
+// TestAutoSealHoldsNoShardLockAcrossItsBarriers
+// A Put that fills the tail begins the auto-seal under the shard's
+// shared lock and finishes it after letting go: with its barriers
+// parked, a Get of the shard -- and a writer queued for the exclusive
+// lock -- must go through (spec 1.6).
+func TestAutoSealHoldsNoShardLockAcrossItsBarriers(t *testing.T) {
+	dir := storeDir(t, "autoseal-gate")
+	kv, err := NewKV2(dir, 2)
+	require.NoError(t, err)
+	defer kv.Close()
+
+	kr := NewFastRandom([]byte{96})
+	k1, k2 := kr.NextHash(), kr.NextHash()
+	_, err = kv.PutPerm(k1, []byte("one"))
+	require.NoError(t, err)
+
+	parked, release := gateFsyncs(t)
+	var putErr error
+	done := make(chan struct{})
+	go func() {
+		_, putErr = kv.PutPerm(k2, []byte("two")) // Tips SealLimit: auto-seals
+		close(done)
+	}()
+	waitFor(t, "the auto-seal to reach a barrier", func() bool { return parked.Load() >= 1 })
+	within(t, 2*time.Second, "Get during an auto-seal", func() error {
+		for k, want := range map[[32]byte]string{k1: "one", k2: "two"} {
+			v, err := kv.Get(k)
+			if err != nil {
+				return err
+			}
+			require.Equal(t, []byte(want), v)
+		}
+		return nil
+	})
+	within(t, 2*time.Second, "the exclusive lock during an auto-seal", func() error {
+		kv.Mutex.Lock() // What Close, SetFilterBlocks and Seal take
+		kv.Mutex.Unlock()
+		return nil
+	})
+	release()
+	<-done
+	require.NoError(t, putErr)
+	require.Equal(t, 0, kv.PermKV.LiveCount(), "the tail was sealed")
 }
 
 // TestSealBarrierCount
@@ -475,9 +642,9 @@ func TestSealBarrierCount(t *testing.T) {
 
 // TestFilterRebuildKeepsTheCutTail
 // Between a seal's halves the cut tail is in no segment and not the
-// live tail.  A filter rebuilt then -- SetFilterBlocks does it -- must
-// still hold its keys, or the segment they land in is denied by the
-// filters that claim to cover it: a false "absent" (issue #35).
+// live tail.  A filter rebuilt then must still hold its keys, or the
+// segment they land in is denied by the filters that claim to cover
+// it: a false "absent" (issue #35).
 func TestFilterRebuildKeepsTheCutTail(t *testing.T) {
 	dir := storeDir(t, "cutfilter")
 	store, err := NewSegmentStore(dir, false)
@@ -489,7 +656,9 @@ func TestFilterRebuildKeepsTheCutTail(t *testing.T) {
 	require.NoError(t, store.Put(k, []byte("cut")))
 	pending, err := store.beginSeal(1)
 	require.NoError(t, err)
-	require.NoError(t, store.SetFilterBlocks(2*MinFilterBlocks), "rebuilds every filter")
+	store.Mutex.Lock() // What any rebuild between the halves does
+	require.NoError(t, store.rebuildKeyFilters())
+	store.Mutex.Unlock()
 	_, err = pending.finish()
 	require.NoError(t, err)
 

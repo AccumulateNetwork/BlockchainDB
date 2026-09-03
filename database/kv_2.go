@@ -307,40 +307,63 @@ func (k *KV2) GetDeep(key [32]byte) (value []byte, err error) {
 // PutDyna
 // Use when the k/v is known to be a dynamic k/v
 func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
-	k.Mutex.RLock() // Shared: see Put (issue #66)
+	var autoSeal *pendingSeal
+	defer func() { err = finishAutoSeal(autoSeal, err) }() // After the unlock below
+	k.Mutex.RLock()                                        // Shared: see Put (issue #66)
 	defer k.Mutex.RUnlock()
 	k.dWrites.Add(1)
 	if err = k.DynaKV.Put(key, value); err != nil {
 		return int(k.dWrites.Load()), err
 	}
-	return int(k.dWrites.Load()), k.sealDynaIfFull()
+	autoSeal, err = k.sealDynaIfFull()
+	return int(k.dWrites.Load()), err
 }
 
 // PutPerm
 // Use when the k/v is known to be a permanent (immutable) k/v
 func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
-	k.Mutex.RLock() // Shared: see Put (issue #66)
+	var autoSeal *pendingSeal
+	defer func() { err = finishAutoSeal(autoSeal, err) }() // After the unlock below
+	k.Mutex.RLock()                                        // Shared: see Put (issue #66)
 	defer k.Mutex.RUnlock()
 	k.pWrites.Add(1)
 	if err = k.PermKV.Put(key, value); err != nil {
 		return int(k.dWrites.Load()), err
 	}
-	return int(k.dWrites.Load()), k.sealPermIfFull()
+	autoSeal, err = k.sealPermIfFull()
+	return int(k.dWrites.Load()), err
+}
+
+// finishAutoSeal is the second half of an auto-seal a Put began: it
+// runs after the Put has released the shard's lock, so that the
+// seal's barriers hold up no reader of the shard (spec 1.6).  A Put
+// that fails before it begins one has nothing to finish.
+func finishAutoSeal(p *pendingSeal, err error) error {
+	if p == nil {
+		return err
+	}
+	if _, sealErr := p.finish(); err == nil {
+		err = sealErr
+	}
+	return err
 }
 
 // sealPermIfFull
-// Seal the Perm layer once its live tail reaches SealLimit keys, so
-// the unsealed tail (and the memory tracking it) stays bounded between
-// block boundaries.  The caller must hold the KV2 lock, shared or
+// Begin sealing the Perm layer once its live tail reaches SealLimit
+// keys, so the unsealed tail (and the memory tracking it) stays
+// bounded between block boundaries.  Only the cut happens here, under
+// the shard's lock; the caller finishes the seal once it has let the
+// lock go (finishAutoSeal), so that the barriers hold up no reader --
+// the lock is shared, but a writer queued behind it would block every
+// new reader for as long as it is held (spec 1.6, issue #84).  The caller must hold the KV2 lock, shared or
 // exclusive: SealLimit is written only before the database is
 // published and under the exclusive lock in Open, and the layer
 // serializes its own seal.
-func (k *KV2) sealPermIfFull() (err error) {
+func (k *KV2) sealPermIfFull() (p *pendingSeal, err error) {
 	if k.SealLimit <= 0 || k.PermKV.LiveCount() < k.SealLimit {
-		return nil
+		return nil, nil
 	}
-	_, err = k.PermKV.SealNext()
-	return err
+	return k.PermKV.beginSealNext()
 }
 
 // sealDynaIfFull
@@ -350,12 +373,11 @@ func (k *KV2) sealPermIfFull() (err error) {
 // key count flat while the tail grew without bound -- and that tail is
 // replayed in full on every open.  The caller must hold the KV2 lock,
 // shared or exclusive; see sealPermIfFull.
-func (k *KV2) sealDynaIfFull() (err error) {
+func (k *KV2) sealDynaIfFull() (p *pendingSeal, err error) {
 	if k.SealLimit <= 0 || k.DynaKV.LiveRecords() < uint64(k.SealLimit) {
-		return nil
+		return nil, nil
 	}
-	_, err = k.DynaKV.SealNext()
-	return err
+	return k.DynaKV.beginSealNext()
 }
 
 // Seal
@@ -376,9 +398,9 @@ func (k *KV2) sealDynaIfFull() (err error) {
 // cutting one per block and a full seal per block per shard to pay
 // for.  A sync on a tail that took no writes is free.
 //
-// Both layers are advanced before either error is returned, so a
-// failure to sync Dyna does not leave Perm unsealed and the block
-// unrepeatable.
+// Both layers are cut and both are finished whatever the other does,
+// so a failure in one does not leave the other's block unclosed and
+// unrepeatable; the Perm error is the one reported when both fail.
 //
 // The Dyna layer is also told the block, so that it ages.  Its
 // segments are tagged with the block they were sealed in and its
@@ -401,10 +423,6 @@ func (k *KV2) sealDynaIfFull() (err error) {
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
 	perm, err := k.PermKV.beginSeal(height)
-	if err != nil {
-		k.Mutex.Unlock()
-		return meta, err
-	}
 	dyna, dynaErr := k.DynaKV.beginSync()
 	k.DynaKV.AdvanceBlock(height + 1)
 	k.Mutex.Unlock()
@@ -419,7 +437,9 @@ func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 			dynaErr = dyna.finish()
 		}()
 	}
-	meta, err = perm.finish()
+	if perm != nil {
+		meta, err = perm.finish()
+	}
 	wg.Wait()
 	if err == nil {
 		err = dynaErr
@@ -462,6 +482,8 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	// finds the value identical (a no-op) or moves the key to Dyna,
 	// where the newest record wins -- the rule every read already
 	// follows.  The counters are atomic for the same reason.
+	var autoSeal *pendingSeal
+	defer func() { err = finishAutoSeal(autoSeal, err) }() // After the unlock below
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
 
@@ -473,7 +495,8 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		if err = k.DynaKV.Put(key, value); err != nil { // If the value DID change, update
 			return int(k.dWrites.Load()), err
 		}
-		return int(k.dWrites.Load()), k.sealDynaIfFull()
+		autoSeal, err = k.sealDynaIfFull()
+		return int(k.dWrites.Load()), err
 	}
 	// One lookup settles all three Perm cases: absent (in which case the
 	// write has already happened), present and identical (nothing to
@@ -487,7 +510,8 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	}
 	if !existed { // It is a new permanent key, and it is now written
 		k.pWrites.Add(1)
-		return int(k.dWrites.Load()), k.sealPermIfFull() // PermKV is never compacted; report DWrites
+		autoSeal, err = k.sealPermIfFull()
+		return int(k.dWrites.Load()), err // PermKV is never compacted; report DWrites
 	}
 	if bytes.Equal(existing, value) { // If no change, ignore;
 		// DWrites, like every other path here: the count the caller
@@ -502,7 +526,8 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
 		return int(k.dWrites.Load()), err
 	}
-	return int(k.dWrites.Load()), k.sealDynaIfFull()
+	autoSeal, err = k.sealDynaIfFull()
+	return int(k.dWrites.Load()), err
 }
 
 // Compress

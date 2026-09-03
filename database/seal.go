@@ -1,6 +1,7 @@
 package blockchainDB
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -32,24 +33,34 @@ import (
 // commits by commitMu alone.  Reads meanwhile answer from the cut tail
 // (SegmentStore.sealing) exactly as they answered from the live one,
 // and writes go to the new tail, so nothing on the protocol path waits
-// for a barrier.  The data and index fsyncs overlap each other, and a
-// shard's Dyna sync overlaps its Perm seal (KV2.Seal); the shards of a
-// set seal concurrently (KVShard.SealBlock).  The barriers a seal
-// issues are the same ones; what changed is that nothing else waits
-// behind them, and they no longer wait behind each other.
+// for a barrier.  The data fsync, the index and the hash overlap each
+// other, and a shard's Dyna sync overlaps its Perm seal (KV2.Seal);
+// the shards of a set seal concurrently (KVShard.SealBlock).  The
+// barriers a seal issues are the same ones; what changed is that
+// nothing else waits behind them, and they no longer wait behind each
+// other.
 //
-// Measured (TestSealBlockCost, NVMe, ~5 ms per fsync, 8 shards, ~200
+// Measured (TestSealBlockCost, NVMe, ~5.5 ms per fsync, 8 shards, ~200
 // records per shard per block): a block boundary went from 253 ms
-// mean and 382 ms worst to 50 ms and 67 ms, and the worst Get issued
-// during one from 56 ms to 1.8 ms.  On the soak host's 17 ms fsyncs
-// the boundary was 0.7-0.8 s; the same arithmetic puts it near 0.1 s.
+// mean and 382 ms worst to ~50 ms and ~70 ms, and the worst Get issued
+// during one from 56 ms to under 2 ms.  What remains is five waves of
+// barriers -- data alongside index and Dyna, manifest, directory, then
+// the block record's two -- and on ext4 a wave of concurrent fsyncs
+// costs about two journal commits rather than one (8 at once measured
+// 10.7 ms against 5.5 ms for one), so a boundary is ~45 ms on this
+// disk rather than the ~27 ms five single barriers would be.  On the
+// soak host's 17 ms fsyncs the boundary was 0.7-0.8 s; the same
+// arithmetic puts it near 0.15 s.
 //
 // The crash contract is unchanged: a file is durable before it is
 // named, and the manifest commit is the one commit point (spec 1.8).
 // The cut adds one recoverable state -- a tail sitting at sealing.dat
 // whose seal did not complete -- and recoverSealingTail folds it back
 // into the live tail on open, so its records are exactly as durable
-// as they were as the live tail they had just been.
+// as they were as the live tail they had just been.  In-process, a
+// seal whose second half failed is resumed by the next seal
+// (SegmentStore.staged), so a transient error costs one block's
+// delay, not the store.
 
 // segSealingName is where a cut tail sits between the cut and the
 // link that gives it its segment name.  One per store: seals are
@@ -60,6 +71,11 @@ const segSealingName = "sealing.dat"
 // renamed to the segment's index name once the data file has its
 // name.  A .tmp, so an open after a crash removes it unread.
 const segSealingIndexTmp = "sealing.idx" + segTmpSuffix
+
+// segFoldingName is where recovery builds the live tail it folds a
+// cut tail into (recoverSealingTail).  A .tmp: incomplete until it is
+// renamed over live.dat.
+const segFoldingName = "folding.dat" + segTmpSuffix
 
 // fsyncs counts every barrier this package issues, so that what a
 // seal or a block boundary costs is measured rather than assumed
@@ -86,12 +102,6 @@ func fsync(f *os.File) error {
 // asking what a block boundary costs.
 func FsyncCount() uint64 { return fsyncs.Load() }
 
-// errSealStaged says a seal of this store was cut and then failed to
-// finish, so its tail sits at sealing.dat.  The store still answers
-// reads from it; closing and reopening the store folds it back into
-// the live tail (recoverSealingTail), after which sealing works again.
-var errSealStaged = errors.New("a previous seal of this store failed after cutting the tail; close and reopen the store to recover it")
-
 // sealingTail is a live tail that has been cut but not yet named:
 // its map and its file, now at sealing.dat, open for reading only.
 // Readers consult it under the Mutex, between the live tail and the
@@ -99,7 +109,6 @@ var errSealStaged = errors.New("a previous seal of this store failed after cutti
 type sealingTail struct {
 	entries map[[32]byte]*DBBKey
 	file    *BFile // Flushed; File stays open for readers until the segment replaces it
-	records uint64 // Physical records, for the header
 
 	order [][32]byte // The keys, in the order the index is built in
 	hash  string     // Set by promote in an immutable store
@@ -109,13 +118,22 @@ type sealingTail struct {
 // store's commitMu is held, and finish owes the store a segment (or
 // an error, or nothing at all when the tail was empty) and the release
 // of commitMu.
+//
+// The second half records how far it got -- dataPath once the file is
+// linked, seg once it is promoted, swapped once it is in the active
+// tier -- so that a failure leaves a seal the next one resumes from
+// that point, rather than a store that can never seal again.
 type pendingSeal struct {
 	s             *SegmentStore
 	height, seq   uint64
 	blockBoundary bool
 	tail          *sealingTail    // nil when there was nothing to cut
 	record        *manifestCommit // A boundary with nothing to seal may still owe a manifest
-	released      bool
+
+	dataPath string   // The segment name the cut file is linked at, once it is
+	seg      *segment // The promoted segment, once it is
+	swapped  bool     // In the active tier, in place of the cut tail
+	released bool
 }
 
 // Seal
@@ -154,9 +172,30 @@ func (s *SegmentStore) SealNext() (meta SegmentMeta, err error) {
 // boundary.  On success the returned seal holds commitMu until it is
 // finished, and the caller MUST finish it.
 func (s *SegmentStore) beginSeal(height uint64) (p *pendingSeal, err error) {
+	return s.beginCut(height, true)
+}
+
+// beginSealNext is the first half of SealNext: the cut at the block
+// the tail is accumulating.
+func (s *SegmentStore) beginSealNext() (p *pendingSeal, err error) {
+	return s.beginCut(0, false)
+}
+
+// beginCut takes commitMu, resumes any seal a failure left behind,
+// and cuts the tail under the Mutex.  On error commitMu is released;
+// on success the returned seal holds it.  Without blockBoundary the
+// height is the block the tail is in, read under the locks.
+func (s *SegmentStore) beginCut(height uint64, blockBoundary bool) (p *pendingSeal, err error) {
 	s.commitMu.Lock()
+	if err = s.finishStaged(); err != nil {
+		s.commitMu.Unlock()
+		return nil, err
+	}
 	s.Mutex.Lock()
-	p, err = s.cutTail(height, true)
+	if !blockBoundary {
+		height = s.blockHeight
+	}
+	p, err = s.cutTail(height, blockBoundary)
 	s.Mutex.Unlock()
 	if err != nil {
 		s.commitMu.Unlock()
@@ -164,17 +203,19 @@ func (s *SegmentStore) beginSeal(height uint64) (p *pendingSeal, err error) {
 	return p, err
 }
 
-// beginSealNext is the first half of SealNext: the cut at the block
-// the tail is accumulating, which is read under the locks.
-func (s *SegmentStore) beginSealNext() (p *pendingSeal, err error) {
-	s.commitMu.Lock()
-	s.Mutex.Lock()
-	p, err = s.cutTail(s.blockHeight, false)
-	s.Mutex.Unlock()
-	if err != nil {
-		s.commitMu.Unlock()
+// finishStaged resumes a seal whose second half failed, if there is
+// one.  The caller must hold commitMu.  Success clears it; failure
+// leaves it for the next attempt, with the error.
+func (s *SegmentStore) finishStaged() (err error) {
+	p := s.staged
+	if p == nil {
+		return nil
 	}
-	return p, err
+	if _, err = p.resume(); err != nil {
+		return fmt.Errorf("resuming the seal of (block %d, seq %d): %w", p.height, p.seq, err)
+	}
+	s.staged = nil
+	return nil
 }
 
 // cutTail is the half of a seal that needs the store to hold still.
@@ -191,8 +232,8 @@ func (s *SegmentStore) cutTail(height uint64, blockBoundary bool) (p *pendingSea
 	if err = s.checkOpen(); err != nil {
 		return nil, err
 	}
-	if s.sealing != nil {
-		return nil, errSealStaged
+	if s.sealing != nil { // finishStaged ran first, so this is a bug, not a state
+		return nil, fmt.Errorf("a cut tail is still staged; the seal of block %d cannot start", height)
 	}
 	if blockBoundary && s.blockHeight > height {
 		return nil, fmt.Errorf("block %d is already closed; now accumulating block %d", height, s.blockHeight)
@@ -204,8 +245,9 @@ func (s *SegmentStore) cutTail(height uint64, blockBoundary bool) (p *pendingSea
 	p = &pendingSeal{s: s, height: height, seq: seq, blockBoundary: blockBoundary}
 	if len(s.live) == 0 {
 		// Nothing to seal, but a block boundary still closes the block:
-		// the next writes belong to the block after this one
-		if blockBoundary && s.blockHeight <= height {
+		// the next writes belong to the block after this one, which is
+		// why the advance is here, under the lock, and not in finish
+		if blockBoundary {
 			s.advanceBlock(height + 1)
 			if !s.ExternalBlockRecord { // Else recorded once for the whole shard set
 				c := s.buildManifest()
@@ -244,7 +286,7 @@ func (s *SegmentStore) cutTail(height uint64, blockBoundary bool) (p *pendingSea
 	if err = os.Rename(livePath, stagedPath); err != nil {
 		return nil, err
 	}
-	tail := &sealingTail{entries: s.live, file: s.liveFile, records: count}
+	tail := &sealingTail{entries: s.live, file: s.liveFile}
 	tail.file.Filename = stagedPath
 	s.live = make(map[[32]byte]*DBBKey)
 	if err = s.newLiveFile(); err != nil {
@@ -262,20 +304,33 @@ func (s *SegmentStore) cutTail(height uint64, blockBoundary bool) (p *pendingSea
 }
 
 // finish is the second half of a seal: make the cut tail durable,
-// name it, and commit.  Releases commitMu whatever happens.
+// name it, and commit.  Releases commitMu whatever happens.  A
+// failure after the cut leaves the seal staged for the next seal (or
+// Close) to resume; the store keeps answering reads from the cut tail
+// meanwhile.
 func (p *pendingSeal) finish() (meta SegmentMeta, err error) {
 	defer p.release()
+	if meta, err = p.resume(); err != nil && p.tail != nil {
+		p.s.staged = p
+	}
+	return meta, err
+}
+
+// resume does whatever of the second half is still to do.  The caller
+// must hold commitMu.
+func (p *pendingSeal) resume() (meta SegmentMeta, err error) {
 	if p.tail == nil {
 		if p.record != nil {
 			return meta, p.s.commitManifest(*p.record)
 		}
 		return meta, nil
 	}
-	seg, err := p.promote()
-	if err != nil {
-		return meta, err
+	if p.seg == nil {
+		if p.seg, err = p.promote(); err != nil {
+			return meta, err
+		}
 	}
-	return p.commit(seg)
+	return p.commit()
 }
 
 // release gives commitMu back; idempotent
@@ -292,10 +347,12 @@ func (p *pendingSeal) release() {
 // hold commitMu and must NOT hold the Mutex: this is the half that
 // waits on the disk.
 //
-// The data fsync and the index's build-and-fsync run together: the
-// index is built from the map in hand, not from the file, so it needs
-// nothing the fsync is waiting for, and two barriers in flight at once
-// cost about one.
+// The data fsync, the index's build-and-fsync and the hash run
+// together.  The index is built from the map in hand, not from the
+// file, and the hash reads a file whose content is final at the cut,
+// so neither needs anything the fsync is waiting for.  Measured on a
+// 50k-record tail, the hash alone is ~8 ms, a fifth of the seal, and
+// in series it was the only piece of a seal still waiting on another.
 //
 // The seal is not the only identity minter: a compaction of history's
 // newest suffix names its output (historyNewest.Seq+1), and when the
@@ -305,21 +362,35 @@ func (p *pendingSeal) release() {
 // the sequence after -- correctly ordered, because the seal holds
 // commitMu and anything that claimed the name is maintenance output
 // at or below it.  The identity the seal ends up with is p.seq.
+//
+// Resumable: a retry after a failure repeats the barriers -- cheap on
+// a file already durable -- but never the link, since the name it
+// claimed is recorded in p.dataPath.
 func (p *pendingSeal) promote() (seg *segment, err error) {
 	s, tail := p.s, p.tail
-	tail.order = make([][32]byte, 0, len(tail.entries))
-	for key := range tail.entries {
-		tail.order = append(tail.order, key)
+	if tail.order == nil {
+		tail.order = make([][32]byte, 0, len(tail.entries))
+		for key := range tail.entries {
+			tail.order = append(tail.order, key)
+		}
 	}
 	indexTmp := filepath.Join(s.Directory, segSealingIndexTmp)
+	filePath := tail.file.Filename // sealing.dat, or the segment name once linked
 
 	var wg sync.WaitGroup
-	var indexErr error
+	var indexErr, hashErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		indexErr = writeIndexFileTmp(indexTmp, tail.order, tail.entries)
 	}()
+	if !s.Mutable { // Immutable segments are transported; a peer verifies this
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tail.hash, _, hashErr = hashAndCount(filePath)
+		}()
+	}
 	dataErr := fsync(tail.file.File)
 	wg.Wait()
 	if dataErr != nil {
@@ -329,44 +400,46 @@ func (p *pendingSeal) promote() (seg *segment, err error) {
 	if indexErr != nil {
 		return nil, indexErr
 	}
+	if hashErr != nil {
+		os.Remove(indexTmp)
+		return nil, hashErr
+	}
 
-	// Link, not rename: a rename would silently replace the file of a
-	// segment minted the same identity, turning the race above into
-	// data loss.  A taken name is skipped, audibly, and the squatter is
-	// never touched (issue #61).
-	stagedPath := tail.file.Filename
-	var dataPath string
-	for {
-		dataPath = filepath.Join(s.Directory, segmentFileName(p.height, p.seq))
-		err = os.Link(stagedPath, dataPath)
-		if err == nil {
-			break
+	if p.dataPath == "" {
+		// Link, not rename: a rename would silently replace the file of
+		// a segment minted the same identity, turning the race above
+		// into data loss.  A taken name is skipped, audibly, and the
+		// squatter is never touched (issue #61).
+		for {
+			dataPath := filepath.Join(s.Directory, segmentFileName(p.height, p.seq))
+			err = os.Link(filePath, dataPath)
+			if err == nil {
+				p.dataPath = dataPath
+				break
+			}
+			if !errors.Is(err, os.ErrExist) {
+				os.Remove(indexTmp)
+				return nil, err
+			}
+			auditUnlink(s.Directory, fmt.Sprintf("seal-remint: %s is taken", segmentFileName(p.height, p.seq)))
+			p.seq++
 		}
-		if !errors.Is(err, os.ErrExist) {
-			os.Remove(indexTmp)
+		// The file answers to its segment name from here on; the
+		// staging name goes, and a retry must not link it again
+		tail.file.Filename = p.dataPath
+		if err = os.Remove(filePath); err != nil {
 			return nil, err
 		}
-		auditUnlink(s.Directory, fmt.Sprintf("seal-remint: %s is taken", segmentFileName(p.height, p.seq)))
-		p.seq++
+		// No directory fsync here: the manifest commit that ends this
+		// operation fsyncs the same directory, and that one barrier
+		// makes this link durable too (see commitManifest)
 	}
-	if err = os.Remove(stagedPath); err != nil {
-		return nil, err
-	}
-	// No directory fsync here: the manifest commit that ends this
-	// operation fsyncs the same directory, and that one barrier makes
-	// this link durable too (see commitManifest)
 
-	if !s.Mutable { // Immutable segments are transported; a peer verifies this
-		if tail.hash, _, err = hashAndCount(dataPath); err != nil {
-			return nil, err
-		}
-	}
-	indexPath := strings.TrimSuffix(dataPath, segDataSuffix) + segIndexSuffix
+	indexPath := strings.TrimSuffix(p.dataPath, segDataSuffix) + segIndexSuffix
 	if err = os.Rename(indexTmp, indexPath); err != nil {
 		return nil, err
 	}
-
-	meta := SegmentMeta{Height: p.height, Seq: p.seq, File: filepath.Base(dataPath),
+	meta := SegmentMeta{Height: p.height, Seq: p.seq, File: filepath.Base(p.dataPath),
 		Count: uint64(len(tail.order)), Hash: tail.hash}
 	if seg, err = s.openSegment(meta); err != nil {
 		return nil, err
@@ -378,31 +451,35 @@ func (p *pendingSeal) promote() (seg *segment, err error) {
 // commit puts the promoted segment in the active tier, in place of the
 // cut tail, and commits the manifest that names it.  The Mutex is
 // held for the swap and the manifest's construction; the commit's
-// barriers run without it.
-func (p *pendingSeal) commit(seg *segment) (meta SegmentMeta, err error) {
+// barriers run without it.  Resumable: a retry after a failed commit
+// rebuilds the manifest and commits again, without swapping twice.
+func (p *pendingSeal) commit() (meta SegmentMeta, err error) {
 	s, tail := p.s, p.tail
 	s.Mutex.Lock()
-	s.active = append(s.active, seg)
-	s.sealing = nil // Readers find the keys in the segment from here on
-	if tail.file.File != nil {
-		tail.file.File.Close() // No reader holds it: they read under the Mutex
-		tail.file.File = nil
-	}
-	// The tail's keys are in every live filter already, and the segment
-	// they now sit in is inside the window by construction, so the
-	// filters cover it; advancing the block is what may roll them, and
-	// what may hand the oldest active segments to history
-	s.advanceBlock(p.height)
-	if p.blockBoundary {
-		s.advanceBlock(p.height + 1) // The next writes belong to the next block
+	if !p.swapped {
+		s.active = append(s.active, p.seg)
+		s.sealing = nil // Readers find the keys in the segment from here on
+		if tail.file.File != nil {
+			tail.file.File.Close() // No reader holds it: they read under the Mutex
+			tail.file.File = nil
+		}
+		// The tail's keys are in every live filter already, and the
+		// segment they now sit in is inside the window by construction,
+		// so the filters cover it; advancing the block is what may roll
+		// them, and what may hand the oldest active segments to history
+		s.advanceBlock(p.height)
+		if p.blockBoundary {
+			s.advanceBlock(p.height + 1) // The next writes belong to the next block
+		}
+		p.swapped = true
 	}
 	c := s.buildManifest()
 	s.Mutex.Unlock()
 
 	if err = s.commitManifest(c); err != nil {
-		return seg.meta, err
+		return p.seg.meta, err
 	}
-	return seg.meta, nil
+	return p.seg.meta, nil
 }
 
 // pendingSync is a Sync between its halves: the tail's buffer is
@@ -533,11 +610,18 @@ func (p *pendingSync) release() {
 //     replayed as well.
 //   - Not linked: the seal got no further than the cut, or its fsync.
 //     The file's records precede everything in live.dat -- the tail
-//     started at the cut -- so live.dat's whole records are appended
-//     to it and it becomes live.dat.  Either file may be torn at its
-//     end, live.dat by the crash and sealing.dat because nothing had
-//     fsynced it; each is cut at its last whole record first, as
-//     replay would cut it.
+//     started at the cut -- so a new tail is built from its whole
+//     records followed by live.dat's, made durable, and renamed over
+//     live.dat.  Either file may be torn at its end, live.dat by the
+//     crash and sealing.dat because nothing had fsynced it; each is
+//     cut at its last whole record, as replay would cut it.
+//
+// Neither input is modified, so a crash during the fold leaves the
+// next open the same two files and the same job.  The one state that
+// needs recognising is a fold that landed but whose removal of the
+// staging name did not: then live.dat already begins with the staged
+// records, byte for byte, and the staged file is dropped rather than
+// folded twice.
 func (s *SegmentStore) recoverSealingTail() (err error) {
 	stagedPath := filepath.Join(s.Directory, segSealingName)
 	fi, err := os.Stat(stagedPath)
@@ -548,6 +632,7 @@ func (s *SegmentStore) recoverSealingTail() (err error) {
 		return err
 	}
 	livePath := filepath.Join(s.Directory, segLiveName)
+	foldingPath := filepath.Join(s.Directory, segFoldingName)
 
 	entries, err := os.ReadDir(s.Directory)
 	if err != nil {
@@ -568,81 +653,131 @@ func (s *SegmentStore) recoverSealingTail() (err error) {
 		auditUnlink(s.Directory, "recoverSealingTail-empty", stagedPath)
 		return os.Remove(stagedPath)
 	}
-	end, err := wholeRecordsEnd(stagedPath)
-	if err != nil {
-		return err
-	}
-	staged, err := os.OpenFile(stagedPath, os.O_RDWR, 0)
+	staged, err := os.Open(stagedPath)
 	if err != nil {
 		return err
 	}
 	defer staged.Close()
-	if err = staged.Truncate(int64(end)); err != nil {
+	stagedEnd, err := scanTailRecords(staged, uint64(fi.Size()), nil)
+	if err != nil {
+		return err
+	}
+
+	// live.dat's whole records, if it has any; and the check for a
+	// fold that already landed
+	var live *os.File
+	var liveEnd uint64
+	if lfi, statErr := os.Stat(livePath); statErr == nil && lfi.Size() > segDataHdrSize {
+		if live, err = os.Open(livePath); err != nil {
+			return err
+		}
+		defer live.Close()
+		if liveEnd, err = scanTailRecords(live, uint64(lfi.Size()), nil); err != nil {
+			return err
+		}
+		if liveEnd >= stagedEnd {
+			same, err := sameBytes(staged, live, segDataHdrSize, stagedEnd-segDataHdrSize)
+			if err != nil {
+				return err
+			}
+			if same {
+				auditUnlink(s.Directory, "recoverSealingTail-already-folded", stagedPath)
+				return os.Remove(stagedPath)
+			}
+		}
+	}
+
+	out, err := os.Create(foldingPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if out != nil {
+			out.Close()
+			os.Remove(foldingPath)
+		}
+	}()
+	if _, err = io.Copy(out, io.NewSectionReader(staged, 0, int64(stagedEnd))); err != nil {
 		return err
 	}
 	var appended int64
-	if lfi, statErr := os.Stat(livePath); statErr == nil && lfi.Size() > segDataHdrSize {
-		liveEnd, err := wholeRecordsEnd(livePath)
-		if err != nil {
-			return err
-		}
-		live, err := os.Open(livePath)
-		if err != nil {
-			return err
-		}
-		body := io.NewSectionReader(live, segDataHdrSize, int64(liveEnd)-segDataHdrSize)
-		if _, err = staged.Seek(int64(end), io.SeekStart); err != nil {
-			live.Close()
-			return err
-		}
-		appended, err = io.Copy(staged, body)
-		live.Close()
-		if err != nil {
+	if live != nil {
+		if appended, err = io.Copy(out, io.NewSectionReader(live, segDataHdrSize, int64(liveEnd)-segDataHdrSize)); err != nil {
 			return err
 		}
 	}
-	if err = fsync(staged); err != nil {
+	if err = fsync(out); err != nil {
 		return err
 	}
-	if err = os.Remove(livePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err = out.Close(); err != nil {
+		out = nil
 		return err
 	}
-	if err = os.Rename(stagedPath, livePath); err != nil {
+	out = nil
+	// live.dat is not a segment file, so replacing it is the point (1.7
+	// is about published names).  The new tail is durable before it is
+	// named; the staging name goes only once the name is.
+	if err = os.Rename(foldingPath, livePath); err != nil {
 		return err
 	}
-	auditUnlink(s.Directory, fmt.Sprintf("recoverSealingTail-folded(%d bytes staged, %d bytes of live.dat appended)", end, appended))
+	if err = syncDir(s.Directory); err != nil {
+		return err
+	}
+	auditUnlink(s.Directory, fmt.Sprintf("recoverSealingTail-folded(%d bytes staged, %d bytes of live.dat appended)", stagedEnd, appended), stagedPath)
+	if err = os.Remove(stagedPath); err != nil {
+		return err
+	}
 	return syncDir(s.Directory)
 }
 
-// wholeRecordsEnd is the offset just past the last whole record in a
-// tail file: where a replay would stop, and where a torn record from
-// a crash mid-write begins.
-func wholeRecordsEnd(path string) (end uint64, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return 0, err
-	}
-	size := uint64(fi.Size())
+// scanTailRecords walks a tail file's records -- key, length, value --
+// from the header to the last whole one, and reports where that one
+// ends: where a replay stops, and where a torn record from a crash
+// mid-write begins.  visit, if given, sees each whole record.  The one
+// reader of the tail format, for replay and for recovery alike.
+func scanTailRecords(r io.ReaderAt, size uint64, visit func(key [32]byte, valueOffset, length uint64)) (end uint64, err error) {
 	end = segDataHdrSize
 	var recHdr [segRecHdrSize]byte
 	for end+segRecHdrSize <= size {
-		if _, err = f.ReadAt(recHdr[:], int64(end)); err != nil {
+		if _, err = r.ReadAt(recHdr[:], int64(end)); err != nil {
 			return 0, err
 		}
 		length := binary.BigEndian.Uint64(recHdr[32:])
 		if length > size { // Garbage, or torn: what follows is not a record
 			break
 		}
-		next := end + segRecHdrSize + length
-		if next > size {
-			break
+		valueOffset := end + segRecHdrSize
+		if valueOffset+length > size {
+			break // Torn tail record from a crash mid-write; drop it
 		}
-		end = next
+		if visit != nil {
+			var key [32]byte
+			copy(key[:], recHdr[:32])
+			visit(key, valueOffset, length)
+		}
+		end = valueOffset + length
 	}
 	return end, nil
+}
+
+// sameBytes reports whether two files hold the same n bytes from off
+func sameBytes(a, b io.ReaderAt, off, n uint64) (same bool, err error) {
+	const chunk = 1 << 16
+	ba, bb := make([]byte, chunk), make([]byte, chunk)
+	for done := uint64(0); done < n; done += chunk {
+		want := n - done
+		if want > chunk {
+			want = chunk
+		}
+		if _, err = a.ReadAt(ba[:want], int64(off+done)); err != nil {
+			return false, err
+		}
+		if _, err = b.ReadAt(bb[:want], int64(off+done)); err != nil {
+			return false, err
+		}
+		if !bytes.Equal(ba[:want], bb[:want]) {
+			return false, nil
+		}
+	}
+	return true, nil
 }

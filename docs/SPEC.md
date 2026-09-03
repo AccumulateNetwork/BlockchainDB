@@ -308,9 +308,15 @@ manifest's tmp, then the directory — counted by `FsyncCount` and
 pinned by `TestSealBarrierCount` (#33 tracks what remains).
 `KV2.Seal` holds the shard's lock for both layers' cuts only and
 finishes the Perm seal and the Dyna sync side by side;
-`KVShard.SealBlock` seals the shards concurrently.  A crash between
-the halves leaves `sealing.dat`, which `recoverSealingTail` folds
-back into the live tail on open (2.8).
+`KVShard.SealBlock` seals the shards concurrently.  The auto-seal a
+`Put` triggers at `SealLimit` is split the same way: the cut under the
+shard's shared lock, the rest after the `Put` has let it go, so that
+a writer queued for the exclusive lock does not hold every new reader
+behind the barriers.  A failure in the second half leaves the seal
+staged (`SegmentStore.staged`, its progress recorded), and the next
+seal or `Close` resumes it from where it stopped before cutting its
+own tail; a crash between the halves leaves `sealing.dat`, which
+`recoverSealingTail` folds back into the live tail on open (2.8).
 
 ### 2.4 Manifests (1.8)
 

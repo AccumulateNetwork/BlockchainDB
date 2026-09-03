@@ -567,6 +567,11 @@ type SegmentStore struct {
 	// cleared when its segment joins active (seal.go).
 	sealing *sealingTail
 
+	// staged is a seal whose second half failed after the cut: its
+	// tail is still `sealing`, and the next seal (or Close) resumes it
+	// from wherever it stopped before cutting again.  Under commitMu.
+	staged *pendingSeal
+
 	live        map[[32]byte]*DBBKey // Keys written since the last seal
 	liveFile    *BFile               // Their records
 	liveRecords uint64               // Physical records in liveFile (>= len(live) if keys repeat)
@@ -882,7 +887,7 @@ func (s *SegmentStore) load() (err error) {
 	s.historyNewest, s.historyAny = SegmentMeta{}, false
 	s.handoffs, s.retireAfterActiveCommit = nil, nil // The manifests being read are the truth again
 	s.liveRecords = 0
-	s.sealing = nil
+	s.sealing, s.staged = nil, nil
 
 	m, err := s.readManifest()
 	if err != nil {
@@ -1310,23 +1315,13 @@ func (s *SegmentStore) openLive() (err error) {
 		return err
 	}
 
-	offset := uint64(segDataHdrSize)
-	var recHdr [segRecHdrSize]byte
-	for offset+segRecHdrSize <= s.liveFile.EOD {
-		if err = s.liveFile.ReadAt(offset, recHdr[:]); err != nil {
-			return err
-		}
-		var key [32]byte
-		copy(key[:], recHdr[:32])
-		length := binary.BigEndian.Uint64(recHdr[32:])
-		valueOffset := offset + segRecHdrSize
-		if valueOffset+length > s.liveFile.EOD {
-			break // Torn tail record from a crash mid-write; drop it
-		}
+	offset, err := scanTailRecords(s.liveFile.File, s.liveFile.EOD, func(key [32]byte, valueOffset, length uint64) {
 		s.live[key] = &DBBKey{Offset: valueOffset, Length: length}
 		s.liveRecords++
 		s.filterSet(key)
-		offset = valueOffset + length
+	})
+	if err != nil {
+		return err
 	}
 
 	// Drop whatever follows the last complete record: a torn record
@@ -3370,6 +3365,12 @@ func (s *SegmentStore) checkNoConflicts(seg *segment) (err error) {
 func (s *SegmentStore) Close() (err error) {
 	s.commitMu.Lock() // Waits for a seal or a sync in flight
 	defer s.commitMu.Unlock()
+	if s.staged != nil && !s.closed.Load() {
+		// A seal that failed after its cut gets one more try at the
+		// durability point; if it fails again the tail is made durable
+		// below and the next open folds it back
+		_ = s.finishStaged()
+	}
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	s.History.Lock() // Both, in the one order they may nest; not the protocol path
@@ -3405,10 +3406,11 @@ func (s *SegmentStore) Close() (err error) {
 		}
 	}
 	if t := s.sealing; t != nil && t.file.File != nil {
-		// A seal that failed after its cut: the tail is at sealing.dat,
-		// and the next open folds it back into the live tail.  Made
-		// durable here, as the live tail is, so that a Close is the
-		// durability point for it too.
+		// A seal that failed after its cut, twice: the tail is at
+		// sealing.dat (or linked at its segment name, which the orphan
+		// sweep adopts), and the next open recovers it.  Made durable
+		// here, as the live tail is, so that a Close is the durability
+		// point for it too.
 		if err = fsync(t.file.File); err != nil {
 			return err
 		}
@@ -3425,6 +3427,7 @@ func (s *SegmentStore) Close() (err error) {
 	}
 	s.active, s.history = nil, nil
 	s.historyNewest, s.historyAny = SegmentMeta{}, false
+	s.sealing, s.staged = nil, nil // load starts from the disk
 	s.closed.Store(true)
 	s.awaitUnlinks() // So that a closed store has deleted what it retired
 	return nil
