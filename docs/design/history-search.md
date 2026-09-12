@@ -1,6 +1,8 @@
 # Searching history
 
-Status: **design, not built.**  The simulations behind every number
+Status: **step 1 built, the rest designed.**  History's filters are now
+held to a budget rather than freed (2026-09-11, spec 1.2, 1.4, 2.7);
+everything below that is design.  The simulations behind every number
 here are in `database/keytable_sim_test.go` and run with
 `go test -run TestKeyTable ./database/`.  Tracks issues #86, #87, #88.
 
@@ -219,22 +221,23 @@ still grows linearly with age, so the schedule has to be chosen against
 an expected lifetime rather than derived.  This needs its own
 simulation before anything is built.
 
-**Open: residency.**  Issue #88 notes that `handoffBelowWindow` frees
-the bloom of every history segment, so each probe today is three
-one-byte reads from disk.  Dyna history is bounded by the live key set
-rather than by the chain, so at today's sizes its filters could simply
-stay resident and the walk would cost memory tests rather than preads.
-That is a handful of lines and fixes the measured regression now; it
-stops working somewhere below a billion keys, where 12 bits a key is
-1.5 GB.
+**Residency: done.**  `handoffBelowWindow` freed the bloom of every
+history segment, so each probe was K one-byte reads from disk.  A
+segment now keeps its filter while `BloomResidentBytes` has room,
+newest first, and an open refills the budget.  Measured over 39
+history segments, an absent-key lookup went from 18.7 µs to 1.8 µs.
+The budget is 8 MB a store, about 5.5 million keys of history, and
+past it the oldest segments are probed on disk exactly as they all
+were before — so this holds until history outgrows the bound, which is
+what the filters of step 2 are for.
 
 ## Plan
 
-1. Keep dyna history blooms resident, and add the segment-count gauges
-   of #87 so the soak can see the walk length.  Small, and it addresses
-   what #86 and #88 actually measured.
+1. ~~Keep history blooms resident under a budget, and add the
+   segment-count gauges of #87.~~  **Done**: 10.3x on the measured
+   absent-key walk, spec 1.2, 1.4 and 2.7 updated.
 2. Simulate the level schedule, then build the history filters for when
-   history outgrows residency.
+   history outgrows the residency budget.
 3. Revisit the key table for the permanent layer once the filters are
    in and measured.
 

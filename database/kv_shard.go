@@ -674,8 +674,10 @@ const packDropWorkers = 16
 // caller watching a node has one database, not 512, and the per-shard
 // split is an implementation detail of routing -- so the sum is the
 // number that answers "is the immutability check earning its keep",
-// "what are the filters buying".  Taken without any lock, like the
-// per-store snapshot it is built from.
+// "what are the filters buying", "how far does a read walk".  The
+// segment counts sum the same way, so HistorySegments is the walk a
+// read crosses across the whole database rather than in one shard
+// (issue #87).
 func (k *KVShard) Stats() (perm, dyna StoreStats) {
 	add := func(dst *StoreStats, s StoreStats) {
 		dst.PutTotal += s.PutTotal
@@ -687,6 +689,9 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 		dst.FilterWalked += s.FilterWalked
 		dst.FilterMisled += s.FilterMisled
 		dst.LiveHit += s.LiveHit
+		dst.HistorySegments += s.HistorySegments
+		dst.ActiveSegments += s.ActiveSegments
+		dst.ResidentBloomBytes += s.ResidentBloomBytes
 	}
 	for _, shard := range k.Shards {
 		if shard == nil {

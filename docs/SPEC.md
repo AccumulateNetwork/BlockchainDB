@@ -65,7 +65,12 @@ Every other rule in this section serves this one.  Corollaries:
   not grow with the age of the store either, or it starves the disk
   and the tail latencies show it (#59, #63).
 - Memory that must be resident may scale with the *working set*, never
-  with the total history (#64).
+  with the total history (#64).  The way to obey that is a **bound**,
+  not an absence: filters for history are held to a budget
+  (`BloomResidentBytes`) rather than freed outright, because freeing
+  them all put every history probe on the disk — K one-byte reads per
+  segment, on the walk a mutable read takes for any key outside the
+  window (#86, #88).
 
 ### 1.3 Blocks, the window, and windowed immutability
 
@@ -128,7 +133,8 @@ window (MinFilterBlocks).
   this walk (1.3); it belongs to export and query APIs.  Old blocks
   are read rarely (1.1); their filters may live on disk and be probed
   there — resident filter memory follows the working set, not the
-  chain (#64).
+  chain (#64), which is a budget rather than a rule against holding
+  any (1.2).
 - **Cross-shard consolidation is a rarer, second pass**: per-shard
   merges fold into one set file every 1,000 blocks, with one filter
   over the set.  Sets are grouped by block range (`SetGroupBlocks`, a
@@ -392,13 +398,26 @@ run is still in place and discards its output if not.
   shard by shard, so nothing per-shard is held for the set's size
   either.  #47 tracks what is left: the pack cadence in the adapter.
 - **Filter residency** — a segment's bloom is held in memory only
-  while the segment is in the active tier; a history segment's and
-  every block set's filter stays on disk and is probed there
-  (`segment.bloomTest`, `blockSet.bloomTest`): K one-byte reads from a
-  file the pool already holds open, which the page cache keeps hot.
-  Resident filter memory therefore follows the window, not the chain,
-  and an open reads one index header per segment rather than every
-  filter the store ever wrote (#64).
+  while the segment is in the active tier.  A segment leaving the
+  window KEEPS its filter while `BloomResidentBytes` has room, newest
+  first (`keepHistoryBlooms`), and an open refills the budget from
+  disk (`loadHistoryBlooms`); past it, and for every block set, the
+  filter stays on disk and is probed there (`segment.bloomTest`,
+  `blockSet.bloomTest`): K one-byte reads from a file the pool already
+  holds open, which the page cache keeps hot.  Resident filter memory
+  therefore follows the working set under a bound, not the chain
+  (#64), and an open reads one index header per segment rather than
+  every filter the store ever wrote.
+
+  Freeing them ALL, which is what #64 first did, made the walk a
+  mutable read takes for any key outside the window into K preads per
+  segment: `segment.lookup` measured 17.8% of a validator's CPU with
+  82% of that inside `bloomTest` (#86), and 11,152 lookups per commit
+  crossed the whole of dynamic history to prove a key absent (#88).
+  Held to a budget instead, the same absent-key lookup over 39 history
+  segments measures 1.8 µs against 18.7 µs (`TestHistoryWalkCost`).
+  `StoreStats` reports the walk's length and what the budget holds, so
+  a soak can watch both (#87).
 
 ### 2.8 Crash recovery (1.8)
 
