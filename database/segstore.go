@@ -1296,6 +1296,79 @@ func checkIndexHeader(path string, hdr []byte) error {
 	return nil
 }
 
+// maxBloomBytes bounds a filter read off disk.  Two reasons, and the
+// second is the one that bites: a bitmap larger than this is a corrupt
+// header rather than a filter, and ByteMask computes `v %
+// (NumBytes<<8)`, so a value at or above 2^56 wraps the modulus to
+// zero and divides by it (dayfilter.go says the same thing).
+const maxBloomBytes = 1 << 32
+
+// errIndexInconsistent says an index's header is this build's format
+// but does not describe the file it sits in.  It is separated from a
+// wrong magic or version deliberately, because the two mean opposite
+// things and get opposite answers.
+//
+// A wrong magic says the file is not a segment index, and a wrong
+// version says it is one this build does not read.  Neither may be
+// worked around: spec 1.10 refuses data written in another format
+// rather than migrating it silently, and rebuilding over a file that
+// might not be ours would destroy it.  Those refuse
+// (TestSegmentHeaderVersionsAreChecked).
+//
+// An index that IS ours and IS this format but whose count and bloom
+// do not add up to its length is damaged, and an index is derived
+// data, so the answer is to rebuild it from the .dat rather than
+// believe it or refuse to open the store.
+var errIndexInconsistent = errors.New("index header does not describe its file")
+
+// readIndexHeader
+// Fill in what a lookup keeps in memory about a segment's index, and
+// refuse a header that does not describe the file it sits in.
+//
+// An index is its header, then `count` records, then the bloom, so the
+// count, the bloom's size and the file's size are one statement and
+// are checked as one.  A header that does not add up may not be
+// believed, because both halves of a lookup read it:
+//
+//   - a short count hides every key above it from the binary search
+//     (segment.lookup), and
+//   - a wrong count moves bloomOff, so bloomTest reads index records
+//     as filter bits -- where a zero bit is a confident "not here".
+//
+// Either answers ABSENT for a key the segment holds, which is the one
+// answer a filter may never give (issue #35).  openDayFilter has
+// checked exactly this since it was written; the segment index and the
+// block set did not.
+func (s *segment) readIndexHeader(index *os.File, indexPath string) (err error) {
+	var header [segIndexHdrSize]byte
+	if _, err = index.ReadAt(header[:], 0); err != nil {
+		return err
+	}
+	if err = checkIndexHeader(indexPath, header[:]); err != nil {
+		return err
+	}
+	info, err := index.Stat()
+	if err != nil {
+		return err
+	}
+	count := int64(binary.BigEndian.Uint64(header[8:]))
+	bloomBytes := binary.BigEndian.Uint64(header[16:])
+	records := (info.Size() - segIndexHdrSize) / DBKeyFullSize
+	if count < 0 || count > records || bloomBytes > maxBloomBytes {
+		return fmt.Errorf("%w: %s claims %d records and %d bloom bytes in a %d-byte file",
+			errIndexInconsistent, indexPath, count, bloomBytes, info.Size())
+	}
+	if want := segIndexHdrSize + count*DBKeyFullSize + int64(bloomBytes); want != info.Size() {
+		return fmt.Errorf("%w: %s describes %d bytes (%d records and %d of bloom); the file is %d",
+			errIndexInconsistent, indexPath, want, count, bloomBytes, info.Size())
+	}
+	s.count = count
+	s.bloomBytes = bloomBytes
+	s.bloomK = int(binary.BigEndian.Uint32(header[24:]))
+	s.bloomOff = segIndexHdrSize + count*DBKeyFullSize
+	return nil
+}
+
 // openSegment
 // Adopt a sealed segment: read what a lookup needs to keep in memory
 // -- the record count, the key count, and the bloom filter -- and give
@@ -1341,21 +1414,31 @@ func (s *SegmentStore) openSegmentAt(meta SegmentMeta, dataPath, indexPath strin
 		seg.close()
 		return nil, err
 	}
-	defer releaseIndex()
-
-	var header [segIndexHdrSize]byte
-	if _, err = index.ReadAt(header[:], 0); err != nil {
-		seg.close()
-		return nil, err
+	err = seg.readIndexHeader(index, indexPath)
+	releaseIndex()
+	if err != nil {
+		if !errors.Is(err, errIndexInconsistent) {
+			seg.close() // Not ours, or not our format: refuse (see errIndexInconsistent)
+			return nil, err
+		}
+		// Damaged, but derived: buildIndexFor reconstructs it from the
+		// .dat, which is better than believing it or failing the open.
+		segmentFiles.forget(indexPath)
+		if rebuildErr := buildIndexFor(dataPath, indexPath); rebuildErr != nil {
+			seg.close()
+			return nil, fmt.Errorf("%w; rebuilding it failed: %v", err, rebuildErr)
+		}
+		if index, releaseIndex, err = seg.index(); err != nil {
+			seg.close()
+			return nil, err
+		}
+		err = seg.readIndexHeader(index, indexPath)
+		releaseIndex()
+		if err != nil {
+			seg.close()
+			return nil, err
+		}
 	}
-	if err = checkIndexHeader(indexPath, header[:]); err != nil {
-		seg.close()
-		return nil, err
-	}
-	seg.count = int64(binary.BigEndian.Uint64(header[8:]))
-	seg.bloomBytes = binary.BigEndian.Uint64(header[16:])
-	seg.bloomK = int(binary.BigEndian.Uint32(header[24:]))
-	seg.bloomOff = segIndexHdrSize + seg.count*DBKeyFullSize
 	// The filter is left on disk.  Whoever places the segment in a tier
 	// loads it if the segment is worth the memory -- the active tier --
 	// and a history segment is probed cold (issue #64).  Opening a

@@ -2,6 +2,7 @@ package blockchainDB
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -283,11 +284,20 @@ func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	defer k.Mutex.RUnlock()
 
 	// Check and see if this is a key that has been changed
-	if value, err = k.DynaKV.Get(key); err == nil { // Not in DynaKV, then return whatever
+	value, err = k.DynaKV.Get(key)
+	switch {
+	case err == nil:
 		return value, nil
+	case !errors.Is(err, errNotFound):
+		// A read that FAILED is not a read that found nothing.  Asking
+		// Perm next and reporting its miss would turn an I/O error into
+		// "this key does not exist" -- an answer the caller cannot tell
+		// from the truth, about a key the store may well hold.  A key
+		// that was never written is a different thing, and errNotFound
+		// is how it says so.
+		return nil, err
 	}
-	return k.PermKV.Get(key) //                      PermKV has.
-
+	return k.PermKV.Get(key) // Not in DynaKV; return whatever PermKV has
 }
 
 // GetDeep
@@ -298,8 +308,12 @@ func (k *KV2) GetDeep(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
 
-	if value, err = k.DynaKV.GetDeep(key); err == nil {
+	value, err = k.DynaKV.GetDeep(key)
+	switch {
+	case err == nil:
 		return value, nil
+	case !errors.Is(err, errNotFound):
+		return nil, err // See Get: a failure is not an absence
 	}
 	return k.PermKV.GetDeep(key)
 }
@@ -416,6 +430,22 @@ func (k *KV2) MergeBelow(height uint64) (meta SegmentMeta, merged bool, err erro
 }
 
 // Put
+// Write a key without saying which layer it belongs to, and let the
+// value decide: a permanent key rewritten with a different value
+// becomes dynamic.
+//
+// NOT FOR A RUNNING NODE, and the reason is the first line of it.
+// Routing by "did the value change" has to resolve the key before it
+// can route, so every call asks the dynamic layer first -- and a
+// dynamic miss walks the whole of dynamic history, which is the cost
+// issue #88 measured.  Routing by what the caller already knows costs
+// nothing, which is why PutPerm and PutDyna exist and why the writer
+// is the one that chooses (spec 1.1).
+//
+// It also leaves the moved key's permanent record behind forever,
+// which is the garbage spec 1.4 says the permanent layer does not
+// accumulate.  That is true only for as long as this is unused.
+//
 // Returns the number of writes since the last compress, and an err if the put failed
 func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	// SHARED, not exclusive.  This lock is here to exclude the
