@@ -32,10 +32,33 @@ BlockchainDB stores two kinds of data with different immutability:
   set.  **The dynamic layer is expected to stay small**; designs may
   rely on that.
 
-A database is two layers, **Perm** and **Dyna**, one per kind.  A
-generic read resolves Dyna first: a permanent key overwritten with a
-different value has *become* dynamic, and the dynamic copy is the
-truth (the stale Perm copy is dead weight, never a wrong answer).
+A database is two layers, **Perm** and **Dyna**, one per kind.  **The
+writer says which**, through `PutPerm` and `PutDyna`.  Deciding by
+whether a value changed cannot be cheaper than resolving the key
+first, which is a lookup on every write and a walk of the whole
+dynamic layer for a miss (#88) — so the generic `KV2.Put`, which
+routes that way and moves a changed permanent key to Dyna, is not for
+a running node.  A generic read still resolves Dyna first, because
+that is where a key routed both ways would be newest.
+
+A permanent value that is not permanent is therefore a bug in what
+wrote it, not something the store can refuse: the immutability check
+is windowed (1.3) for the same cost reason.  It is found by analysis
+instead — `AuditPermanentValues` (`audit.go`) merges every index the
+permanent layer holds and reports each key held with more than one
+value — and fixed in the writer.
+
+**Scale means isolation, not speed at the bottom.**  A database is
+expected to reach billions of keys.  That has never meant making a
+billion keys fast to reach.  It means the SIZE of history may not load
+the active execution path.  Reaching old data quickly is an
+application need, served by systems built over the data; the protocol
+asks only for the window (1.3) and the dynamic layer's current state
+(1.5), neither of which grows with the chain.  The direction that
+follows is that history LEAVES the node: a packed set is permanent and
+never rewritten (1.4), which is what makes it the unit that can move
+to data servers answering queries over big data, while the active
+database splits across more networks.
 
 ### 1.2 The latency rule (governing aspiration)
 
@@ -65,7 +88,12 @@ Every other rule in this section serves this one.  Corollaries:
   not grow with the age of the store either, or it starves the disk
   and the tail latencies show it (#59, #63).
 - Memory that must be resident may scale with the *working set*, never
-  with the total history (#64).
+  with the total history (#64).  The way to obey that is a **bound**,
+  not an absence: filters for history are held to a budget
+  (`BloomResidentBytes`) rather than freed outright, because freeing
+  them all put every history probe on the disk — K one-byte reads per
+  segment, on the walk a mutable read takes for any key outside the
+  window (#86, #88).
 
 ### 1.3 Blocks, the window, and windowed immutability
 
@@ -125,10 +153,12 @@ window (MinFilterBlocks).
 - **Deep reads are explicit** (`GetDeep`): they walk merged blocks
   newest-first, one filter probe per block, binary-searching only a
   block whose filter claims the key.  The protocol path never takes
-  this walk (1.3); it belongs to export and query APIs.  Old blocks
+  this walk (1.3); it belongs to export and query APIs, and making it
+  fast is an application's need rather than the protocol's (1.1).  Old blocks
   are read rarely (1.1); their filters may live on disk and be probed
   there — resident filter memory follows the working set, not the
-  chain (#64).
+  chain (#64), which is a budget rather than a rule against holding
+  any (1.2).
 - **Cross-shard consolidation is a rarer, second pass**: per-shard
   merges fold into one set file every 1,000 blocks, with one filter
   over the set.  Sets are grouped by block range (`SetGroupBlocks`, a
@@ -424,13 +454,26 @@ run is still in place and discards its output if not.
   shard by shard, so nothing per-shard is held for the set's size
   either.  #47 tracks what is left: the pack cadence in the adapter.
 - **Filter residency** — a segment's bloom is held in memory only
-  while the segment is in the active tier; a history segment's and
-  every block set's filter stays on disk and is probed there
-  (`segment.bloomTest`, `blockSet.bloomTest`): K one-byte reads from a
-  file the pool already holds open, which the page cache keeps hot.
-  Resident filter memory therefore follows the window, not the chain,
-  and an open reads one index header per segment rather than every
-  filter the store ever wrote (#64).
+  while the segment is in the active tier.  A segment leaving the
+  window KEEPS its filter while `BloomResidentBytes` has room, newest
+  first (`keepHistoryBlooms`), and an open refills the budget from
+  disk (`loadHistoryBlooms`); past it, and for every block set, the
+  filter stays on disk and is probed there (`segment.bloomTest`,
+  `blockSet.bloomTest`): K one-byte reads from a file the pool already
+  holds open, which the page cache keeps hot.  Resident filter memory
+  therefore follows the working set under a bound, not the chain
+  (#64), and an open reads one index header per segment rather than
+  every filter the store ever wrote.
+
+  Freeing them ALL, which is what #64 first did, made the walk a
+  mutable read takes for any key outside the window into K preads per
+  segment: `segment.lookup` measured 17.8% of a validator's CPU with
+  82% of that inside `bloomTest` (#86), and 11,152 lookups per commit
+  crossed the whole of dynamic history to prove a key absent (#88).
+  Held to a budget instead, the same absent-key lookup over 39 history
+  segments measures 1.8 µs against 18.7 µs (`TestHistoryWalkCost`).
+  `StoreStats` reports the walk's length and what the budget holds, so
+  a soak can watch both (#87).
 
 ### 2.8 Crash recovery (1.8)
 

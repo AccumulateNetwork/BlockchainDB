@@ -281,6 +281,81 @@ func (s *segment) loadBloom() (err error) {
 // from the one on disk
 func (s *segment) freeBloom() { s.bloom = nil }
 
+// BloomResidentBytes bounds the filter memory one store holds for its
+// HISTORY segments.  The window's filters are not counted: they are
+// bounded by the window itself and are the protocol's, so they are
+// always resident (issue #64).
+//
+// History used to hold none at all.  Issue #64 freed them because the
+// permanent layer grows without bound and a filter per segment grew
+// with it -- resident for every key the store had ever held, scanned
+// by every GC, read in full at open.  The rule that fixed it is spec
+// 1.2's: resident memory may follow the WORKING SET and never the
+// chain.  A bound does that as well as freeing everything does, and it
+// costs far less.
+//
+// What freeing everything costs was measured later.  A mutable store
+// cannot rule a key out by the window, so every read of an account not
+// touched for N blocks walks the whole of dynamic history -- 11,152
+// such walks per commit on a soaking validator -- and with no resident
+// filter each step of the walk is K one-byte reads from disk instead
+// of a memory test (issue #88).  `segment.lookup` was 17.8% of a
+// validator's CPU, 82% of it inside bloomTest (issue #86).
+//
+// 8 MB a store is about 5.5 million keys of history at
+// BloomBitsPerKey, and a database of eight shards holds two stores a
+// shard, so the bound is 128 MB for a database whose history fits it.
+// Beyond the bound the OLDEST history segments give their filters up
+// and are probed on disk, which is what every one of them did before.
+// It is a var and not an environment variable (spec 1.10), and it is
+// not persisted: it bounds memory, not the on-disk format.
+var BloomResidentBytes uint64 = 8 << 20
+
+// keepHistoryBlooms decides which history segments hold their filter
+// in memory, newest first -- the newest are what a walk probes first
+// and what a working set is likeliest to want.  The caller must hold
+// History exclusively.
+//
+// It reads nothing.  A segment arriving from the window brings its
+// filter with it, so keeping one is free; this only gives up what no
+// longer fits.  A filter given up here is not read back until the
+// store is reopened, which is the trade for never doing I/O on this
+// path: it is called from the handoff, which the protocol path takes.
+func (s *SegmentStore) keepHistoryBlooms() {
+	var used uint64
+	for i := len(s.history) - 1; i >= 0; i-- {
+		seg := s.history[i]
+		if seg.bloom == nil {
+			continue
+		}
+		if used+seg.bloomBytes > BloomResidentBytes {
+			seg.freeBloom()
+			continue
+		}
+		used += seg.bloomBytes
+	}
+	s.historyBloomBytes = used
+}
+
+// loadHistoryBlooms fills the budget from disk, newest first: what
+// open does, where reading is free because nothing is waiting on the
+// store yet.  Without it a reopened store would walk its whole history
+// on disk until the segments it has now had all been replaced.
+func (s *SegmentStore) loadHistoryBlooms() {
+	var used uint64
+	for i := len(s.history) - 1; i >= 0; i-- {
+		seg := s.history[i]
+		if seg.bloomBytes == 0 || used+seg.bloomBytes > BloomResidentBytes {
+			break // Segments are bounded by SealLimit, so sizes are comparable
+		}
+		if err := seg.loadBloom(); err != nil {
+			break // Cold is correct, just slower
+		}
+		used += seg.bloomBytes
+	}
+	s.historyBloomBytes = used
+}
+
 // bloomTest asks the segment's filter whether the key might be here.
 // Resident: a memory probe.  Cold: one byte read per hash function,
 // from the index file -- the same bits, at the same offsets, without
@@ -322,6 +397,7 @@ func (s *segment) bloomTest(key [32]byte) (mightBe bool, err error) {
 func (s *segment) close() {
 	segmentFiles.forget(s.dataPath)
 	segmentFiles.forget(s.indexPath)
+	s.bloom = nil // A retired segment holds nothing, memory included
 }
 
 // data borrows the segment's data file; release when the read is done
@@ -547,6 +623,10 @@ type SegmentStore struct {
 	// that no longer names them.  Under handoffMu.
 	retireAfterActiveCommit []string
 
+	// historyBloomBytes is the filter memory history holds, against
+	// BloomResidentBytes.  Under History.
+	historyBloomBytes uint64
+
 	// epoch counts handoffs.  A write that had to consult history
 	// without the active lock checks it before writing, and starts
 	// over if the window rolled in between.  Under Mutex.
@@ -726,6 +806,14 @@ type StoreStats struct {
 	FilterWalked uint64 // Filters said "maybe" (or were absent): the window walked
 	FilterMisled uint64 // Walked the window on the filters' say-so and found nothing
 	LiveHit      uint64 // Answered from the live tail, before any filter
+
+	// The walk's length, and what it costs to shorten it.  A read that
+	// misses the window probes one history segment after another, so
+	// HistorySegments is the thing that must not grow with the chain
+	// (spec 1.2) and the thing a soak could not see before (issue #87).
+	HistorySegments    int    // Segments in history now
+	ActiveSegments     int    // Segments in the window now
+	ResidentBloomBytes uint64 // History filter memory held, of BloomResidentBytes
 }
 
 // storeCounters is StoreStats as the store keeps it: atomics, because
@@ -738,11 +826,17 @@ type storeCounters struct {
 }
 
 // Stats
-// A snapshot of the store's counters.  Taken without any lock: each
-// counter is read atomically, and a snapshot that straddles a
-// concurrent operation is off by one, which is what a counter is for.
+// A snapshot of the store's counters, and the gauges that say what
+// they were paid over (issue #87).
+//
+// The counters are read atomically and without any lock: a snapshot
+// that straddles a concurrent operation is off by one, which is what a
+// counter is for.  The gauges need their lists to hold still, so each
+// tier is read under its own lock, one after the other and never both
+// at once.  This is not the protocol path, and two counts a moment
+// apart are what a gauge is.
 func (s *SegmentStore) Stats() StoreStats {
-	return StoreStats{
+	st := StoreStats{
 		PutTotal:     s.stats.putTotal.Load(),
 		PutNew:       s.stats.putNew.Load(),
 		PutDuplicate: s.stats.putDuplicate.Load(),
@@ -753,6 +847,14 @@ func (s *SegmentStore) Stats() StoreStats {
 		FilterMisled: s.stats.filterMisled.Load(),
 		LiveHit:      s.stats.liveHit.Load(),
 	}
+	s.History.RLock()
+	st.HistorySegments = len(s.history)
+	st.ResidentBloomBytes = s.historyBloomBytes
+	s.History.RUnlock()
+	s.Mutex.RLock()
+	st.ActiveSegments = len(s.active)
+	s.Mutex.RUnlock()
+	return st
 }
 
 // NewSegmentStore
@@ -980,6 +1082,7 @@ func (s *SegmentStore) load() (err error) {
 	if n := len(s.history); n > 0 {
 		s.historyNewest, s.historyAny = s.history[n-1].meta, true
 	}
+	s.loadHistoryBlooms()
 
 	// After recoverOrphans, because an adopted segment changes what the
 	// filters have to cover; before openLive, which adds the live keys
@@ -1078,13 +1181,13 @@ func (s *SegmentStore) handoffBelowWindow() {
 	s.handoffMu.Lock()
 	for _, seg := range moved {
 		s.handoffs = append(s.handoffs, handoff{seg: seg})
-		// Out of the window, out of memory: history is probed on disk,
-		// so the filters the store holds cover the window and no more
-		// (issue #64).  This is the one place a segment leaves the
-		// active tier while the store runs.
-		seg.freeBloom()
 	}
 	s.handoffMu.Unlock()
+	// A segment leaving the window keeps its filter if history's budget
+	// still has room, and gives it up otherwise.  This used to free
+	// every one of them unconditionally, which left every history probe
+	// reading the filter off disk a byte at a time (issues #86, #88).
+	s.keepHistoryBlooms()
 	s.History.Unlock()
 }
 
@@ -1223,6 +1326,79 @@ func checkIndexHeader(path string, hdr []byte) error {
 	return nil
 }
 
+// maxBloomBytes bounds a filter read off disk.  Two reasons, and the
+// second is the one that bites: a bitmap larger than this is a corrupt
+// header rather than a filter, and ByteMask computes `v %
+// (NumBytes<<8)`, so a value at or above 2^56 wraps the modulus to
+// zero and divides by it (dayfilter.go says the same thing).
+const maxBloomBytes = 1 << 32
+
+// errIndexInconsistent says an index's header is this build's format
+// but does not describe the file it sits in.  It is separated from a
+// wrong magic or version deliberately, because the two mean opposite
+// things and get opposite answers.
+//
+// A wrong magic says the file is not a segment index, and a wrong
+// version says it is one this build does not read.  Neither may be
+// worked around: spec 1.10 refuses data written in another format
+// rather than migrating it silently, and rebuilding over a file that
+// might not be ours would destroy it.  Those refuse
+// (TestSegmentHeaderVersionsAreChecked).
+//
+// An index that IS ours and IS this format but whose count and bloom
+// do not add up to its length is damaged, and an index is derived
+// data, so the answer is to rebuild it from the .dat rather than
+// believe it or refuse to open the store.
+var errIndexInconsistent = errors.New("index header does not describe its file")
+
+// readIndexHeader
+// Fill in what a lookup keeps in memory about a segment's index, and
+// refuse a header that does not describe the file it sits in.
+//
+// An index is its header, then `count` records, then the bloom, so the
+// count, the bloom's size and the file's size are one statement and
+// are checked as one.  A header that does not add up may not be
+// believed, because both halves of a lookup read it:
+//
+//   - a short count hides every key above it from the binary search
+//     (segment.lookup), and
+//   - a wrong count moves bloomOff, so bloomTest reads index records
+//     as filter bits -- where a zero bit is a confident "not here".
+//
+// Either answers ABSENT for a key the segment holds, which is the one
+// answer a filter may never give (issue #35).  openDayFilter has
+// checked exactly this since it was written; the segment index and the
+// block set did not.
+func (s *segment) readIndexHeader(index *os.File, indexPath string) (err error) {
+	var header [segIndexHdrSize]byte
+	if _, err = index.ReadAt(header[:], 0); err != nil {
+		return err
+	}
+	if err = checkIndexHeader(indexPath, header[:]); err != nil {
+		return err
+	}
+	info, err := index.Stat()
+	if err != nil {
+		return err
+	}
+	count := int64(binary.BigEndian.Uint64(header[8:]))
+	bloomBytes := binary.BigEndian.Uint64(header[16:])
+	records := (info.Size() - segIndexHdrSize) / DBKeyFullSize
+	if count < 0 || count > records || bloomBytes > maxBloomBytes {
+		return fmt.Errorf("%w: %s claims %d records and %d bloom bytes in a %d-byte file",
+			errIndexInconsistent, indexPath, count, bloomBytes, info.Size())
+	}
+	if want := segIndexHdrSize + count*DBKeyFullSize + int64(bloomBytes); want != info.Size() {
+		return fmt.Errorf("%w: %s describes %d bytes (%d records and %d of bloom); the file is %d",
+			errIndexInconsistent, indexPath, want, count, bloomBytes, info.Size())
+	}
+	s.count = count
+	s.bloomBytes = bloomBytes
+	s.bloomK = int(binary.BigEndian.Uint32(header[24:]))
+	s.bloomOff = segIndexHdrSize + count*DBKeyFullSize
+	return nil
+}
+
 // openSegment
 // Adopt a sealed segment: read what a lookup needs to keep in memory
 // -- the record count, the key count, and the bloom filter -- and give
@@ -1268,21 +1444,31 @@ func (s *SegmentStore) openSegmentAt(meta SegmentMeta, dataPath, indexPath strin
 		seg.close()
 		return nil, err
 	}
-	defer releaseIndex()
-
-	var header [segIndexHdrSize]byte
-	if _, err = index.ReadAt(header[:], 0); err != nil {
-		seg.close()
-		return nil, err
+	err = seg.readIndexHeader(index, indexPath)
+	releaseIndex()
+	if err != nil {
+		if !errors.Is(err, errIndexInconsistent) {
+			seg.close() // Not ours, or not our format: refuse (see errIndexInconsistent)
+			return nil, err
+		}
+		// Damaged, but derived: buildIndexFor reconstructs it from the
+		// .dat, which is better than believing it or failing the open.
+		segmentFiles.forget(indexPath)
+		if rebuildErr := buildIndexFor(dataPath, indexPath); rebuildErr != nil {
+			seg.close()
+			return nil, fmt.Errorf("%w; rebuilding it failed: %v", err, rebuildErr)
+		}
+		if index, releaseIndex, err = seg.index(); err != nil {
+			seg.close()
+			return nil, err
+		}
+		err = seg.readIndexHeader(index, indexPath)
+		releaseIndex()
+		if err != nil {
+			seg.close()
+			return nil, err
+		}
 	}
-	if err = checkIndexHeader(indexPath, header[:]); err != nil {
-		seg.close()
-		return nil, err
-	}
-	seg.count = int64(binary.BigEndian.Uint64(header[8:]))
-	seg.bloomBytes = binary.BigEndian.Uint64(header[16:])
-	seg.bloomK = int(binary.BigEndian.Uint32(header[24:]))
-	seg.bloomOff = segIndexHdrSize + seg.count*DBKeyFullSize
 	// The filter is left on disk.  Whoever places the segment in a tier
 	// loads it if the segment is worth the memory -- the active tier --
 	// and a history segment is probed cold (issue #64).  Opening a
@@ -2561,6 +2747,11 @@ func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	// back as far as the oldest of them
 	meta.Span = last.Height - run[0].meta.first()
 	seg.meta = meta
+	// Its filter, read here rather than under History: the output is
+	// about to BE history, and a segment that joins without one is
+	// probed on disk for as long as it stands (BloomResidentBytes).
+	// The swap gives it up again if the budget is full.
+	_ = seg.loadBloom()
 	if maintenanceHook != nil {
 		maintenanceHook()
 	}
@@ -2606,6 +2797,7 @@ func (s *SegmentStore) swapHistory(run []*segment, out *segment, at int) (ok boo
 		discard()
 		return false, err
 	}
+	s.keepHistoryBlooms() // The output joined history; the inputs left it
 	for _, seg := range run {
 		s.releaseFromHistory(seg)
 	}
@@ -3030,6 +3222,7 @@ func (s *SegmentStore) MergeBelow(height uint64) (meta SegmentMeta, merged bool,
 	if err != nil {
 		return meta, false, err
 	}
+	_ = seg.loadBloom() // Joining history with its filter; see CompactHistory
 	// The merged segment reaches back to the oldest block in the run.
 	// The key filters cover a block range, and this is what tells them
 	// the segment is not one block: a filter that started after the
@@ -3110,6 +3303,7 @@ func (s *SegmentStore) DropBelow(height uint64) (dropped int, err error) {
 		s.history = old
 		return 0, err
 	}
+	s.keepHistoryBlooms()
 	for _, seg := range old[:n] {
 		s.releaseFromHistory(seg)
 	}

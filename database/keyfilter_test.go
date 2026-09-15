@@ -624,16 +624,29 @@ func TestFilterBlocksIsValidatedAndPersisted(t *testing.T) {
 	require.NoError(t, reopened.Close())
 }
 
-// TestResidentFiltersFollowTheWindow
-// A segment's bloom is worth memory only while the segment is in the
-// window a protocol read walks.  Holding every filter resident cost
-// 1.5 bytes per key for every key the store had ever held: memory
-// growing with the age of the chain, scanned by every GC, and read in
-// full at open, so opening got slower forever (issue #64).  History is
-// probed on disk instead -- the same bits, K one-byte reads -- so what
-// the store holds follows the working set, not the chain (spec 1.2).
-func TestResidentFiltersFollowTheWindow(t *testing.T) {
+// TestResidentFiltersFollowTheBudget
+// What the store holds in memory follows the working set and never the
+// chain (spec 1.2), and the way it does that is a BOUND.
+//
+// Holding every filter resident cost 1.5 bytes per key for every key
+// the store had ever held: memory growing with the age of the chain,
+// scanned by every GC, and read in full at open, so opening got slower
+// forever (issue #64).  Freeing every history filter instead fixed
+// that and broke something else: every history probe became K
+// one-byte reads from disk, on the walk a mutable read takes for any
+// key outside the window (issues #86, #88).
+//
+// So history keeps its filters while BloomResidentBytes has room and
+// gives them up past it.  What this pins is both halves: the budget is
+// honoured in each direction, an open never reads more filters than it
+// asks for, and a filter probed on disk answers exactly what the same
+// filter answers in memory.
+func TestResidentFiltersFollowTheBudget(t *testing.T) {
 	dir := storeDir(t, "residency")
+	oldBudget := BloomResidentBytes
+	defer func() { BloomResidentBytes = oldBudget }()
+	BloomResidentBytes = 8 << 20 // Room for every filter in this store
+
 	store, err := NewSegmentStore(dir, false)
 	require.NoError(t, err)
 	defer store.Close()
@@ -668,10 +681,22 @@ func TestResidentFiltersFollowTheWindow(t *testing.T) {
 	store.Mutex.RUnlock()
 
 	require.NotEmpty(t, history, "the window must have rolled past something")
-	require.Equal(t, 0, resident(history),
-		"history holds %d resident filters; they belong on disk", resident(history))
+	require.Equal(t, len(history), resident(history),
+		"with room in the budget, history keeps the filters it arrived with")
 	require.Equal(t, len(active), resident(active),
-		"the window's filters are the ones worth memory")
+		"the window's filters are always worth memory")
+	require.Equal(t, len(history), store.Stats().HistorySegments, "the walk's length (#87)")
+
+	// Now take the budget away.  Every history filter goes, which is
+	// what every one of them did before the budget existed, and the
+	// store must go on answering exactly as it did.
+	BloomResidentBytes = 0
+	store.History.Lock()
+	store.keepHistoryBlooms()
+	store.History.Unlock()
+	require.Equal(t, 0, resident(history), "no budget, no resident history filters")
+	require.Equal(t, len(active), resident(active), "the window is not the budget's to take")
+	require.Equal(t, uint64(0), store.Stats().ResidentBloomBytes)
 
 	// Cold filters still answer, and answer correctly: every key is
 	// found through the history walk, and unwritten keys are not
@@ -702,16 +727,34 @@ func TestResidentFiltersFollowTheWindow(t *testing.T) {
 	}
 	seg.freeBloom()
 
-	// And an open reads no filter it does not need
+	// An open reads no filter the budget does not ask for.  This is the
+	// half of issue #64 that must survive: a store whose history is
+	// larger than its budget may not read every filter it ever wrote
+	// just to open.
 	require.NoError(t, store.Close())
-	reopened, err := OpenSegmentStore(dir)
+	unbudgeted, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
-	defer reopened.Close()
-	reopened.History.RLock()
-	rh := resident(reopened.history)
-	nh := len(reopened.history)
-	reopened.History.RUnlock()
-	require.Equalf(t, 0, rh, "reopen materialised %d of %d history filters", rh, nh)
+	unbudgeted.History.RLock()
+	rh, nh := resident(unbudgeted.history), len(unbudgeted.history)
+	unbudgeted.History.RUnlock()
+	require.Equalf(t, 0, rh, "reopen with no budget materialised %d of %d history filters", rh, nh)
+	require.NoError(t, unbudgeted.Close())
+
+	// And with a budget it fills it, newest first, and stops there: a
+	// restart that had to walk its history on disk until every segment
+	// it held had been replaced would be a restart that never recovered
+	BloomResidentBytes = 10 * minBloomBytes
+	warm, err := OpenSegmentStore(dir)
+	require.NoError(t, err)
+	defer warm.Close()
+	warm.History.RLock()
+	rh, nh = resident(warm.history), len(warm.history)
+	newest := warm.history[nh-1].bloom != nil
+	oldest := warm.history[0].bloom != nil
+	warm.History.RUnlock()
+	require.Equalf(t, 10, rh, "reopen filled %d of a budget of 10 filters, from %d history segments", rh, nh)
+	require.True(t, newest, "the newest history segment is the first a walk probes")
+	require.False(t, oldest, "the oldest is what the budget gives up")
 }
 
 // TestFilterSizingFollowsRecentDemand

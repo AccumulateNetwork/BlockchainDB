@@ -585,6 +585,27 @@ func openBlockSet(path string) (set *blockSet, err error) {
 	if bloomBytes == 0 || bloomK < 1 {
 		return nil, fmt.Errorf("%s has no bloom filter", path)
 	}
+	// The header has to describe the file.  A set is header, directory,
+	// indexes, bloom, bodies, and the writer records where the bodies
+	// begin, so the key count and the bloom's size add up to that
+	// offset or the header is wrong.  Believing a wrong one puts
+	// bloomOff inside the index records, where bloomTest reads them as
+	// filter bits and a zero bit is a confident "not here" for a key
+	// the set holds -- the one answer a filter may never give (#35).
+	//
+	// Refused loudly rather than worked around: a set is the only copy
+	// of what it holds, so unlike a segment index there is nothing to
+	// rebuild it from, and answering for it on a header that does not
+	// add up would lose keys silently.
+	dataStart := binary.BigEndian.Uint64(header[48:])
+	indexEnd := uint64(setHdrSize) + uint64(nShards)*setDirEntSize
+	size := uint64(info.Size())
+	if set.meta.Keys > size/DBKeyFullSize || bloomBytes > maxBloomBytes ||
+		indexEnd+set.meta.Keys*DBKeyFullSize+bloomBytes != dataStart || dataStart > size {
+		return nil, fmt.Errorf(
+			"%s: header describes %d keys and %d bloom bytes before a body at %d, in a %d-byte file",
+			path, set.meta.Keys, bloomBytes, dataStart, size)
+	}
 
 	raw := make([]byte, nShards*setDirEntSize)
 	if _, err = f.ReadAt(raw, setHdrSize); err != nil {
