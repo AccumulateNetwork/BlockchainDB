@@ -313,6 +313,8 @@ func (s *SegmentStore) FilterSizing() (capacity, peak uint64, fill []uint64) {
 // and a smaller N hands the oldest active segments to history as a
 // roll would.  Not the protocol path: it takes both locks.
 func (s *SegmentStore) SetFilterBlocks(n uint64) (err error) {
+	s.commitMu.Lock() // It commits a manifest
+	defer s.commitMu.Unlock()
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	if err = s.checkOpen(); err != nil {
@@ -476,6 +478,9 @@ func (s *SegmentStore) buildKeyFilter(start, expected uint64) (f *keyFilter, err
 		}
 	}
 	held += uint64(len(s.live))
+	if s.sealing != nil { // A tail cut by a seal in flight: a segment in all but name (seal.go)
+		held += uint64(len(s.sealing.entries))
+	}
 	if held > expected {
 		expected = held
 	}
@@ -489,6 +494,16 @@ func (s *SegmentStore) buildKeyFilter(start, expected uint64) (f *keyFilter, err
 	}
 	for key := range s.live {
 		f.keys.Set(key)
+	}
+	if s.sealing != nil {
+		// Between a seal's halves the cut tail is in no segment and not
+		// the live tail, and its segment will lie at or above `start`
+		// when it lands (it is newer than every segment).  A filter
+		// built without its keys would deny them once it does: a
+		// false "absent", which a filter may never give (issue #35).
+		for key := range s.sealing.entries {
+			f.keys.Set(key)
+		}
 	}
 	if s.cold == nil {
 		s.filtersLackCold = true
@@ -651,7 +666,7 @@ func (s *SegmentStore) saveKeyFilters() (c filterClaim, err error) {
 			return c, err
 		}
 	}
-	if err = f.Sync(); err != nil {
+	if err = fsync(f); err != nil {
 		return c, err
 	}
 	if err = f.Close(); err != nil {

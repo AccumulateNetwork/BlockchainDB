@@ -629,13 +629,11 @@ func TestRecoveryStillAdoptsAnInterruptedSeal(t *testing.T) {
 	// promote it, and reopen without committing
 	late := kr.NextHash()
 	require.NoError(t, store.Put(late, []byte("late")))
-	store.Mutex.Lock()
-	sl, seq, err := store.promoteLiveFile(2, 0)
+	pending, err := store.beginSeal(2)
 	require.NoError(t, err)
-	require.NoError(t, writeIndexFile(
-		filepath.Join(dir, strings.TrimSuffix(segmentFileName(2, seq), segDataSuffix)+segIndexSuffix),
-		sl.order, sl.entries))
-	store.Mutex.Unlock()
+	_, err = pending.promote() // Durable and named; the commit never happens
+	require.NoError(t, err)
+	pending.release()
 
 	reopened, err := OpenSegmentStore(dir)
 	require.NoError(t, err)
