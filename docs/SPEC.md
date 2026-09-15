@@ -32,10 +32,33 @@ BlockchainDB stores two kinds of data with different immutability:
   set.  **The dynamic layer is expected to stay small**; designs may
   rely on that.
 
-A database is two layers, **Perm** and **Dyna**, one per kind.  A
-generic read resolves Dyna first: a permanent key overwritten with a
-different value has *become* dynamic, and the dynamic copy is the
-truth (the stale Perm copy is dead weight, never a wrong answer).
+A database is two layers, **Perm** and **Dyna**, one per kind.  **The
+writer says which**, through `PutPerm` and `PutDyna`.  Deciding by
+whether a value changed cannot be cheaper than resolving the key
+first, which is a lookup on every write and a walk of the whole
+dynamic layer for a miss (#88) — so the generic `KV2.Put`, which
+routes that way and moves a changed permanent key to Dyna, is not for
+a running node.  A generic read still resolves Dyna first, because
+that is where a key routed both ways would be newest.
+
+A permanent value that is not permanent is therefore a bug in what
+wrote it, not something the store can refuse: the immutability check
+is windowed (1.3) for the same cost reason.  It is found by analysis
+instead — `AuditPermanentValues` (`audit.go`) merges every index the
+permanent layer holds and reports each key held with more than one
+value — and fixed in the writer.
+
+**Scale means isolation, not speed at the bottom.**  A database is
+expected to reach billions of keys.  That has never meant making a
+billion keys fast to reach.  It means the SIZE of history may not load
+the active execution path.  Reaching old data quickly is an
+application need, served by systems built over the data; the protocol
+asks only for the window (1.3) and the dynamic layer's current state
+(1.5), neither of which grows with the chain.  The direction that
+follows is that history LEAVES the node: a packed set is permanent and
+never rewritten (1.4), which is what makes it the unit that can move
+to data servers answering queries over big data, while the active
+database splits across more networks.
 
 ### 1.2 The latency rule (governing aspiration)
 
@@ -130,7 +153,8 @@ window (MinFilterBlocks).
 - **Deep reads are explicit** (`GetDeep`): they walk merged blocks
   newest-first, one filter probe per block, binary-searching only a
   block whose filter claims the key.  The protocol path never takes
-  this walk (1.3); it belongs to export and query APIs.  Old blocks
+  this walk (1.3); it belongs to export and query APIs, and making it
+  fast is an application's need rather than the protocol's (1.1).  Old blocks
   are read rarely (1.1); their filters may live on disk and be probed
   there — resident filter memory follows the working set, not the
   chain (#64), which is a budget rather than a rule against holding

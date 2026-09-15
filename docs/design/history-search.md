@@ -38,9 +38,19 @@ of the store.  This is one.
 ## What the target is
 
 The database is expected to reach millions and eventually billions of
-keys.  History does not have to be fast, but it has to stay
-*reasonable* at that size, which means a lookup's cost may grow with
-the logarithm of the store and not with its age.
+keys, and that has never meant making a billion keys fast to reach
+(spec 1.1).  It means the SIZE of history may not load the active
+execution path.  Reaching old data quickly is an application's need,
+not the protocol's.
+
+That changes what the work below is for.  Everything here is worth
+having only insofar as it keeps history's growth off the execution
+path; a structure that makes a deep read fast at the cost of work on
+every commit is the wrong trade, however good the read number looks.
+It also says where this ends: a packed set is permanent and never
+rewritten, which makes it the unit that can leave the node for a data
+server, and the location table below is that server's structure rather
+than a validator's.
 
 ## Four designs, and what killed three of them
 
