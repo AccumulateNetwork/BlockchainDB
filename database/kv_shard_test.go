@@ -335,3 +335,46 @@ func TestShardStatsSumTheShards(t *testing.T) {
 	}
 	require.Equal(t, byShard, perm.PutTotal)
 }
+
+// A put never compacts.  Maintenance runs on the caller's cadence, off
+// the protocol path; the write-count trigger that once ran
+// CompactHistory from inside a put cost the committing goroutine 3.4 s
+// of every 30 s at nineteen minutes of load (#92).
+func TestPutNeverCompacts(t *testing.T) {
+	dir, rm := MakeDir()
+	defer rm()
+	kvs, err := NewKVShardN(dir, 1, 100) // Dyna segments form on the seal limit, not the block
+	require.NoError(t, err)
+	defer kvs.Close()
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
+
+	inPut := false
+	compactions := 0
+	maintenanceHook = func() {
+		compactions++
+		if inPut {
+			t.Errorf("a put ran CompactHistory")
+		}
+	}
+	defer func() { maintenanceHook = nil }()
+
+	// Past the old 5,000-write trigger, with blocks sealed along the
+	// way so there is history to compact
+	fr := NewFastRandom([]byte{92})
+	for block := uint64(1); block <= 3*MinFilterBlocks; block++ {
+		inPut = true
+		for i := 0; i < 100; i++ {
+			require.NoError(t, kvs.PutDyna(fr.NextHash(), []byte("v")))
+			require.NoError(t, kvs.PutPerm(fr.NextHash(), []byte("v")))
+			require.NoError(t, kvs.Put(fr.NextHash(), []byte("v")))
+		}
+		inPut = false
+		require.NoError(t, kvs.SealBlock(block))
+	}
+	history, _ := tiers(kvs.Shards[0].DynaKV)
+	require.Greater(t, len(history), 1, "the Dyna layer must hold history to compact")
+	// The hook is live: compaction still runs when the caller asks
+	before := compactions
+	require.NoError(t, kvs.Compress())
+	require.Greater(t, compactions, before, "Compress must compact the history the puts made")
+}

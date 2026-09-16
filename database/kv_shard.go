@@ -285,12 +285,8 @@ func (k *KVShard) PutDyna(key [32]byte, value []byte) (err error) {
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
-	if writes, err := k.Shards[index].PutDyna(key, value); err != nil {
-		return err
-	} else if writes > 5000 {
-		return k.Shards[index].Compress()
-	}
-	return nil
+	_, err = k.Shards[index].PutDyna(key, value)
+	return // A put never compacts; maintenance is the caller's cadence (#92)
 }
 
 // PutPerm
@@ -300,12 +296,8 @@ func (k *KVShard) PutPerm(key [32]byte, value []byte) (err error) {
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
-	if writes, err := k.Shards[index].PutPerm(key, value); err != nil {
-		return err
-	} else if writes > 5000 {
-		return k.Shards[index].Compress()
-	}
-	return nil
+	_, err = k.Shards[index].PutPerm(key, value)
+	return // A put never compacts; maintenance is the caller's cadence (#92)
 }
 
 // Put
@@ -315,12 +307,8 @@ func (k *KVShard) Put(key [32]byte, value []byte) (err error) {
 	if err = k.Shards[index].Open(); err != nil { // A failed load leaves the
 		return // shard empty, so a dropped error reads as "not found"
 	}
-	if writes, err := k.Shards[index].Put(key, value); err != nil {
-		return err
-	} else if writes > 5000 {
-		return k.Shards[index].Compress()
-	}
-	return nil
+	_, err = k.Shards[index].Put(key, value)
+	return // A put never compacts; maintenance is the caller's cadence (#92)
 }
 
 // GetDyna

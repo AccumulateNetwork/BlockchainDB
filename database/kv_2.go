@@ -342,10 +342,10 @@ func (k *KV2) PutPerm(key [32]byte, value []byte) (writes int, err error) {
 	defer k.Mutex.RUnlock()
 	k.pWrites.Add(1)
 	if err = k.PermKV.Put(key, value); err != nil {
-		return int(k.dWrites.Load()), err
+		return int(k.pWrites.Load()), err
 	}
 	autoSeal, err = k.sealPermIfFull()
-	return int(k.dWrites.Load()), err
+	return int(k.pWrites.Load()), err
 }
 
 // finishAutoSeal is the second half of an auto-seal a Put began: it

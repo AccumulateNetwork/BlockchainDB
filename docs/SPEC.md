@@ -398,7 +398,10 @@ field read as sealed, which is what they are.
 
 All maintenance copies run with no store lock, publish aside, and
 swap under History exclusively (`swapHistory`), which re-checks the
-run is still in place and discards its output if not.
+run is still in place and discards its output if not.  Nothing on the
+protocol path starts a pass: the store exposes `Compress`, `Merge` and
+`Pack`, and the caller schedules them (`KVShard.Put*` once ran
+`Compress` every 5,000 writes on the committing goroutine, #92).
 
 - **Dyna compaction** — `CompactHistory` (`segstore.go`): fold the run
   `compactionRun` chooses into one segment holding the newest record
