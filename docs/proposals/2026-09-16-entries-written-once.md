@@ -179,11 +179,15 @@ commit point" and closes #33.
 ## Order of work
 
 1. The dynamic heap, behind the existing `KV2` dynamic surface, so
-   the sharding and the adapter do not change.  *Built.*  Alone on
-   the disk with nine stores it holds the seal at ~54 ms p50 with no
-   compaction spikes, reads at 1-2 µs p99, and maintenance at a tenth
-   of the segment layer's; the segment layer alone had a compaction
-   storm in minute 4 (seal max 1.5 s, 58 blocks missed).
+   the sharding and the adapter do not change.  *Built (PR #97).*
+   Alone on the disk with nine stores (run 7): seal p50 53-61 ms in
+   every minute, read p99 1-2 µs, maintenance ~10 s a minute, store
+   3.8 GB at five minutes, zero wrong answers; the segment layer alone
+   seals at 33-38 ms p50 but reads at 11-13 µs, spends 22-110 s a
+   minute compacting, and had a compaction storm in minute 4 (seal
+   max 1.5 s, 58 blocks missed).  The heap's remaining tail (p90
+   150-250 ms in the minutes the mover copies most) is the mover's
+   own fsync volume in the device queue, which the pass size paces.
 2. The permanent index deltas and the single block file, which also
    brings the seal to one commit point.
 3. Merge and pack over indexes.
