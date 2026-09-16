@@ -51,42 +51,43 @@ compaction, merge, pack -- operates on indexes, which are an order of
 magnitude smaller than what they index (a key and a location, ~40 B,
 against a ~300 B value) and can be rebuilt from the entries.
 
-## The dynamic layer: a heap with holes
+## The dynamic layer: an append-and-clean heap
 
 The dynamic layer holds a bounded key set rewritten forever.  Today
 every rewrite appends and the old copy is garbage until a fold
-rewrites everything around it.  Instead:
+rewrites everything around it, index and filter included.  Instead:
 
-- **Entries live in a heap file per shard.**  An entry is
-  `[len][key][value][checksum]`; its location is `(file, offset)`.
+- **Entries are managed by appending.**  An entry is
+  `[cap][len][key][value][checksum]` in a slot of a size class; a
+  block's entries are appended contiguously, so the block sync is one
+  sequential fsync of the heap per shard.  (Filling holes wherever
+  they lie was built first and measured: a block's 11k rewrites
+  scattered over a 380 MB heap dirtied a page each, and the barrier
+  wrote 4x the ingest -- run 3, 443 MB/s against run 2's 117.  The
+  commit path cannot afford scattered writes; only the cleaner can.)
 - **A rewrite within the block reuses the slot.**  A key written
   again in the block that took its slot is rewritten in place when the
   value fits: nothing durable names the slot yet.
-- **A rewrite in a later block takes a new slot.**  The slot the last
-  durable index names is never overwritten, or a crash between the
-  write and the block's sync would expose an uncommitted value under
-  a committed name.  The new entry goes into a hole that fits, or the
-  end of the heap; the old slot becomes a hole one sync later.  A key
-  rewritten every block therefore cycles two slots, its own and last
-  block's; the heap's size for such a key is twice the entry, not a
-  history of it.
-- **Holes are filled, not swept.**  Free space is kept by size class
-  (`8 << n` bytes); a new entry takes the smallest hole that fits, or
-  the end of the file.  Fragmentation is bounded by the size classes
-  the way a slab allocator's is, and the store reports the ratio of
-  hole bytes to live bytes.
-- **Moving is the only rewrite, and it is bounded.**  When the hole
-  ratio exceeds a threshold, one pass moves one entry -- the last
-  live entry of the file into the largest hole that fits -- and stops.
-  A pass costs one entry, never the file.  The file shrinks from the
-  end when its tail is a hole.
+- **A rewrite in a later block appends.**  The slot the last durable
+  index names is never overwritten, or a crash between the write and
+  the block's sync would expose an uncommitted value under a committed
+  name.  The old slot is dead where it lies.
+- **A bounded cleaner makes the big hole.**  On the maintenance
+  cadence, one pass scans up to `HeapCleanBytes` (16 MB) from the head
+  -- the oldest byte in use -- re-appends the entries still live, and
+  marks the region; the sync after the delta naming the copies
+  releases it (`fallocate` punch, size kept).  A pass costs the live
+  fraction of the oldest region: small for a hot key set, and for a
+  cold one the price of a bounded move (1.2).  The store reports bytes
+  scanned against bytes moved, which is the heap's write amplification.
 - **The key map is in memory** for the live dynamic key set (the
   soak's half million keys are ~24 MB per store; 1.2 allows memory
   that scales with the working set).  It is also what the seal makes
   durable, below.
 
 The layer's size converges to O(live keys) by construction (1.5),
-without the deeper fold 2.7 allows today.
+without the deeper fold 2.7 allows today, and nothing but entries is
+ever copied.
 
 ## The permanent layer: append-only data, merged indexes
 
@@ -124,10 +125,11 @@ commit point" and closes #33.
 
 ## Durability and crash consistency (1.8)
 
-- **A hole is reusable one seal late.**  A slot freed in block N may
-  be reused only after N's seal is durable.  Until then the durable
-  index still names the old slot, and a crash must find it intact.
-  Reuse is deferred the way 2.6 defers deletion.  The adapter never
+- **A region is released one seal late.**  The head advances past a
+  cleaned region only after the delta naming the cleaner's copies is
+  durable.  Until then the durable index still names the old slots,
+  and a crash must find them intact.  Release is deferred the way 2.6
+  defers deletion.  The adapter never
   asks the store for an old version (its pre-images are memoized on
   its side), so reuse waits on the seal and on nothing else.
 - **A torn slot is detected, not misread.**  Every entry carries its
@@ -161,8 +163,7 @@ commit point" and closes #33.
    `Stats`), so the sharding and the adapter do not change.  The
    platform measures it alone (`-stores 9 -perm 0`).  *Written:
    `database/heap.go`, opened with `NewKVShardHeapN` / `NewKV2Heap`,
-   detected on open by its directory; `bdbench -dyna-heap`.  The
-   bounded move is not written yet; holes cycle by size class.*
+   detected on open by its directory; `bdbench -dyna-heap`.*
 2. The permanent index deltas and the single block file, which also
    brings the seal to one commit point.
 3. Merge and pack over indexes.

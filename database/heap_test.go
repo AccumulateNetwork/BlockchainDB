@@ -16,9 +16,10 @@ func heapDir(t *testing.T) string {
 func key(b byte) (k [32]byte) { k[0] = b; return }
 
 // A key rewritten within the block reuses its slot; rewritten in a
-// later block it takes a new slot, and the old one is a hole only
-// after the sync that stops naming it.
-func TestHeapRewriteReusesWithinTheBlockAndFreesOneSyncLate(t *testing.T) {
+// later block it is appended, the old slot dead where it lies until a
+// clean pass moves the live entries past it and the next sync
+// releases the region.
+func TestHeapRewriteReusesWithinTheBlockAndCleansOneSyncLate(t *testing.T) {
 	h, err := NewHeapStore(heapDir(t))
 	require.NoError(t, err)
 	defer h.Close()
@@ -33,25 +34,35 @@ func TestHeapRewriteReusesWithinTheBlockAndFreesOneSyncLate(t *testing.T) {
 	require.Equal(t, "uno", string(v))
 
 	// Block 1 durable; block 2 rewrites the key
-	p, err := h.beginBlockSync()
-	require.NoError(t, err)
-	require.NoError(t, p.finish())
+	sync := func() {
+		p, err := h.beginBlockSync()
+		require.NoError(t, err)
+		require.NoError(t, p.finish())
+	}
+	sync()
 	h.AdvanceBlock(2)
 	require.NoError(t, h.Put(key(1), []byte("two")))
 	require.NotEqual(t, off, h.index[key(1)].off, "a durable slot is never rewritten")
-	holes, _ := h.HoleRatio()
-	require.Zero(t, holes, "the old slot is not a hole until block 2 is durable")
-	p, err = h.beginBlockSync()
-	require.NoError(t, err)
-	require.NoError(t, p.finish())
-	holes, _ = h.HoleRatio()
-	require.EqualValues(t, heapMinCap, holes, "now it is")
+	dead, live := h.HoleRatio()
+	require.EqualValues(t, heapMinCap, dead, "the old slot is dead where it lies")
+	require.EqualValues(t, heapMinCap, live)
+	sync()
 
-	// Block 3 fills the hole
+	// A clean pass in block 3 moves the live entry past the dead one;
+	// the region is released only by the sync after it
 	h.AdvanceBlock(3)
-	require.NoError(t, h.Put(key(2), []byte("three")))
-	require.Equal(t, off, h.index[key(2)].off, "the hole is reused")
-	require.EqualValues(t, 1, h.putHole.Load())
+	cleaned, err := h.clean(1 << 20)
+	require.NoError(t, err)
+	require.True(t, cleaned)
+	require.EqualValues(t, 0, h.head, "not released yet: the copies are not durable")
+	scanned, moved := h.Cleaned()
+	require.EqualValues(t, 2*heapMinCap, scanned)
+	require.EqualValues(t, heapMinCap, moved, "one live entry copied, one dead skipped")
+	sync()
+	require.EqualValues(t, 2*heapMinCap, h.head, "released after the sync")
+	dead, live = h.HoleRatio()
+	require.Zero(t, dead)
+	require.EqualValues(t, heapMinCap, live)
 	v, err = h.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, "two", string(v))
@@ -97,8 +108,8 @@ func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	_, err = r.Get(key(99))
 	require.ErrorIs(t, err, errNotFound)
 	require.Equal(t, size, r.size, "the file is cut back to the durable append point")
-	holes, _ := r.HoleRatio()
-	require.EqualValues(t, heapMinCap, holes, "key 1's block-1 slot is a hole again")
+	dead, _ := r.HoleRatio()
+	require.EqualValues(t, heapMinCap, dead, "key 1's block-1 slot is dead where it lies")
 	require.EqualValues(t, 2, r.height, "the durable height: block 3 never synced")
 }
 
@@ -124,7 +135,7 @@ func TestHeapTornLogTailIsDropped(t *testing.T) {
 	require.Equal(t, "one", string(v))
 	st, err := os.Stat(filepath.Join(dir, "index.log"))
 	require.NoError(t, err)
-	require.EqualValues(t, 16+48+4, st.Size(), "one whole delta of one key remains")
+	require.EqualValues(t, heapDeltaHdr+heapDeltaRec+4, st.Size(), "one whole delta of one key remains")
 }
 
 // A snapshot carries the map and empties the log; what comes after is
@@ -133,6 +144,9 @@ func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
 	require.NoError(t, err)
+	every := HeapSnapshotEvery
+	HeapSnapshotEvery = 1
+	defer func() { HeapSnapshotEvery = every }()
 	for b := uint64(1); b <= 30; b++ {
 		h.AdvanceBlock(b)
 		for i := byte(1); i <= 20; i++ {
@@ -159,13 +173,13 @@ func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []byte{30, i}, v)
 	}
-	// A key rewritten every block cycles two slots: the one it holds
-	// and the one it held last block, a hole once this block is durable
-	// and the next block's slot.  So after the last sync every key has
-	// one hole beside its live slot.
-	holes, live := r.HoleRatio()
+	// The one clean pass at block 20 found blocks 1-19 all dead and
+	// stopped at block 20's slots, which the sync at block 21 released;
+	// blocks 20-29 lie dead behind block 30's live slots.
+	dead, live := r.HoleRatio()
 	require.EqualValues(t, 20*heapMinCap, live)
-	require.EqualValues(t, 20*heapMinCap, holes)
+	require.EqualValues(t, 10*20*heapMinCap, dead)
+	require.EqualValues(t, 19*20*heapMinCap, r.head, "released by the sync after the clean")
 }
 
 // A slot whose bytes were damaged is an error, never a value.

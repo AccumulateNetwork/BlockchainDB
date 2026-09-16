@@ -17,7 +17,8 @@ table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:ta
 td:first-child,th:first-child{text-align:left}.warn{color:#d29922}.bad{color:#f85149}.ok{color:#3fb950}
 </style></head><body><div class=wrap>
 <h1>bdbench <span id=state class=ok>live</span></h1>
-<div class=sub>refreshes every 5 s from bdbench.csv and run.json</div>
+<div class=sub>live state every 2 s (live.json); a report row every minute (bdbench.csv)</div>
+<div class=groups id=now></div>
 <div class=groups id=config></div>
 <div class=groups id=cards></div>
 <div class=charts>
@@ -34,9 +35,14 @@ function parse(t){const L=t.trim().split("\n");const h=L[0].split(",");return L.
 function line(id,rows,keys,colors,ymax){const c=document.getElementById(id);const W=c.width=c.clientWidth*2,H=c.height=c.clientHeight*2;const x=c.getContext("2d");x.clearRect(0,0,W,H);if(!rows.length)return;
  let m=ymax||Math.max(1,...keys.flatMap(k=>rows.map(r=>r[k]||0)))*1.1;x.strokeStyle="#2a3240";x.lineWidth=1;for(let g=0;g<=4;g++){const y=H-6-(H-12)*g/4;x.beginPath();x.moveTo(40,y);x.lineTo(W,y);x.stroke();x.fillStyle="#8b949e";x.font="18px sans-serif";x.fillText((m*g/4).toFixed(0),0,y+6)}
  keys.forEach((k,i)=>{x.strokeStyle=colors[i];x.lineWidth=3;x.beginPath();rows.forEach((r,j)=>{const px=40+(W-44)*j/Math.max(1,rows.length-1),py=H-6-(H-12)*Math.min(1,(r[k]||0)/m);j?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()})}
+async function now(){try{const l=await (await fetch("live.json?"+Date.now())).json();const m=Math.floor(l.elapsedSec/60),s=l.elapsedSec%60;document.getElementById("state").textContent=`live · ${m}m ${String(s).padStart(2,"0")}s · block ${l.height} · ${l.blocks} blocks`;const L=l.last10s;
+ document.getElementById("now").innerHTML=[
+  group("Now: seals, last 10 s",[["p50",L.sealP50ms.toFixed(0)+" ms","big"],["p90 (budget 100)",L.sealP90ms.toFixed(0)+" ms",L.sealP90ms>100?"warn":"ok"],["max",L.sealMaxMs.toFixed(0)+" ms"]]),
+  group("Now: blocks, last 10 s",[["p50",L.blockP50ms.toFixed(0)+" ms","big"],["p90 (interval 1000)",L.blockP90ms.toFixed(0)+" ms",L.blockP90ms>1000?"bad":"ok"],["max",L.blockMaxMs.toFixed(0)+" ms"],["over the interval",L.over+" of "+L.blocks,L.over>0?"bad":"ok"]]),
+  group("Now: maintenance and heap",[["passes in flight",l.maintenanceInFlight,"big"],["heap live / holes",l.heapLiveMB.toFixed(0)+" / "+l.heapHoleMB.toFixed(0)+" MB"],["wrong answers so far",l.mismatches,l.mismatches>0?"bad":"ok"]])].join("")}catch(e){}}
 async function tick(){let t;try{t=await (await fetch("bdbench.csv?"+Date.now())).text()}catch(e){document.getElementById("state").textContent="unreachable";return}
  const rows=parse(t),last=rows[rows.length-1]||{};const st=document.getElementById("state");
- st.textContent=rows.length?("minute "+last.minute):"waiting for the first minute";
+ if(!rows.length)st.textContent="waiting for the first minute";
  const tot=(+last.compress_s+ +last.merge_s+ +last.pack_s).toFixed(1);
  document.getElementById("cards").innerHTML=[
   group("Protocol path, this minute",[["seal p90 (budget 100 ms)",last.seal_p90_ms+" ms",last.seal_p90_ms>100?"big warn":"big ok"],["block p90 (interval 1000 ms)",last.block_p90_ms+" ms",last.block_p90_ms>1000?"big bad":"big"],["blocks over the interval",last.over_budget,last.over_budget>0?"bad":"ok"],["blocks this minute",last.blocks],["read p99",last.read_p99_us+" µs"],["put p99 dyna / perm",last.dyna_put_p99_us+" / "+last.perm_put_p99_us+" µs"]]),
@@ -54,5 +60,5 @@ fetch("run.json").then(r=>r.json()).then(c=>{document.getElementById("config").i
  group("Load per block per store",[["dynamic puts",c.dynaPuts],["permanent puts",c.permPuts],["reads",c.reads],["hot dynamic keys",c.hotKeys],["value bytes",c.valueMin+" to "+c.valueMax]]),
  group("Schedule",[["block interval",c.interval],["duration",c.duration],["maintenance every (blocks)",c.compressEvery],["pack every (blocks)",c.packEvery],["started (UTC)",c.started]]),
  group("Run",[["directory",c.dir.split("/").slice(-1)[0]],["seed",c.seed]])].join("")}).catch(()=>{});
-tick();setInterval(tick,5000);
+now();tick();setInterval(now,2000);setInterval(tick,5000);
 </script></body></html>

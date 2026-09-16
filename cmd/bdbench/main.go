@@ -151,10 +151,22 @@ func pct(sorted []time.Duration, p float64) time.Duration {
 func ms(d time.Duration) string { return strconv.FormatFloat(float64(d)/1e6, 'f', 1, 64) }
 func us(d time.Duration) string { return strconv.FormatInt(int64(d/time.Microsecond), 10) }
 
+// recent is one block as the live page sees it: when it ended and
+// what it and its seal cost.
+type recent struct {
+	at          time.Time
+	block, seal time.Duration
+}
+
 // tallies is what every store adds to and the report takes from.
 type tallies struct {
 	blockTimes, sealTimes, dynaPut, permPut, readT samples
 	blocks, over, mismatches                       atomic.Uint64
+	inFlight                                       atomic.Int64 // Maintenance passes running now
+
+	ringMu sync.Mutex
+	ring   [1024]recent // The last blocks, for the live state
+	ringN  uint64
 
 	mu      sync.Mutex
 	passes  map[string]int
@@ -287,10 +299,15 @@ func (s *store) block(c config, t *tallies) error {
 	if err := s.kv.SealBlock(s.height); err != nil {
 		return fmt.Errorf("store %d SealBlock: %w", s.id, err)
 	}
-	t.sealTimes.add(time.Since(at))
+	sealTook := time.Since(at)
+	t.sealTimes.add(sealTook)
 	took := time.Since(start)
 	t.blockTimes.add(took)
 	t.blocks.Add(1)
+	t.ringMu.Lock()
+	t.ring[t.ringN%uint64(len(t.ring))] = recent{at: time.Now(), block: took, seal: sealTook}
+	t.ringN++
+	t.ringMu.Unlock()
 	if took > c.interval {
 		t.over.Add(1)
 	} else {
@@ -313,9 +330,11 @@ func (s *store) maintain(c config, t *tallies) {
 	}
 	height := s.height
 	s.maintWG.Add(1)
+	t.inFlight.Add(1)
 	go func() {
 		defer s.maintWG.Done()
 		defer s.maintaining.Store(false)
+		defer t.inFlight.Add(-1)
 		at := time.Now()
 		err := s.kv.Compress()
 		t.note("compress", time.Since(at))
@@ -371,6 +390,58 @@ func dirSize(dir string) (files int, bytes int64) {
 		return nil
 	})
 	return
+}
+
+// liveState is what the page shows between report rows: the last ten
+// seconds of blocks and seals, and the run's running totals.  Written
+// to live.json every two seconds.
+func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
+	t.ringMu.Lock()
+	cut := time.Now().Add(-10 * time.Second)
+	var bt, st []time.Duration
+	n := t.ringN
+	if n > uint64(len(t.ring)) {
+		n = uint64(len(t.ring))
+	}
+	for i := uint64(0); i < n; i++ {
+		r := t.ring[(t.ringN-1-i)%uint64(len(t.ring))]
+		if r.at.Before(cut) {
+			break
+		}
+		bt = append(bt, r.block)
+		st = append(st, r.seal)
+	}
+	t.ringMu.Unlock()
+	sort.Slice(bt, func(i, j int) bool { return bt[i] < bt[j] })
+	sort.Slice(st, func(i, j int) bool { return st[i] < st[j] })
+	over := 0
+	for _, d := range bt {
+		if d > c.interval {
+			over++
+		}
+	}
+	var height uint64
+	var holes, live int64
+	for _, s := range stores {
+		if s.height > height {
+			height = s.height
+		}
+		for _, sh := range s.kv.Shards {
+			if sh.Heap != nil {
+				h, l := sh.Heap.HoleRatio()
+				holes, live = holes+h, live+l
+			}
+		}
+	}
+	b, _ := json.Marshal(map[string]any{
+		"elapsedSec": int(time.Since(start).Seconds()), "blocks": t.blocks.Load(), "height": height,
+		"last10s": map[string]any{"blocks": len(bt), "over": over,
+			"blockP50ms": float64(pct(bt, .5)) / 1e6, "blockP90ms": float64(pct(bt, .9)) / 1e6, "blockMaxMs": float64(pct(bt, 1)) / 1e6,
+			"sealP50ms": float64(pct(st, .5)) / 1e6, "sealP90ms": float64(pct(st, .9)) / 1e6, "sealMaxMs": float64(pct(st, 1)) / 1e6},
+		"maintenanceInFlight": t.inFlight.Load(), "mismatches": t.mismatches.Load(),
+		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
+	})
+	return b
 }
 
 func fail(what string, err error) {
@@ -506,6 +577,22 @@ func main() {
 			strconv.FormatUint(mism, 10)})
 		csvw.Flush()
 	}
+
+	// The live state, every two seconds, beside the per-minute rows
+	liveStop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				_ = os.WriteFile(filepath.Join(c.dir, "live.json"), t.liveState(c, stores, start), 0o644)
+			case <-liveStop:
+				return
+			}
+		}
+	}()
+	defer close(liveStop)
 
 	// Every store drives its own blocks; the first error stops the run.
 	stop := make(chan struct{})
