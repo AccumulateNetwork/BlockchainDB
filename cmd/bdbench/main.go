@@ -378,6 +378,8 @@ func procIO() (read, write uint64) {
 	return
 }
 
+// dirSize counts the bytes the files occupy, not their apparent size:
+// a heap releases regions with punched holes and keeps its length.
 func dirSize(dir string) (files int, bytes int64) {
 	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -385,7 +387,11 @@ func dirSize(dir string) (files int, bytes int64) {
 		}
 		if info, err := d.Info(); err == nil {
 			files++
-			bytes += info.Size()
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				bytes += st.Blocks * 512
+			} else {
+				bytes += info.Size()
+			}
 		}
 		return nil
 	})
@@ -422,6 +428,7 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 	}
 	var height uint64
 	var holes, live int64
+	var scanned, moved uint64
 	for _, s := range stores {
 		if s.height > height {
 			height = s.height
@@ -430,6 +437,8 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 			if sh.Heap != nil {
 				h, l := sh.Heap.HoleRatio()
 				holes, live = holes+h, live+l
+				sc, mv := sh.Heap.Cleaned()
+				scanned, moved = scanned+sc, moved+mv
 			}
 		}
 	}
@@ -440,6 +449,7 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 			"sealP50ms": float64(pct(st, .5)) / 1e6, "sealP90ms": float64(pct(st, .9)) / 1e6, "sealMaxMs": float64(pct(st, 1)) / 1e6},
 		"maintenanceInFlight": t.inFlight.Load(), "mismatches": t.mismatches.Load(),
 		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
+		"heapScannedMB": float64(scanned) / 1e6, "heapMovedMB": float64(moved) / 1e6,
 	})
 	return b
 }

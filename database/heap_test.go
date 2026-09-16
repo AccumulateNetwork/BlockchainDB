@@ -48,18 +48,22 @@ func TestHeapRewriteReusesWithinTheBlockAndCleansOneSyncLate(t *testing.T) {
 	require.EqualValues(t, heapMinCap, live)
 	sync()
 
-	// A clean pass in block 3 moves the live entry past the dead one;
-	// the region is released only by the sync after it
+	// A clean pass in block 3 takes the region (half dead) and moves
+	// the live entry out of it; the region is released only by the
+	// sync after it.  The region must not be the one block 3 appends
+	// to, so the file is pushed into a second region first.
 	h.AdvanceBlock(3)
+	h.size = HeapRegionBytes // Block 3 appends into region 1
 	cleaned, err := h.clean(1 << 20)
 	require.NoError(t, err)
 	require.True(t, cleaned)
-	require.EqualValues(t, 0, h.head, "not released yet: the copies are not durable")
+	require.Equal(t, []int{0}, h.release, "not released yet: the copies are not durable")
+	require.False(t, h.regions[0].released)
 	scanned, moved := h.Cleaned()
 	require.EqualValues(t, 2*heapMinCap, scanned)
 	require.EqualValues(t, heapMinCap, moved, "one live entry copied, one dead skipped")
 	sync()
-	require.EqualValues(t, 2*heapMinCap, h.head, "released after the sync")
+	require.True(t, h.regions[0].released, "released after the sync")
 	dead, live = h.HoleRatio()
 	require.Zero(t, dead)
 	require.EqualValues(t, heapMinCap, live)
@@ -156,9 +160,8 @@ func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, p.finish())
 		if b == 20 {
-			ok, err := h.compact()
+			_, err := h.compact() // Nothing to clean: one region, still being appended to
 			require.NoError(t, err)
-			require.True(t, ok)
 			st, err := os.Stat(filepath.Join(dir, "index.log"))
 			require.NoError(t, err)
 			require.Zero(t, st.Size(), "the log is empty after the snapshot")
@@ -173,13 +176,12 @@ func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []byte{30, i}, v)
 	}
-	// The one clean pass at block 20 found blocks 1-19 all dead and
-	// stopped at block 20's slots, which the sync at block 21 released;
-	// blocks 20-29 lie dead behind block 30's live slots.
+	// Everything fits in the region the blocks append to, which the
+	// cleaner never takes: blocks 1-29 lie dead behind block 30's live
+	// slots, and the accounting survives the reopen.
 	dead, live := r.HoleRatio()
 	require.EqualValues(t, 20*heapMinCap, live)
-	require.EqualValues(t, 10*20*heapMinCap, dead)
-	require.EqualValues(t, 19*20*heapMinCap, r.head, "released by the sync after the clean")
+	require.EqualValues(t, 29*20*heapMinCap, dead)
 }
 
 // A slot whose bytes were damaged is an error, never a value.

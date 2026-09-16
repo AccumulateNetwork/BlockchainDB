@@ -23,24 +23,29 @@ import (
 //
 //	heap.dat   entries: [cap u32][len u32][key 32][value][crc32 of
 //	           key+value], each in a slot of cap bytes (a size class),
-//	           appended in the order written; the head is the oldest
-//	           byte still in use, and everything before it is released
-//	index.log  one delta per block sync: the head, and the (key, off,
-//	           cap, len) of every key the block touched, checksummed
+//	           appended in the order written; the file is a sequence of
+//	           regions of HeapRegionBytes, and a region whose entries
+//	           are all dead is released (a punched hole, size kept)
+//	index.log  one delta per block sync: the (key, off, cap, len) of
+//	           every key the block touched, checksummed
 //	index.snap the whole key map, rewritten on the maintenance cadence
 //
 // A block's writes are contiguous, so the block sync is one sequential
 // fsync of the heap: filling holes wherever they lie was measured at
 // 4x the ingest in page writes at every barrier, and is not done.  A
 // slot a key stops naming is dead where it lies until the cleaner
-// reaches it.
+// takes its region: the region with the most dead bytes, once at
+// least HeapCleanRatio of it is dead, so a pass copies little.
+// Cleaning the oldest region regardless was measured too: with a
+// skewed key set the oldest region is mostly live cold keys, and every
+// pass copied most of it into one block's sync.
 //
 // Durability (spec 1.8).  The block sync fsyncs heap.dat and then
 // appends and fsyncs the block's delta, so an index entry is durable
 // only after the slot it names is.  A slot the last durable index
 // names is never overwritten: a key rewritten in a later block takes
-// a new slot at the end, and its old slot is dead but intact until
-// the head passes it -- and the head advances only after the delta
+// a new slot at the end, and its old slot is dead but intact until its
+// region is released -- and a region is released only after the delta
 // naming the cleaner's copies is durable, one sync late, the way spec
 // 2.6 defers deletion.  A key rewritten again within the same block
 // reuses the slot it took this block, since nothing durable names it
@@ -54,15 +59,18 @@ type HeapStore struct {
 	file   *os.File // heap.dat
 	log    *os.File // index.log
 	size   int64    // Append point: the end of heap.dat
-	head   int64    // The oldest byte in use; everything before it is released
 	index  map[[32]byte]slot
 	height uint64 // The block being written; slots taken in it may be rewritten in place
 
-	// touched is the block's delta in the making; cleanedTo is where
-	// the head moves once the delta naming the cleaner's copies is
-	// durable; snapshots counts compact calls between snapshots.
+	// regions is the live and dead capacity in each HeapRegionBytes of
+	// the file, what the cleaner chooses by; released marks the
+	// regions punched.  touched is the block's delta in the making;
+	// release holds the regions emptied by the last pass, punched once
+	// the delta naming their copies is durable; snapshots counts
+	// compact calls between snapshots.
+	regions   []region
 	touched   map[[32]byte]struct{}
-	cleanedTo int64
+	release   []int
 	snapshots int
 
 	closed    bool
@@ -71,6 +79,12 @@ type HeapStore struct {
 	putTotal, putInPlace, putAppend atomic.Uint64
 	lookups, hits                   atomic.Uint64
 	cleanedBytes, movedBytes        atomic.Uint64
+}
+
+// region is the accounting for one HeapRegionBytes of the heap.
+type region struct {
+	live, dead int64
+	released   bool
 }
 
 // slot is where an entry lives: its offset, the capacity of the slot
@@ -88,15 +102,22 @@ const (
 	heapTrailer  = 4             // crc32 of key+value
 	heapMinCap   = 64            // Smallest slot
 	heapMagic    = 0x48454150    // "HEAP", the delta record's marker
-	heapDeltaHdr = 4 + 8 + 8 + 4 // magic, height, head, count
+	heapDeltaHdr = 4 + 8 + 8 + 4 // magic, height, reserved, count
 	heapDeltaRec = 32 + 8 + 4 + 4
 )
 
-// HeapCleanBytes bounds one cleaning pass: the bytes of the oldest
-// region scanned, of which only the live entries are copied.  Sized so
-// the cleaner keeps up with the adapter's cadence on the soak's
-// volume (~10 MB appended per shard per 20 blocks) with room to spare.
-var HeapCleanBytes int64 = 16 << 20
+// HeapRegionBytes is the size of the regions the heap is cleaned and
+// released by.
+var HeapRegionBytes int64 = 4 << 20
+
+// HeapCleanBytes bounds one cleaning pass by the bytes it COPIES: the
+// most a pass can add to the next block's sync.
+var HeapCleanBytes int64 = 2 << 20
+
+// HeapCleanRatio is the dead fraction a region must reach before the
+// cleaner takes it: what bounds the copying a pass does per byte it
+// releases.
+var HeapCleanRatio = 0.5
 
 // HeapSnapshotEvery is how many compact calls pass between key-map
 // snapshots; between them the log is what open replays.
@@ -149,7 +170,7 @@ func (h *HeapStore) Open() (err error) {
 	h.index = map[[32]byte]slot{}
 	h.touched = map[[32]byte]struct{}{}
 	h.closed = false
-	h.head, h.size, h.liveBytes, h.cleanedTo = 0, 0, 0, 0
+	h.size, h.liveBytes, h.regions, h.release = 0, 0, nil, nil
 	if err = h.loadSnapshot(); err != nil {
 		return err
 	}
@@ -213,10 +234,9 @@ func (h *HeapStore) Put(key [32]byte, value []byte) error {
 		h.putInPlace.Add(1)
 	} else {
 		s = slot{off: h.size, cap: heapCap(need), n: uint32(len(value)), block: h.height}
-		h.size += int64(s.cap)
-		h.liveBytes += int64(s.cap)
+		h.append(s)
 		if had {
-			h.liveBytes -= int64(old.cap) // Dead where it lies
+			h.kill(old) // Dead where it lies
 		}
 		h.putAppend.Add(1)
 	}
@@ -226,6 +246,27 @@ func (h *HeapStore) Put(key [32]byte, value []byte) error {
 	h.index[key] = s
 	h.touched[key] = struct{}{}
 	return nil
+}
+
+// append accounts a slot taken at the end of the file.  The caller
+// holds the lock and has set s.off to the append point.
+func (h *HeapStore) append(s slot) {
+	h.size += int64(s.cap)
+	h.liveBytes += int64(s.cap)
+	r := int(s.off / HeapRegionBytes)
+	for len(h.regions) <= r {
+		h.regions = append(h.regions, region{})
+	}
+	h.regions[r].live += int64(s.cap)
+}
+
+// kill accounts a slot its key stopped naming.  The caller holds the
+// lock.
+func (h *HeapStore) kill(s slot) {
+	h.liveBytes -= int64(s.cap)
+	r := &h.regions[int(s.off/HeapRegionBytes)]
+	r.live -= int64(s.cap)
+	r.dead += int64(s.cap)
 }
 
 // Get answers from the key map and one read of the slot.  A slot
@@ -276,11 +317,11 @@ func (h *HeapStore) AdvanceBlock(height uint64) {
 }
 
 // heapSync is a block sync in flight: the delta to make durable and
-// the head to release once it is.
+// the regions to release once it is.
 type heapSync struct {
-	h         *HeapStore
-	delta     []byte
-	cleanedTo int64
+	h       *HeapStore
+	delta   []byte
+	release []int
 }
 
 // beginBlockSync takes the block's delta under the lock; finish makes
@@ -291,22 +332,22 @@ func (h *HeapStore) beginBlockSync() (blockSync, error) {
 	if h.closed || h.file == nil {
 		return nil, errStoreClosed
 	}
-	p := &heapSync{h: h, cleanedTo: h.cleanedTo}
-	if len(h.touched) > 0 || h.cleanedTo > h.head {
+	p := &heapSync{h: h, release: h.release}
+	h.release = nil
+	if len(h.touched) > 0 || len(p.release) > 0 {
 		p.delta = h.encodeDelta()
 		h.touched = map[[32]byte]struct{}{}
 	}
 	return p, nil
 }
 
-// encodeDelta is the block's index delta: marker, height, the head
-// the block's copies let the heap release, the touched keys' slots,
-// and a checksum.  The caller holds the lock.
+// encodeDelta is the block's index delta: marker, height, a reserved
+// word, the touched keys' slots, and a checksum.  The caller holds
+// the lock.
 func (h *HeapStore) encodeDelta() []byte {
 	buf := make([]byte, heapDeltaHdr+len(h.touched)*heapDeltaRec+4)
 	binary.LittleEndian.PutUint32(buf, heapMagic)
 	binary.LittleEndian.PutUint64(buf[4:], h.height)
-	binary.LittleEndian.PutUint64(buf[12:], uint64(h.cleanedTo))
 	binary.LittleEndian.PutUint32(buf[20:], uint32(len(h.touched)))
 	at := heapDeltaHdr
 	for key := range h.touched {
@@ -324,8 +365,8 @@ func putDeltaRec(buf []byte, key [32]byte, s slot) int {
 	return heapDeltaRec
 }
 
-// finish: entries durable, then the delta durable, then the head the
-// delta records is released.
+// finish: entries durable, then the delta durable, then the regions
+// the delta's copies emptied are released.
 func (p *heapSync) finish() error {
 	h := p.h
 	if p.delta == nil {
@@ -342,11 +383,11 @@ func (p *heapSync) finish() error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if p.cleanedTo > h.head {
-		if err := punchHole(h.file, h.head, p.cleanedTo-h.head); err != nil {
+	for _, r := range p.release {
+		if err := punchHole(h.file, int64(r)*HeapRegionBytes, HeapRegionBytes); err != nil {
 			return err
 		}
-		h.head = p.cleanedTo
+		h.regions[r] = region{released: true}
 	}
 	return nil
 }
@@ -372,72 +413,80 @@ func (h *HeapStore) compact() (bool, error) {
 	return cleaned, err
 }
 
-// clean scans up to budget bytes from the head, re-appends the entries
-// still live, and marks the region for release at the next sync.  The
-// cost of a pass is the live fraction of the oldest region: for a hot
-// key set rewritten every block it is small, and for a cold one it is
-// the price of a bounded move (spec 1.2).  Holds the lock for the
-// pass: bounded, and the copies are ordinary appends.
+// clean takes the region with the most dead bytes, once at least
+// HeapCleanRatio of it is dead, re-appends its live entries -- at most
+// budget bytes of them, the rest next pass -- and, when none are left,
+// marks it for release at the next sync.  The cost of a pass is bounded
+// by the copies it makes and by the ratio: a byte released never costs
+// more than a byte copied (spec 1.2).  Holds the lock for the pass:
+// bounded, and the copies are ordinary appends.
 func (h *HeapStore) clean(budget int64) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return false, errStoreClosed
 	}
-	if h.cleanedTo > h.head {
+	if len(h.release) > 0 {
 		return false, nil // The last pass's release is still waiting on a sync
 	}
-	from, to := h.head, h.head+budget
+	// The region the block in progress is appending to is never taken:
+	// a slot taken this block may still be rewritten in place, and
+	// moving it would race that
+	current := int(h.size / HeapRegionBytes)
+	pick, best := -1, 0.0
+	for i, r := range h.regions {
+		if i >= current || r.released || r.dead == 0 {
+			continue
+		}
+		if f := float64(r.dead) / float64(r.dead+r.live); f >= HeapCleanRatio && f > best {
+			pick, best = i, f
+		}
+	}
+	if pick < 0 {
+		return false, nil
+	}
+	from := int64(pick) * HeapRegionBytes
+	to := from + HeapRegionBytes
 	if to > h.size {
 		to = h.size
 	}
-	if from >= to || h.liveBytes == 0 {
-		return false, nil
-	}
-	// The pass never eats the block in progress: a slot taken this
-	// block may still be rewritten in place, and moving it would race
-	// that.  Stop at the first slot of the current block.
-	region := make([]byte, to-from)
-	if _, err := h.file.ReadAt(region, from); err != nil && !errors.Is(err, io.EOF) {
+	buf := make([]byte, to-from)
+	if _, err := h.file.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
-	var off = from
-	var moved int64
-	for off < to {
-		at := off - from
-		if at+heapHeader > int64(len(region)) {
-			break
-		}
-		capacity := binary.LittleEndian.Uint32(region[at:])
-		n := binary.LittleEndian.Uint32(region[at+4:])
-		if capacity == 0 || at+int64(capacity) > int64(len(region)) {
-			break // Unwritten, or a slot that straddles the budget: next pass
+	var moved, at int64
+	for at+heapHeader <= int64(len(buf)) {
+		capacity := binary.LittleEndian.Uint32(buf[at:])
+		if capacity == 0 || at+int64(capacity) > int64(len(buf)) {
+			break // Unwritten, or a slot that straddles the region
 		}
 		var key [32]byte
-		copy(key[:], region[at+8:])
-		s, live := h.index[key]
-		if live && s.off == off {
-			if s.block == h.height {
-				break
+		copy(key[:], buf[at+8:])
+		if s, live := h.index[key]; live && s.off == from+at {
+			if moved >= budget {
+				h.cleanedBytes.Add(uint64(at))
+				h.movedBytes.Add(uint64(moved))
+				return true, nil // The rest next pass
 			}
-			entry := region[at : at+int64(heapHeader)+int64(n)+heapTrailer]
+			n := binary.LittleEndian.Uint32(buf[at+4:])
+			entry := buf[at : at+int64(heapHeader)+int64(n)+heapTrailer]
 			ns := slot{off: h.size, cap: capacity, n: n, block: h.height}
 			if _, err := h.file.WriteAt(entry, ns.off); err != nil {
 				return false, err
 			}
-			h.size += int64(capacity)
+			h.append(ns)
+			h.kill(s)
 			h.index[key] = ns
 			h.touched[key] = struct{}{}
 			moved += int64(capacity)
 		}
-		off += int64(capacity)
+		at += int64(capacity)
 	}
-	if off == from {
-		return false, nil
-	}
-	h.cleanedTo = off
-	h.cleanedBytes.Add(uint64(off - from))
+	h.cleanedBytes.Add(uint64(at))
 	h.movedBytes.Add(uint64(moved))
+	if h.regions[pick].live == 0 {
+		h.release = append(h.release, pick)
+	}
 	return true, nil
 }
 
@@ -453,7 +502,6 @@ func (h *HeapStore) Snapshot() error {
 	buf := make([]byte, heapDeltaHdr+len(h.index)*heapDeltaRec+4)
 	binary.LittleEndian.PutUint32(buf, heapMagic)
 	binary.LittleEndian.PutUint64(buf[4:], h.height)
-	binary.LittleEndian.PutUint64(buf[12:], uint64(h.head))
 	binary.LittleEndian.PutUint32(buf[20:], uint32(len(h.index)))
 	at := heapDeltaHdr
 	for key, s := range h.index {
@@ -583,9 +631,6 @@ func (h *HeapStore) applyDelta(buf []byte) (int, error) {
 	if height := binary.LittleEndian.Uint64(buf[4:]); height > h.height {
 		h.height = height
 	}
-	if head := int64(binary.LittleEndian.Uint64(buf[12:])); head > h.head {
-		h.head = head
-	}
 	for at := heapDeltaHdr; at < end; at += heapDeltaRec {
 		var key [32]byte
 		copy(key[:], buf[at:])
@@ -595,30 +640,42 @@ func (h *HeapStore) applyDelta(buf []byte) (int, error) {
 	return end + 4, nil
 }
 
-// deriveExtent finds the append point from the key map and cuts the
-// file back to it: anything past the last named slot is a crash's
-// torn writes or the entries of a block whose delta never became
-// durable, and must not be read as anything.  The caller holds the
-// lock.
+// deriveExtent finds the append point and the regions' accounting
+// from the key map and cuts the file back to it: anything past the
+// last named slot is a crash's torn writes or the entries of a block
+// whose delta never became durable, and must not be read as anything.
+// A region with nothing live is released (idempotent for one already
+// punched).  The caller holds the lock.
 func (h *HeapStore) deriveExtent() error {
 	var end int64
-	h.liveBytes = 0
+	h.liveBytes, h.regions, h.release = 0, nil, nil
 	for _, s := range h.index {
-		if s.off < h.head {
-			return fmt.Errorf("heap: a live slot at %d lies below the head %d", s.off, h.head)
-		}
 		if e := s.off + int64(s.cap); e > end {
 			end = e
 		}
 		h.liveBytes += int64(s.cap)
+		r := int(s.off / HeapRegionBytes)
+		for len(h.regions) <= r {
+			h.regions = append(h.regions, region{})
+		}
+		h.regions[r].live += int64(s.cap)
 	}
 	h.size = end
-	h.cleanedTo = h.head
 	if err := h.file.Truncate(end); err != nil {
 		return err
 	}
-	if h.head > 0 {
-		return punchHole(h.file, 0, h.head) // Idempotent: the region is already released
+	for i := range h.regions {
+		extent := HeapRegionBytes
+		if e := end - int64(i)*HeapRegionBytes; e < extent {
+			extent = e
+		}
+		h.regions[i].dead = extent - h.regions[i].live
+		if h.regions[i].live == 0 && int64(i+1)*HeapRegionBytes <= end {
+			if err := punchHole(h.file, int64(i)*HeapRegionBytes, HeapRegionBytes); err != nil {
+				return err
+			}
+			h.regions[i] = region{released: true}
+		}
 	}
 	return nil
 }
@@ -639,12 +696,15 @@ func (h *HeapStore) Stats() StoreStats {
 	}
 }
 
-// HoleRatio reports the dead bytes between the head and the append
-// point against the live bytes: what the cleaner has yet to reclaim.
+// HoleRatio reports the dead bytes in unreleased regions against the
+// live bytes: what the cleaner has yet to reclaim.
 func (h *HeapStore) HoleRatio() (dead, live int64) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.size - h.head - h.liveBytes, h.liveBytes
+	for _, r := range h.regions {
+		dead += r.dead
+	}
+	return dead, h.liveBytes
 }
 
 // Cleaned reports what the cleaner has scanned and what it had to
