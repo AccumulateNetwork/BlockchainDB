@@ -118,16 +118,19 @@ const (
 // released by.
 var HeapRegionBytes int64 = 4 << 20
 
-// HeapCleanBytes bounds one cleaning pass by the bytes it COPIES: the
-// most a pass can add to the next block's sync.  A pass takes region
-// after region until the budget is spent, so mostly-dead regions,
-// which cost little to copy, are released several to a pass.
-var HeapCleanBytes int64 = 2 << 20
+// HeapCleanBytes bounds one cleaning pass by the bytes it COPIES.  The
+// pass syncs its own copies, so the bound is about the pass's own
+// length, not a block's barrier; sized to keep up with the soak's
+// append rate (~10 MB per shard per 20 blocks) at a live fraction of
+// one half.  A pass takes region after region until the budget is
+// spent, so mostly-dead regions, which cost little, go several to a
+// pass.
+var HeapCleanBytes int64 = 16 << 20
 
 // HeapCleanRegions bounds a pass by regions taken as well, so that a
 // heap of wholly dead regions is not scanned end to end under the
 // lock in one pass.
-var HeapCleanRegions = 8
+var HeapCleanRegions = 32
 
 // HeapCleanRatio is the dead fraction a region must reach before the
 // cleaner takes it: what bounds the copying a pass does per byte it
@@ -528,48 +531,102 @@ func (h *HeapStore) compact() (bool, error) {
 	return cleaned, err
 }
 
-// clean takes the region with the most dead bytes, once at least
-// HeapCleanRatio of it is dead, re-appends its live entries -- at most
-// budget bytes of them, the rest next pass -- and, when none are left,
-// marks it for release at the next sync.  The cost of a pass is bounded
-// by the copies it makes and by the ratio: a byte released never costs
-// more than a byte copied (spec 1.2).  Holds the lock for the pass:
-// bounded, and the copies are ordinary appends.
+// clean is the mover: it takes the regions with the most dead bytes,
+// once at least HeapCleanRatio of each is dead, copies their live
+// entries to the end -- at most budget bytes per pass -- and marks
+// the regions for release once the delta naming the copies is
+// durable.  The pass syncs its own copies, so they never land in a
+// block's barrier and the pass can be sized to the append rate; and
+// it holds the shard's lock only to choose and to name, never across
+// the copy or its fsync (spec 1.6).  A byte released never costs more
+// than a byte copied (spec 1.2).
 func (h *HeapStore) clean(budget int64) (bool, error) {
+	// 1. Under the lock: pick the regions, read them, decide what is
+	// live and where each copy will go
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
 		return false, errStoreClosed
 	}
 	if len(h.release) > 0 {
+		h.mu.Unlock()
 		return false, nil // The last pass's release is still waiting on a sync
 	}
-	var moved int64
-	taken := 0
-	for taken < HeapCleanRegions && moved < budget {
+	var moves []heapMove
+	var regions []int
+	var copied int64
+	for len(regions) < HeapCleanRegions && copied < budget {
 		pick := h.pickRegion()
 		if pick < 0 {
 			break
 		}
-		m, err := h.cleanRegion(pick, budget-moved)
+		h.regions[pick].cleaning = true
+		regions = append(regions, pick)
+		m, n, err := h.planRegion(pick, budget-copied)
 		if err != nil {
-			return taken > 0, err
+			h.mu.Unlock()
+			return false, err
 		}
-		moved += m
-		taken++
+		moves = append(moves, m...)
+		copied += n
 	}
-	for i := range h.regions {
-		h.regions[i].cleaning = false
+	for _, r := range regions {
+		h.regions[r].cleaning = false
 	}
-	return taken > 0, nil
+	h.mu.Unlock()
+	if len(regions) == 0 {
+		return false, nil
+	}
+	// 2. Without the lock: write the copies and make them durable.
+	// Their slots were reserved at the end of the file under the lock,
+	// so puts landing meanwhile go past them.
+	for _, m := range moves {
+		if _, err := h.file.WriteAt(m.entry, m.to.off); err != nil {
+			return false, err
+		}
+	}
+	if len(moves) > 0 {
+		if err := fsync(h.file); err != nil {
+			return false, err
+		}
+	}
+	// 3. Under the lock: name the copies, unless the key was rewritten
+	// meanwhile, in which case the copy is dead on arrival; and mark
+	// the regions the pass emptied
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range moves {
+		s, live := h.index[m.key]
+		if live && s.off == m.from.off {
+			h.index[m.key] = m.to
+			h.touched[m.key] = struct{}{}
+			h.kill(m.from)
+		} else {
+			h.kill(m.to) // Reserved and written, but no longer wanted
+		}
+	}
+	for _, r := range regions {
+		if h.regions[r].live == 0 {
+			h.release = append(h.release, r)
+		}
+	}
+	h.movedBytes.Add(uint64(copied))
+	return true, nil
+}
+
+// heapMove is one live entry the mover copies: where it was, where
+// it goes, and the bytes to write there.
+type heapMove struct {
+	key      [32]byte
+	from, to slot
+	entry    []byte
 }
 
 // pickRegion is the region with the most dead bytes, once at least
 // HeapCleanRatio of it is dead; -1 when none qualifies.  The region
 // the block in progress is appending to is never taken: a slot taken
 // this block may still be rewritten in place, and moving it would
-// race that.  A region a pass has already partly cleaned keeps its
-// dead bytes and is picked again.  The caller holds the lock.
+// race that.  The caller holds the lock.
 func (h *HeapStore) pickRegion() int {
 	current := int(h.size / HeapRegionBytes)
 	pick, best := -1, 0.0
@@ -584,21 +641,22 @@ func (h *HeapStore) pickRegion() int {
 	return pick
 }
 
-// cleanRegion re-appends the live entries of one region, at most
-// budget bytes of them, and marks the region for release when none
-// are left.  Returns the bytes copied.  The caller holds the lock.
-func (h *HeapStore) cleanRegion(pick int, budget int64) (int64, error) {
+// planRegion reads one region and reserves, at the end of the file, a
+// slot for each live entry in it up to budget bytes; the rest wait for
+// the next pass.  The caller holds the lock.  The reserved slots are
+// counted live in their region at once, so the accounting is right
+// whether or not the copy is wanted when it lands.
+func (h *HeapStore) planRegion(pick int, budget int64) (moves []heapMove, copied int64, err error) {
 	from := int64(pick) * HeapRegionBytes
 	to := from + HeapRegionBytes
 	if to > h.size {
 		to = h.size
 	}
 	buf := make([]byte, to-from)
-	if _, err := h.file.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
-		return 0, err
+	if _, err = h.file.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
+		return nil, 0, err
 	}
-	h.regions[pick].cleaning = true // Not picked again this pass
-	var moved, at int64
+	var at int64
 	for at+heapHeader <= int64(len(buf)) {
 		capacity := binary.LittleEndian.Uint32(buf[at:])
 		if capacity == 0 || at+int64(capacity) > int64(len(buf)) {
@@ -607,33 +665,22 @@ func (h *HeapStore) cleanRegion(pick int, budget int64) (int64, error) {
 		var key [32]byte
 		copy(key[:], buf[at+16:])
 		if s, live := h.index[key]; live && s.off == from+at {
-			if moved >= budget {
-				h.cleanedBytes.Add(uint64(at))
-				h.movedBytes.Add(uint64(moved))
-				return moved, nil // The rest next pass
+			if copied >= budget {
+				break // The rest next pass
 			}
 			n := binary.LittleEndian.Uint32(buf[at+4:])
-			// The copy is this block's write of the key: it carries
-			// this height, so a repair scan prefers it to the original
 			value := buf[at+int64(heapHeader) : at+int64(heapHeader)+int64(n)]
 			ns := slot{off: h.size, cap: capacity, n: n, block: h.height}
-			if _, err := h.file.WriteAt(encodeEntry(capacity, h.height, key, value), ns.off); err != nil {
-				return moved, err
-			}
 			h.append(ns)
-			h.kill(s)
-			h.index[key] = ns
-			h.touched[key] = struct{}{}
-			moved += int64(capacity)
+			// The copy is this block's write of the key: it carries this
+			// height, so a repair scan prefers it to the original
+			moves = append(moves, heapMove{key: key, from: s, to: ns, entry: encodeEntry(capacity, h.height, key, value)})
+			copied += int64(capacity)
 		}
 		at += int64(capacity)
 	}
 	h.cleanedBytes.Add(uint64(at))
-	h.movedBytes.Add(uint64(moved))
-	if h.regions[pick].live == 0 {
-		h.release = append(h.release, pick)
-	}
-	return moved, nil
+	return moves, copied, nil
 }
 
 // Snapshot writes the whole key map and drops the deltas it covers
