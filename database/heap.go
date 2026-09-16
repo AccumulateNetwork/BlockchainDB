@@ -808,13 +808,15 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	if len(taken) == 0 {
 		return false, nil
 	}
-	// 2. Without the lock: read them.  A picked file is neither the
-	// block's nor the mover's, so its bytes do not change; only what
-	// the index says of them can, and that is checked under the lock
-	contents := make([][]byte, len(taken))
+	// 2. Without the lock: read and decode them.  A picked file is
+	// neither the block's nor the mover's, so its bytes do not change;
+	// only what the index says of them can, and that is checked under
+	// the lock.  Decoding here, checksums included, keeps 16 MB of
+	// CRC per file off the lock
+	entries := make([][]heapEntry, len(taken))
 	for i, hf := range taken {
-		contents[i] = make([]byte, hf.size)
-		if _, err := hf.f.ReadAt(contents[i], 0); err != nil {
+		buf := make([]byte, hf.size)
+		if _, err := hf.f.ReadAt(buf, 0); err != nil {
 			h.mu.Lock()
 			for _, hf := range taken {
 				hf.cleaning = false
@@ -822,6 +824,8 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 			h.mu.Unlock()
 			return false, err
 		}
+		entries[i] = decodeFile(buf)
+		h.cleanedBytes.Add(uint64(hf.size))
 	}
 	// 3. Under the lock: decide what is live and reserve each copy's
 	// slot in the mover's file; the mover's files leave the dirty set,
@@ -830,7 +834,7 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	var moves []heapMove
 	var copied int64
 	for i, hf := range taken {
-		m, n, err := h.planFile(hf, contents[i], budget-copied)
+		m, n, err := h.planFile(hf, entries[i], budget-copied)
 		if err != nil {
 			h.mu.Unlock()
 			return false, err
@@ -923,34 +927,53 @@ func (h *HeapStore) pickFile() *heapFile {
 	return pick
 }
 
-// planFile walks one file's bytes, read outside the lock, and
-// reserves in the mover's file a slot for each entry the index still
-// names, up to budget bytes; the rest wait for the next pass.  The
-// caller holds the lock.
-func (h *HeapStore) planFile(hf *heapFile, buf []byte, budget int64) (moves []heapMove, copied int64, err error) {
+// heapEntry is one entry of a picked file as decoded outside the
+// lock: where it is, and its bytes ready to be copied.
+type heapEntry struct {
+	off   uint32
+	size  int64
+	key   [32]byte
+	value []byte
+}
+
+// decodeFile walks a file's bytes into its entries, stopping at the
+// first unwritten, torn or damaged slot.
+func decodeFile(buf []byte) (entries []heapEntry) {
 	var at int64
 	for at < int64(len(buf)) {
 		size, _, key, value, ok := decodeEntry(buf[at:])
 		if !ok {
 			break
 		}
-		if s, live := h.index[key]; live && s.file == hf.id && int64(s.off) == at {
-			if copied >= budget {
-				break // The rest next pass
-			}
-			to, off, err := h.reserve(true, size)
-			if err != nil {
-				return nil, 0, err
-			}
-			ns := slot{file: to.id, off: uint32(off), n: uint32(len(value)), block: h.height}
-			// The copy is this block's write of the key: it carries this
-			// height, so a repair scan prefers it to the original
-			moves = append(moves, heapMove{key: key, from: s, to: ns, hf: to, entry: encodeEntry(h.height, key, value)})
-			copied += size
-		}
+		entries = append(entries, heapEntry{off: uint32(at), size: size, key: key, value: value})
 		at += size
 	}
-	h.cleanedBytes.Add(uint64(at))
+	return entries
+}
+
+// planFile reserves, in the mover's file, a slot for each entry of a
+// picked file the index still names, up to budget bytes; the rest
+// wait for the next pass.  The caller holds the lock; the entries
+// were decoded outside it.
+func (h *HeapStore) planFile(hf *heapFile, entries []heapEntry, budget int64) (moves []heapMove, copied int64, err error) {
+	for _, e := range entries {
+		s, live := h.index[e.key]
+		if !live || s.file != hf.id || s.off != e.off {
+			continue
+		}
+		if copied >= budget {
+			break // The rest next pass
+		}
+		to, off, err := h.reserve(true, e.size)
+		if err != nil {
+			return nil, 0, err
+		}
+		ns := slot{file: to.id, off: uint32(off), n: uint32(len(e.value)), block: h.height}
+		// The copy is this block's write of the key: it carries this
+		// height, so a repair scan prefers it to the original
+		moves = append(moves, heapMove{key: e.key, from: s, to: ns, hf: to, entry: encodeEntry(h.height, e.key, e.value)})
+		copied += e.size
+	}
 	return moves, copied, nil
 }
 
