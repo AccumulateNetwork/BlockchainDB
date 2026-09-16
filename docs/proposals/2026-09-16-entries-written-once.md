@@ -51,39 +51,52 @@ compaction, merge, pack -- operates on indexes, which are an order of
 magnitude smaller than what they index (a key and a location, ~40 B,
 against a ~300 B value) and can be rebuilt from the entries.
 
-## The dynamic layer: an append-and-clean heap
+## The dynamic layer: files of entries, a map of keys
 
 The dynamic layer holds a bounded key set rewritten forever.  Today
 every rewrite appends and the old copy is garbage until a fold
-rewrites everything around it, index and filter included.  Instead:
+rewrites everything around it, index and filter included.  Instead
+(`database/heap.go`, opened with `NewKVShardHeapN` / `NewKV2Heap`,
+recognised on open by its directory; `bdbench -dyna-heap`):
 
-- **Entries are managed by appending.**  An entry is
-  `[cap][len][key][value][checksum]` in a slot of a size class; a
-  block's entries are appended contiguously, so the block sync is one
-  sequential fsync of the heap per shard.  (Filling holes wherever
-  they lie was built first and measured: a block's 11k rewrites
-  scattered over a 380 MB heap dirtied a page each, and the barrier
-  wrote 4x the ingest -- run 3, 443 MB/s against run 2's 117.  The
-  commit path cannot afford scattered writes; only the cleaner can.)
-- **A rewrite within the block reuses the slot.**  A key written
-  again in the block that took its slot is rewritten in place when the
-  value fits: nothing durable names the slot yet.
+- **An entry is written once, at the end of a file.**  An entry is
+  `[len][height][key][value][checksum]` at its exact aligned length;
+  a key is `(file, offset, length)`.  Data files are fixed-size
+  (`HeapFileBytes`, 16 MB); a block appends to the current file, so
+  the block sync is one sequential fsync per file the block touched.
+  (Filling holes at put time was built first and measured: a block's
+  11k rewrites scattered over a 380 MB heap dirtied a page each, and
+  the barrier wrote 4x the ingest -- run 3, 443 MB/s against run 2's
+  117.  Size classes were measured too: a third of the store wasted
+  for nothing, once nothing was allocated from free lists.)
+- **A rewrite within the block reuses the slot** when the entry keeps
+  its aligned size: nothing durable names it yet, and the file stays a
+  contiguous sequence of entries a scan can walk.
 - **A rewrite in a later block appends.**  The slot the last durable
   index names is never overwritten, or a crash between the write and
   the block's sync would expose an uncommitted value under a committed
   name.  The old slot is dead where it lies.
-- **A bounded cleaner makes the big hole.**  On the maintenance
-  cadence, one pass scans up to `HeapCleanBytes` (16 MB) from the head
-  -- the oldest byte in use -- re-appends the entries still live, and
-  marks the region; the sync after the delta naming the copies
-  releases it (`fallocate` punch, size kept).  A pass costs the live
-  fraction of the oldest region: small for a hot key set, and for a
-  cold one the price of a bounded move (1.2).  The store reports bytes
-  scanned against bytes moved, which is the heap's write amplification.
+- **The mover makes the space.**  On the maintenance cadence a pass
+  takes the deadest files -- once half dead, or whatever their ratio
+  while dead bytes exceed live, which bounds the heap at twice its
+  live set -- copies their live entries into a file of its own, and
+  marks a file left with nothing live for deletion by the sync after
+  the delta naming the copies.  The mover's file is not the block's,
+  so their barriers never share an inode (measured: the two fsyncs on
+  one file flushed each other's pages, seal p50 193 ms).  The pass
+  holds the shard's lock only to pick, to plan and to name, never
+  across a read, a write or an fsync (measured: reading a 16 MB file
+  under the lock put the seal at 229 ms).  A key rewritten while its
+  copy is in flight leaves the copy dead on arrival.  The store
+  reports bytes scanned against bytes copied: the heap's write
+  amplification.
 - **The key map is in memory** for the live dynamic key set (the
-  soak's half million keys are ~24 MB per store; 1.2 allows memory
-  that scales with the working set).  It is also what the seal makes
-  durable, below.
+  soak's half million keys are ~50 MB per store in Go; 1.2 allows
+  memory that scales with the working set).  What the seal makes
+  durable is a delta of the keys the block touched; a snapshot starts
+  a new index generation in a file of its own on the maintenance
+  cadence, written aside, fsynced and renamed into place, so no delta
+  is ever truncated away.
 
 The layer's size converges to O(live keys) by construction (1.5),
 without the deeper fold 2.7 allows today, and nothing but entries is
@@ -125,24 +138,31 @@ commit point" and closes #33.
 
 ## Durability and crash consistency (1.8)
 
-- **A region is released one seal late.**  The head advances past a
-  cleaned region only after the delta naming the cleaner's copies is
-  durable.  Until then the durable index still names the old slots,
-  and a crash must find them intact.  Release is deferred the way 2.6
-  defers deletion.  The adapter never
-  asks the store for an old version (its pre-images are memoized on
-  its side), so reuse waits on the seal and on nothing else.
+- **A file is deleted one seal late.**  A file emptied by the mover
+  is deleted only after the delta naming the mover's copies out of it
+  is durable.  Until then the durable index still names its slots,
+  and a crash must find them intact: never unlink what a durable
+  index names.  The adapter never asks the store for an old version
+  (its pre-images are memoized on its side), so deletion waits on the
+  seal and on nothing else.
 - **A torn slot is detected, not misread.**  Every entry carries its
-  length and a checksum; a slot whose checksum fails after a crash is
-  a hole, and the durable index never points at one, because an index
-  entry is durable only after the slot it names is.
-- **The in-memory key map is rebuilt on open** from the last durable
-  index snapshot plus the block files after it, the same replay 2.8
-  does for manifests today.  A snapshot is taken on the pack cadence
-  so the replay is bounded.
-- **Nothing durable is ever overwritten by a different entry** except
-  a slot the durable index no longer names.  1.7's identity rule
-  holds for files: a data file is appended, never republished.
+  length and a checksum; an entry above the committed height is a
+  block that never synced.  An index entry is durable only after the
+  slot it names is, so a torn slot is never named; open cuts the
+  files back to their last named slot and drops a torn delta whole.
+- **The key map is rebuilt on open** from the newest whole index
+  generation: its snapshot, then its deltas.  A generation whose
+  write was interrupted is not whole and is removed.
+- **Repair reads the keys from the data.**  With the index gone, a
+  scan of the data files rebuilds the map: every entry carries its
+  key and the height that wrote it, so the highest committed copy of
+  a key wins (later in the scan on a tie) and an entry above the
+  committed height, which only the store above knows, is dropped.  A
+  child process killed mid-block, three times over, reopens and
+  repairs to exactly the last durable block (`heap_crash_test.go`).
+- **Nothing durable is ever overwritten by a different entry.**  1.7's
+  identity rule holds for files: a data file is appended, never
+  republished.
 
 ## What it is measured with
 
@@ -158,12 +178,12 @@ commit point" and closes #33.
 
 ## Order of work
 
-1. The dynamic heap, behind the existing `KV2` dynamic surface (`Put`,
-   `Get`, `Seal`, `CompactHistory` becoming the bounded move,
-   `Stats`), so the sharding and the adapter do not change.  The
-   platform measures it alone (`-stores 9 -perm 0`).  *Written:
-   `database/heap.go`, opened with `NewKVShardHeapN` / `NewKV2Heap`,
-   detected on open by its directory; `bdbench -dyna-heap`.*
+1. The dynamic heap, behind the existing `KV2` dynamic surface, so
+   the sharding and the adapter do not change.  *Built.*  Alone on
+   the disk with nine stores it holds the seal at ~54 ms p50 with no
+   compaction spikes, reads at 1-2 µs p99, and maintenance at a tenth
+   of the segment layer's; the segment layer alone had a compaction
+   storm in minute 4 (seal max 1.5 s, 58 blocks missed).
 2. The permanent index deltas and the single block file, which also
    brings the seal to one commit point.
 3. Merge and pack over indexes.
