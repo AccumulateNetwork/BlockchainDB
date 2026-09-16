@@ -1,16 +1,12 @@
 package blockchainDB
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -157,21 +153,20 @@ func OpenPermStore(directory string) (*PermStore, error) {
 
 // permManifest is perm.json.
 type permManifest struct {
-	Version      int            `json:"version"`
-	Height       uint64         `json:"height"`
-	FilterBlocks uint64         `json:"filterBlocks"`
-	Rotation     int            `json:"rotation"`
-	NextData     uint32         `json:"nextData"`
-	NextRun      uint32         `json:"nextRun"`
-	DeltasFile   uint32         `json:"deltasFile"` // Deltas after this file:offset are replayed
-	DeltasOff    int64          `json:"deltasOff"`
-	Window       []permRunRef   `json:"window"`
-	Pending      []permRunRef   `json:"pending"`
-	Buckets      []permBucketM  `json:"buckets"`
-	Retired      []permRunRef   `json:"retired"`
-	DataFiles    []uint32       `json:"dataFiles"`
-	RunFiles     []uint32       `json:"runFiles"`
-	Extra        map[string]any `json:"-"`
+	Version      int           `json:"version"`
+	Height       uint64        `json:"height"`
+	FilterBlocks uint64        `json:"filterBlocks"`
+	Rotation     int           `json:"rotation"`
+	NextData     uint32        `json:"nextData"`
+	NextRun      uint32        `json:"nextRun"`
+	DeltasFile   uint32        `json:"deltasFile"` // Deltas after this file:offset are replayed
+	DeltasOff    int64         `json:"deltasOff"`
+	Window       []permRunRef  `json:"window"`
+	Pending      []permRunRef  `json:"pending"`
+	Buckets      []permBucketM `json:"buckets"`
+	Retired      []permRunRef  `json:"retired"`
+	DataFiles    []uint32      `json:"dataFiles"`
+	RunFiles     []uint32      `json:"runFiles"`
 }
 
 type permRunRef struct {
@@ -335,12 +330,6 @@ func (p *PermStore) replayDeltas() error {
 			off += int64(r.bytes)
 		}
 	}
-	// Entries past the last named one are a crash's leftovers
-	var end int64
-	for _, d := range append(p.window, p.pending...) {
-		_ = d
-	}
-	_ = end
 	return nil
 }
 
@@ -663,27 +652,10 @@ func (p *PermStore) Merge() error {
 		due = 1
 	}
 	newest := p.pending[len(p.pending)-1].height
-	type job struct {
-		b     int
-		recs  []permRecord
-		from  []*permDelta
-		fold  []*permRun
-		foldF []*runFile
-		foldI int
-	}
+	type job struct{ b int }
 	var jobs []job
 	for i := 0; i < due; i++ {
-		b := (p.rotation + i) % PermBuckets
-		bk := &p.buckets[b]
-		var j job
-		j.b = b
-		for _, d := range p.pending {
-			if d.height <= bk.merged {
-				continue
-			}
-			j.from = append(j.from, d)
-		}
-		jobs = append(jobs, j)
+		jobs = append(jobs, job{b: (p.rotation + i) % PermBuckets})
 	}
 	rotation := (p.rotation + due) % PermBuckets
 	// Read the deltas' records for these buckets outside the lock:
@@ -714,10 +686,8 @@ func (p *PermStore) Merge() error {
 	rf := p.curRun
 	p.mu.Unlock()
 	var written []struct {
-		b    int
-		run  *permRun
-		fold bool
-		at   int
+		b   int
+		run *permRun
 	}
 	for _, j := range jobs {
 		recs := mergePermRuns(byBucket[j.b])
@@ -734,7 +704,6 @@ func (p *PermStore) Merge() error {
 			p.curRun = rf
 		}
 		at := rf.size
-		rf.size += 0
 		p.mu.Unlock()
 		run, err := writePermRun(rf.f, at, rf.id, recs, 0)
 		if err != nil {
@@ -746,10 +715,8 @@ func (p *PermStore) Merge() error {
 		p.indexBytes.Add(uint64(run.bytes))
 		p.mergeRuns.Add(1)
 		written = append(written, struct {
-			b    int
-			run  *permRun
-			fold bool
-			at   int
+			b   int
+			run *permRun
 		}{b: j.b, run: run})
 	}
 	if err := fsync(rf.f); err != nil {
@@ -1082,12 +1049,3 @@ func (p *PermStore) SetFilterBlocks(n uint64) error {
 	p.mu.Unlock()
 	return nil
 }
-
-// keyPrefixBucket is the bucket a key belongs to.
-func keyPrefixBucket(key [32]byte) int { return int(key[0]) }
-
-var _ = strings.TrimSpace
-var _ = strconv.Itoa
-var _ = binary.LittleEndian
-var _ = bytes.Compare
-var _ = keyPrefixBucket
