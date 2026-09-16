@@ -22,8 +22,10 @@ import (
 //
 // Files, in one directory:
 //
-//	heap.dat   entries: [cap u32][len u32][key 32][value][crc32 of
-//	           key+value], each in a slot of cap bytes (a size class),
+//	heap.dat   entries: [cap u32][len u32][height u64][key 32][value]
+//	           [crc32 of height+key+value], each in a slot of cap bytes
+//	           (a size class), self-describing so that Repair can
+//	           rebuild the key map from the data alone,
 //	           appended in the order written; the file is a sequence of
 //	           regions of HeapRegionBytes, and a region whose entries
 //	           are all dead is released (a punched hole, size kept)
@@ -90,6 +92,7 @@ type HeapStore struct {
 type region struct {
 	live, dead int64
 	released   bool
+	cleaning   bool // Taken by the pass in progress
 }
 
 // slot is where an entry lives: its offset, the capacity of the slot
@@ -103,11 +106,11 @@ type slot struct {
 }
 
 const (
-	heapHeader   = 4 + 4 + 32    // cap, len, key
-	heapTrailer  = 4             // crc32 of key+value
-	heapMinCap   = 64            // Smallest slot
-	heapMagic    = 0x48454150    // "HEAP", the delta record's marker
-	heapDeltaHdr = 4 + 8 + 8 + 4 // magic, height, reserved, count
+	heapHeader   = 4 + 4 + 8 + 32 // cap, len, height, key
+	heapTrailer  = 4              // crc32 of key+value
+	heapMinCap   = 64             // Smallest slot
+	heapMagic    = 0x48454150     // "HEAP", the delta record's marker
+	heapDeltaHdr = 4 + 8 + 8 + 4  // magic, height, reserved, count
 	heapDeltaRec = 32 + 8 + 4 + 4
 )
 
@@ -116,8 +119,15 @@ const (
 var HeapRegionBytes int64 = 4 << 20
 
 // HeapCleanBytes bounds one cleaning pass by the bytes it COPIES: the
-// most a pass can add to the next block's sync.
+// most a pass can add to the next block's sync.  A pass takes region
+// after region until the budget is spent, so mostly-dead regions,
+// which cost little to copy, are released several to a pass.
 var HeapCleanBytes int64 = 2 << 20
+
+// HeapCleanRegions bounds a pass by regions taken as well, so that a
+// heap of wholly dead regions is not scanned end to end under the
+// lock in one pass.
+var HeapCleanRegions = 8
 
 // HeapCleanRatio is the dead fraction a region must reach before the
 // cleaner takes it: what bounds the copying a pass does per byte it
@@ -149,13 +159,82 @@ func NewHeapStore(directory string) (*HeapStore, error) {
 	return h, h.Open()
 }
 
-// OpenHeapStore opens the heap in directory as it was left.
+// OpenHeapStore opens the heap in directory as it was left.  A heap
+// whose data is there but whose index files are not is refused: that
+// is what RepairHeapStore is for, and it needs the committed height,
+// which only the store above knows.
 func OpenHeapStore(directory string) (*HeapStore, error) {
-	if _, err := os.Stat(filepath.Join(directory, "heap.dat")); err != nil {
+	st, err := os.Stat(filepath.Join(directory, "heap.dat"))
+	if err != nil {
 		return nil, fmt.Errorf("open heap at %s: %w", directory, err)
+	}
+	_, snapErr := os.Stat(filepath.Join(directory, "index.snap"))
+	_, logErr := os.Stat(filepath.Join(directory, "index.log"))
+	if st.Size() > 0 && snapErr != nil && logErr != nil {
+		return nil, fmt.Errorf("open heap at %s: %w", directory, ErrHeapNeedsRepair)
 	}
 	h := &HeapStore{Directory: directory}
 	return h, h.Open()
+}
+
+// ErrHeapNeedsRepair says the heap's data is there and its index is
+// not: RepairHeapStore rebuilds the index from the data.
+var ErrHeapNeedsRepair = errors.New("heap has data but no index; repair it")
+
+// RepairHeapStore rebuilds the key map by reading the keys from the
+// data: every entry carries its key, its height and a checksum, so a
+// sequential scan recovers the map without any index.  For each key
+// the copy with the highest height wins, and an entry above the
+// committed height -- a block whose sync never finished -- is
+// dropped, as is any torn or damaged slot.  The rebuilt map is
+// snapshotted, so the next open is an ordinary one.
+func RepairHeapStore(directory string, committed uint64) (*HeapStore, error) {
+	os.Remove(filepath.Join(directory, "index.snap"))
+	os.Remove(filepath.Join(directory, "index.log"))
+	h := &HeapStore{Directory: directory}
+	var err error
+	if h.file, err = os.OpenFile(filepath.Join(directory, "heap.dat"), os.O_RDWR, 0o644); err != nil {
+		return nil, err
+	}
+	if h.log, err = os.OpenFile(filepath.Join(directory, "index.log"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644); err != nil {
+		return nil, err
+	}
+	h.index = map[[32]byte]slot{}
+	h.touched = map[[32]byte]struct{}{}
+	data, err := readFrom(h.file, 0)
+	if err != nil {
+		return nil, err
+	}
+	heights := map[[32]byte]uint64{}
+	var off int64
+	for off < int64(len(data)) {
+		capacity, height, key, value, ok := decodeEntry(data[off:])
+		if !ok {
+			// A released region reads as zeros; skip to the next region
+			// boundary.  Anything else torn ends the scan: nothing past
+			// a torn slot was named before it.
+			if binary.LittleEndian.Uint32(data[off:]) == 0 {
+				off = (off/HeapRegionBytes + 1) * HeapRegionBytes
+				continue
+			}
+			break
+		}
+		if height <= committed {
+			if prev, seen := heights[key]; !seen || height >= prev {
+				heights[key] = height
+				h.index[key] = slot{off: off, cap: capacity, n: uint32(len(value))}
+			}
+		}
+		off += int64(capacity)
+	}
+	h.height = committed
+	if err = h.deriveExtent(); err != nil {
+		return nil, err
+	}
+	if err = h.Snapshot(); err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 // Open loads the key map from the snapshot and the log and derives
@@ -208,15 +287,38 @@ func (h *HeapStore) Close() error {
 	return err
 }
 
-// encodeEntry lays out one entry for its slot.
-func encodeEntry(capacity uint32, key [32]byte, value []byte) []byte {
+// encodeEntry lays out one entry for its slot: the block that wrote
+// it is in the header so that, with the index gone, a scan can tell
+// the current copy of a key (the highest height) from stale ones and
+// a committed entry from one whose block never synced.
+func encodeEntry(capacity uint32, height uint64, key [32]byte, value []byte) []byte {
 	buf := make([]byte, heapHeader+len(value)+heapTrailer)
 	binary.LittleEndian.PutUint32(buf, capacity)
 	binary.LittleEndian.PutUint32(buf[4:], uint32(len(value)))
-	copy(buf[8:], key[:])
+	binary.LittleEndian.PutUint64(buf[8:], height)
+	copy(buf[16:], key[:])
 	copy(buf[heapHeader:], value)
 	binary.LittleEndian.PutUint32(buf[heapHeader+len(value):], crc32.ChecksumIEEE(buf[8:heapHeader+len(value)]))
 	return buf
+}
+
+// decodeEntry checks the entry at the start of buf and returns its
+// fields; ok is false for an unwritten, torn or damaged slot.
+func decodeEntry(buf []byte) (capacity uint32, height uint64, key [32]byte, value []byte, ok bool) {
+	if len(buf) < heapHeader {
+		return
+	}
+	capacity = binary.LittleEndian.Uint32(buf)
+	n := int(binary.LittleEndian.Uint32(buf[4:]))
+	if capacity == 0 || heapHeader+n+heapTrailer > int(capacity) || int(capacity) > len(buf) {
+		return
+	}
+	if crc32.ChecksumIEEE(buf[8:heapHeader+n]) != binary.LittleEndian.Uint32(buf[heapHeader+n:]) {
+		return
+	}
+	height = binary.LittleEndian.Uint64(buf[8:])
+	copy(key[:], buf[16:])
+	return capacity, height, key, buf[heapHeader : heapHeader+n], true
 }
 
 // Put writes value under key: in place if the key took its slot this
@@ -245,7 +347,7 @@ func (h *HeapStore) Put(key [32]byte, value []byte) error {
 		}
 		h.putAppend.Add(1)
 	}
-	if _, err := h.file.WriteAt(encodeEntry(s.cap, key, value), s.off); err != nil {
+	if _, err := h.file.WriteAt(encodeEntry(s.cap, h.height, key, value), s.off); err != nil {
 		return err
 	}
 	h.index[key] = s
@@ -302,7 +404,7 @@ func (h *HeapStore) Get(key [32]byte) ([]byte, error) {
 // value.
 func heapEntryValue(buf []byte, key [32]byte) ([]byte, error) {
 	n := int(binary.LittleEndian.Uint32(buf[4:]))
-	if len(buf) != heapHeader+n+heapTrailer || [32]byte(buf[8:heapHeader]) != key {
+	if len(buf) != heapHeader+n+heapTrailer || [32]byte(buf[16:heapHeader]) != key {
 		return nil, fmt.Errorf("heap: slot does not hold the key it is named for")
 	}
 	if crc32.ChecksumIEEE(buf[8:heapHeader+n]) != binary.LittleEndian.Uint32(buf[heapHeader+n:]) {
@@ -442,22 +544,50 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	if len(h.release) > 0 {
 		return false, nil // The last pass's release is still waiting on a sync
 	}
-	// The region the block in progress is appending to is never taken:
-	// a slot taken this block may still be rewritten in place, and
-	// moving it would race that
+	var moved int64
+	taken := 0
+	for taken < HeapCleanRegions && moved < budget {
+		pick := h.pickRegion()
+		if pick < 0 {
+			break
+		}
+		m, err := h.cleanRegion(pick, budget-moved)
+		if err != nil {
+			return taken > 0, err
+		}
+		moved += m
+		taken++
+	}
+	for i := range h.regions {
+		h.regions[i].cleaning = false
+	}
+	return taken > 0, nil
+}
+
+// pickRegion is the region with the most dead bytes, once at least
+// HeapCleanRatio of it is dead; -1 when none qualifies.  The region
+// the block in progress is appending to is never taken: a slot taken
+// this block may still be rewritten in place, and moving it would
+// race that.  A region a pass has already partly cleaned keeps its
+// dead bytes and is picked again.  The caller holds the lock.
+func (h *HeapStore) pickRegion() int {
 	current := int(h.size / HeapRegionBytes)
 	pick, best := -1, 0.0
 	for i, r := range h.regions {
-		if i >= current || r.released || r.dead == 0 {
+		if i >= current || r.released || r.dead == 0 || r.cleaning {
 			continue
 		}
 		if f := float64(r.dead) / float64(r.dead+r.live); f >= HeapCleanRatio && f > best {
 			pick, best = i, f
 		}
 	}
-	if pick < 0 {
-		return false, nil
-	}
+	return pick
+}
+
+// cleanRegion re-appends the live entries of one region, at most
+// budget bytes of them, and marks the region for release when none
+// are left.  Returns the bytes copied.  The caller holds the lock.
+func (h *HeapStore) cleanRegion(pick int, budget int64) (int64, error) {
 	from := int64(pick) * HeapRegionBytes
 	to := from + HeapRegionBytes
 	if to > h.size {
@@ -465,8 +595,9 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	}
 	buf := make([]byte, to-from)
 	if _, err := h.file.ReadAt(buf, from); err != nil && !errors.Is(err, io.EOF) {
-		return false, err
+		return 0, err
 	}
+	h.regions[pick].cleaning = true // Not picked again this pass
 	var moved, at int64
 	for at+heapHeader <= int64(len(buf)) {
 		capacity := binary.LittleEndian.Uint32(buf[at:])
@@ -474,18 +605,20 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 			break // Unwritten, or a slot that straddles the region
 		}
 		var key [32]byte
-		copy(key[:], buf[at+8:])
+		copy(key[:], buf[at+16:])
 		if s, live := h.index[key]; live && s.off == from+at {
 			if moved >= budget {
 				h.cleanedBytes.Add(uint64(at))
 				h.movedBytes.Add(uint64(moved))
-				return true, nil // The rest next pass
+				return moved, nil // The rest next pass
 			}
 			n := binary.LittleEndian.Uint32(buf[at+4:])
-			entry := buf[at : at+int64(heapHeader)+int64(n)+heapTrailer]
+			// The copy is this block's write of the key: it carries
+			// this height, so a repair scan prefers it to the original
+			value := buf[at+int64(heapHeader) : at+int64(heapHeader)+int64(n)]
 			ns := slot{off: h.size, cap: capacity, n: n, block: h.height}
-			if _, err := h.file.WriteAt(entry, ns.off); err != nil {
-				return false, err
+			if _, err := h.file.WriteAt(encodeEntry(capacity, h.height, key, value), ns.off); err != nil {
+				return moved, err
 			}
 			h.append(ns)
 			h.kill(s)
@@ -500,7 +633,7 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	if h.regions[pick].live == 0 {
 		h.release = append(h.release, pick)
 	}
-	return true, nil
+	return moved, nil
 }
 
 // Snapshot writes the whole key map and drops the deltas it covers

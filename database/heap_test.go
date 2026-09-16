@@ -249,3 +249,50 @@ func TestHeapShardRoundTrip(t *testing.T) {
 		require.Equal(t, byte(45), v[0])
 	}
 }
+
+// With the index files gone, the map is rebuilt from the data: the
+// highest committed copy of each key wins, an entry from the block
+// that never synced is dropped, and a damaged slot is skipped.
+func TestHeapRepairReadsTheKeysFromTheData(t *testing.T) {
+	dir := heapDir(t)
+	h, err := NewHeapStore(dir)
+	require.NoError(t, err)
+	sync := func() {
+		p, err := h.beginBlockSync()
+		require.NoError(t, err)
+		require.NoError(t, p.finish())
+	}
+	h.AdvanceBlock(1)
+	for i := byte(1); i <= 10; i++ {
+		require.NoError(t, h.Put(key(i), []byte{1, i}))
+	}
+	sync()
+	h.AdvanceBlock(2)
+	require.NoError(t, h.Put(key(1), []byte{2, 1})) // Newer copy, higher offset
+	sync()
+	h.AdvanceBlock(3)
+	require.NoError(t, h.Put(key(2), []byte{3, 2})) // Never synced: not committed
+	h.file.Close()
+	h.log.Close()
+	require.NoError(t, os.Remove(filepath.Join(dir, "index.log")))
+
+	_, err = OpenHeapStore(dir)
+	require.ErrorIs(t, err, ErrHeapNeedsRepair)
+	r, err := RepairHeapStore(dir, 2)
+	require.NoError(t, err)
+	defer r.Close()
+	v, err := r.Get(key(1))
+	require.NoError(t, err)
+	require.Equal(t, []byte{2, 1}, v, "the block-2 copy wins")
+	v, err = r.Get(key(2))
+	require.NoError(t, err)
+	require.Equal(t, []byte{1, 2}, v, "block 3 never committed: its copy is dropped")
+	require.EqualValues(t, 10, r.LiveRecords())
+	require.NoError(t, r.Close())
+	re, err := OpenHeapStore(dir)
+	require.NoError(t, err, "the repair left a snapshot: an ordinary open")
+	defer re.Close()
+	v, err = re.Get(key(1))
+	require.NoError(t, err)
+	require.Equal(t, []byte{2, 1}, v)
+}
