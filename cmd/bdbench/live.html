@@ -1,0 +1,43 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><title>bdbench</title>
+<style>
+body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+.wrap{max-width:1300px;margin:0 auto;padding:16px}h1{font-size:18px;margin:0 0 4px}.sub{color:#8b949e;font-size:12px;margin-bottom:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
+.card{background:#161b22;border:1px solid #2a3240;border-radius:8px;padding:8px 10px}.card .k{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:20px;font-weight:650;margin-top:2px}.card .d{color:#8b949e;font-size:11px}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:10px;margin-bottom:14px}
+.chart{background:#161b22;border:1px solid #2a3240;border-radius:8px;padding:8px}.chart h3{margin:0 0 4px;font-size:12px;color:#8b949e;font-weight:600}
+canvas{width:100%;height:140px;display:block}
+table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}th,td{padding:4px 6px;border-bottom:1px solid #2a3240;text-align:right;white-space:nowrap}th{color:#8b949e;font-weight:600;position:sticky;top:0;background:#0d1117}
+td:first-child,th:first-child{text-align:left}.warn{color:#d29922}.bad{color:#f85149}.ok{color:#3fb950}
+</style></head><body><div class=wrap>
+<h1>bdbench <span id=state class=ok>live</span></h1>
+<div class=sub id=sub>refreshes every 5 s from bdbench.csv</div>
+<div class=cards id=cards></div>
+<div class=charts>
+ <div class=chart><h3>seal p50 / p90 / max (ms) — must stay flat with age</h3><canvas id=c_seal></canvas></div>
+ <div class=chart><h3>block p50 / p90 / max (ms) — interval is 1000</h3><canvas id=c_block></canvas></div>
+ <div class=chart><h3>maintenance seconds per minute: compress / merge / pack</h3><canvas id=c_maint></canvas></div>
+ <div class=chart><h3>process disk write MB/s and store size GB</h3><canvas id=c_disk></canvas></div>
+</div>
+<div style="overflow-x:auto"><table id=t></table></div>
+</div>
+<script>
+const cols=["minute","blocks","over_budget","block_p50_ms","block_p90_ms","block_max_ms","seal_p50_ms","seal_p90_ms","seal_max_ms","dyna_put_p99_us","perm_put_p99_us","read_p99_us","compress_passes","compress_s","merge_passes","merge_s","pack_passes","pack_s","skipped","read_MBps","write_MBps","store_MB","files","perm_history","dyna_history","bloom_MB","mismatches"];
+function parse(t){const L=t.trim().split("\n");const h=L[0].split(",");return L.slice(1).map(l=>{const o={};l.split(",").forEach((v,i)=>o[h[i]]=+v);return o})}
+function line(id,rows,keys,colors,ymax){const c=document.getElementById(id);const W=c.width=c.clientWidth*2,H=c.height=c.clientHeight*2;const x=c.getContext("2d");x.clearRect(0,0,W,H);if(!rows.length)return;
+ let m=ymax||Math.max(1,...keys.flatMap(k=>rows.map(r=>r[k]||0)))*1.1;x.strokeStyle="#2a3240";x.lineWidth=1;for(let g=0;g<=4;g++){const y=H-6-(H-12)*g/4;x.beginPath();x.moveTo(40,y);x.lineTo(W,y);x.stroke();x.fillStyle="#8b949e";x.font="18px sans-serif";x.fillText((m*g/4).toFixed(0),0,y+6)}
+ keys.forEach((k,i)=>{x.strokeStyle=colors[i];x.lineWidth=3;x.beginPath();rows.forEach((r,j)=>{const px=40+(W-44)*j/Math.max(1,rows.length-1),py=H-6-(H-12)*Math.min(1,(r[k]||0)/m);j?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()})}
+async function tick(){let t;try{t=await (await fetch("bdbench.csv?"+Date.now())).text()}catch(e){document.getElementById("state").textContent="unreachable";return}
+ const rows=parse(t),last=rows[rows.length-1]||{};const st=document.getElementById("state");
+ st.textContent=rows.length?("minute "+last.minute):"waiting for the first minute";
+ const cards=[["seal p90",last.seal_p90_ms+" ms","budget 100"],["block p90",last.block_p90_ms+" ms","interval 1000"],["blocks over interval",last.over_budget,"this minute"],["read p99",last.read_p99_us+" µs",""],["put p99 dyna/perm",last.dyna_put_p99_us+"/"+last.perm_put_p99_us+" µs",""],["maintenance",(+last.compress_s+ +last.merge_s+ +last.pack_s).toFixed(1)+" s/min",last.compress_passes+" passes, "+last.skipped+" skipped"],["disk write",last.write_MBps+" MB/s","read "+last.read_MBps],["store",(last.store_MB/1000).toFixed(2)+" GB",last.files+" files"],["history segments","perm "+last.perm_history+" dyna "+last.dyna_history,"bloom "+last.bloom_MB+" MB"],["wrong answers",last.mismatches,""]];
+ document.getElementById("cards").innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v ${c[0]=="wrong answers"&&last.mismatches>0?'class=bad':''}>${c[1]}</div><div class=d>${c[2]}</div></div>`).join("");
+ line("c_seal",rows,["seal_p50_ms","seal_p90_ms","seal_max_ms"],["#3fb950","#d29922","#f85149"]);
+ line("c_block",rows,["block_p50_ms","block_p90_ms","block_max_ms"],["#3fb950","#d29922","#f85149"],1000);
+ line("c_maint",rows,["compress_s","merge_s","pack_s"],["#58a6ff","#bc8cff","#39c5cf"]);
+ line("c_disk",rows.map(r=>({w:r.write_MBps,g:r.store_MB/1000*10})),["w","g"],["#d29922","#58a6ff"]);
+ const T=document.getElementById("t");T.innerHTML="<tr>"+cols.map(c=>"<th>"+c.replace(/_/g," ")+"</th>").join("")+"</tr>"+rows.slice().reverse().map(r=>"<tr>"+cols.map(c=>{let cls="";if(c=="seal_p90_ms"&&r[c]>100)cls="warn";if(c=="over_budget"&&r[c]>0)cls="bad";if(c=="mismatches"&&r[c]>0)cls="bad";return `<td class="${cls}">${r[c]}</td>`}).join("")+"</tr>").join("")}
+fetch("run.json").then(r=>r.json()).then(c=>{document.getElementById("sub").textContent=`${c.stores} store(s) × ${c.shards} shards, seal limit ${c.sealLimit}, window ${c.window}, maintenance every ${c.compressEvery} blocks, pack every ${c.packEvery} · per ${c.interval} block: ${c.dynaPuts} dyna puts, ${c.permPuts} perm puts, ${c.reads} reads over ${c.hotKeys} hot keys, values ${c.valueMin}-${c.valueMax} B · ${c.dir} · started ${c.started} for ${c.duration} · refreshes every 5 s from bdbench.csv`}).catch(()=>{});
+tick();setInterval(tick,5000);
+</script></body></html>

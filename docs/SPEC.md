@@ -495,13 +495,44 @@ commit for the post-mortem the failure itself cannot give (#61).
 
 ### 2.9 The Accumulate adapter
 
-`accumulate/pkg/database/keyvalue/bcdb`: currently opens a **single
-KV2** — SealLimit 100k, `CompressEvery` 128 commits, watermark
-`MergeLag` 64 blocks — with maintenance async off the committing
-goroutine (one run at a time, skipped not queued).  **DEVIATION #62**:
-the adapter should open the sharded store; unsharded, it has no pack
-tier and leans on `MergeBelow` alone (compounding #63), and perm
-ingest serializes through one store.
+`accumulate/pkg/database/keyvalue/bcdb` opens the **sharded store**
+(`NewKVShard`, 8 shards, `SealLimit` 12,500 records per shard layer)
+with the window `MergeLag` 20 blocks (`SetFilterBlocks`).  Every block
+commit is one `SealBlock`.  Maintenance runs on the adapter's cadence,
+off the committing goroutine, one pass in flight and a pass that lands
+while another runs skipped, not queued: every `CompressEvery` = 20
+commits, `Compress` (2.7 dyna compaction on every shard), then
+`MergeFinalized(height - MergeLag)`, and on a `PackEvery` = 1000 period
+`PackFinalized` at the same watermark.  Nothing else in the adapter
+starts maintenance, and since #92 nothing in the store does either.
+
+### 2.11 The load platform (1.2)
+
+`cmd/bdbench` drives the store the way the adapter does, without
+Accumulate: one block per interval, each block a fixed volume of
+dynamic rewrites over a hot key set, permanent appends of new keys and
+lookups across all ages (half hot dynamic, a third permanent, the
+rest absent), then a seal; maintenance on the adapter's cadence, in
+its own goroutine.  Its defaults are a soak's BVN store at 500 tps
+(~11k dynamic puts, ~8k permanent puts, ~40k lookups per 1 s block,
+run 20260916T185711Z).  Configuration is flags only (1.10); a run is a
+fresh, empty directory.
+
+Once a minute it reports what 1.2 governs, so that a cost growing with
+the age of the store is a column that climbs: blocks over the
+interval; block and seal p50/p90/max; put and read p99; each
+maintenance kind's passes and time; the process's own disk read and
+write rate; store size and file count; history segments per layer;
+resident filter memory; and the count of reads that returned a value
+other than the last written, which fails the run.  A minute whose seal
+p90 exceeds `-seal-budget` (100 ms) is flagged.
+
+What a healthy store must show on it: block time under the interval,
+the seal bounded and flat with age, put and read p99 flat with age,
+and maintenance passes bounded per pass (1.2).  A change to the
+protocol path or to maintenance is measured here before it is measured
+under Accumulate, because here the seal's wait is the store's own and
+not the executor's.
 
 ### 2.10 Deviation register
 
@@ -509,9 +540,8 @@ The current gaps between Section 1 and the code, in one place:
 
 | Issue | Invariant | Gap |
 |---|---|---|
-| #62 | 1.9 sharding | Adapter opens one unsharded KV2 |
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
-| #47 | 1.4 pack cadence | Pack cadence not scheduled in the adapter (group filters and pin-not-lock done) |
+| #94 | 1.2, 1.6 bounded maintenance | Compaction passes are bounded by records, not bytes or rate; the seal's barriers wait behind their I/O |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.
