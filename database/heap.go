@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -250,7 +251,12 @@ func (h *HeapStore) Open() (err error) {
 		}
 	} else {
 		h.gen = 1
-		if err = h.startGeneration(); err != nil {
+		// A fresh store: the first generation, written with the locks
+		// released since startGeneration takes them itself
+		h.mu.Unlock()
+		err = h.startGeneration()
+		h.mu.Lock()
+		if err != nil {
 			return err
 		}
 	}
@@ -288,30 +294,71 @@ func (h *HeapStore) replayGeneration() (err error) {
 	return nil
 }
 
-// startGeneration begins an index generation with a snapshot of the
-// map, written aside and renamed into place, then fsynced; the
-// previous generation's file is removed once the new one is durable.
-// The caller holds syncMu and the lock (Open holds the lock alone,
-// with nothing else running).
+// startGeneration begins an index generation: a snapshot of the map,
+// written aside and fsynced, then the deltas appended to the old
+// generation meanwhile copied after it, renamed into place, the
+// directory fsynced, and the previous generation's file removed once
+// the new one is durable.  The snapshot itself is written with no
+// lock held but the map's read lock; only the tail copy and the
+// switch hold syncMu, so a block's sync waits milliseconds for a
+// snapshot, not for 3 MB of map (measured: seal p90 276 ms at every
+// hundredth block with the whole write under syncMu).  Open calls it
+// with nothing else running.
 func (h *HeapStore) startGeneration() error {
-	path := filepath.Join(h.Directory, indexName(h.gen))
-	tmp := path + segTmpSuffix
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
+	next := h.gen
+	if h.log != nil {
+		next = h.gen + 1 // A snapshot starts the generation after the current one
 	}
+	path := filepath.Join(h.Directory, indexName(next))
+	tmp := path + segTmpSuffix
+	// 1. The map as of now, and where the old generation's log ends:
+	// deltas after that point are copied over below
+	h.mu.RLock()
 	all := func(emit func(key [32]byte)) {
 		for key := range h.index {
 			emit(key)
 		}
 	}
-	if _, err = f.Write(h.encodeIndexOf(heapSnapshot, all, len(h.index))); err != nil {
+	snap := h.encodeIndexOf(heapSnapshot, all, len(h.index))
+	var copiedTo int64
+	if h.log != nil {
+		copiedTo, _ = h.log.Seek(0, io.SeekEnd)
+	}
+	h.mu.RUnlock()
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(snap); err != nil {
 		f.Close()
 		return err
 	}
 	if err = fsync(f); err != nil {
 		f.Close()
 		return err
+	}
+	// 2. Under syncMu: no delta is in flight, so the old log's tail
+	// past copiedTo is exactly the deltas since the snapshot
+	h.syncMu.Lock()
+	defer h.syncMu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.log != nil {
+		rest, err := readFrom(h.log, copiedTo)
+		if err != nil {
+			f.Close()
+			return err
+		}
+		if len(rest) > 0 {
+			if _, err = f.Write(rest); err != nil {
+				f.Close()
+				return err
+			}
+			if err = fsync(f); err != nil {
+				f.Close()
+				return err
+			}
+		}
 	}
 	if err = f.Close(); err != nil {
 		return err
@@ -328,9 +375,24 @@ func (h *HeapStore) startGeneration() error {
 	}
 	if old != nil {
 		old.Close()
-		os.Remove(filepath.Join(h.Directory, indexName(h.gen-1)))
+		os.Remove(filepath.Join(h.Directory, indexName(h.gen)))
 	}
+	h.gen = next
 	return nil
+}
+
+// readFrom reads a file from off to its end.
+func readFrom(f *os.File, off int64) ([]byte, error) {
+	end, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	if end <= off {
+		return nil, nil
+	}
+	buf := make([]byte, end-off)
+	_, err = f.ReadAt(buf, off)
+	return buf, err
 }
 
 // fsyncDir makes a directory's entries durable: a rename or an unlink
@@ -756,14 +818,12 @@ func (h *HeapStore) compact() (bool, error) {
 // the state of the last finished delta and no delta lands in the
 // generation being retired.  Off the protocol path.
 func (h *HeapStore) Snapshot() error {
-	h.syncMu.Lock()
-	defer h.syncMu.Unlock()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.closed {
+	h.mu.RLock()
+	closed := h.closed
+	h.mu.RUnlock()
+	if closed {
 		return errStoreClosed
 	}
-	h.gen++
 	return h.startGeneration()
 }
 
