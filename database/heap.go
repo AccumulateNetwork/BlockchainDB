@@ -128,13 +128,16 @@ const (
 // HeapFileBytes is the size a data file is rolled at.
 var HeapFileBytes int64 = 16 << 20
 
-// HeapCleanBytes bounds one mover pass by the bytes it copies; the
-// pass syncs its own copies, so the bound is about the pass's length,
-// not a block's barrier.
-var HeapCleanBytes int64 = 16 << 20
+// HeapCleanBytes bounds one mover pass by the bytes it copies.  The
+// pass syncs its own copies, so the bound is not about a block's
+// barrier but about the device queue the barrier shares: 16 MB
+// passes put the seal's p90 at 150-250 ms in the minutes they ran
+// (run 7), 4 MB releases more than the soak appends per shard per
+// cadence (~4 MB, of which a quarter to a third is live).
+var HeapCleanBytes int64 = 4 << 20
 
 // HeapCleanFiles bounds a pass by files taken as well.
-var HeapCleanFiles = 8
+var HeapCleanFiles = 4
 
 // HeapCleanRatio is the dead fraction a file must reach before the
 // mover takes it -- unless dead bytes exceed live bytes overall, when
