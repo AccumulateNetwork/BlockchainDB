@@ -15,66 +15,89 @@ func heapDir(t *testing.T) string {
 
 func key(b byte) (k [32]byte) { k[0] = b; return }
 
+func syncHeap(t *testing.T, h *HeapStore) {
+	t.Helper()
+	p, err := h.beginBlockSync()
+	require.NoError(t, err)
+	require.NoError(t, p.finish())
+}
+
+// Small files, so that rolling and deletion happen within a test.
+func smallFiles(t *testing.T) {
+	t.Helper()
+	was := HeapFileBytes
+	HeapFileBytes = 1024
+	t.Cleanup(func() { HeapFileBytes = was })
+}
+
 // A key rewritten within the block reuses its slot; rewritten in a
-// later block it is appended, the old slot dead where it lies until a
-// clean pass moves the live entries past it and the next sync
-// releases the region.
-func TestHeapRewriteReusesWithinTheBlockAndCleansOneSyncLate(t *testing.T) {
+// later block it is appended, the old slot dead where it lies until
+// the mover copies the file's live entries out and the next sync
+// deletes the file.
+func TestHeapRewriteReusesWithinTheBlockAndMovesOneSyncLate(t *testing.T) {
+	smallFiles(t)
 	h, err := NewHeapStore(heapDir(t))
 	require.NoError(t, err)
 	defer h.Close()
 	h.AdvanceBlock(1)
 	require.NoError(t, h.Put(key(1), []byte("one")))
-	off := h.index[key(1)].off
+	first := h.index[key(1)]
 	require.NoError(t, h.Put(key(1), []byte("uno")))
-	require.Equal(t, off, h.index[key(1)].off, "same block, fits: in place")
+	require.Equal(t, first, h.index[key(1)], "same block, fits: in place")
 	require.EqualValues(t, 1, h.putInPlace.Load())
 	v, err := h.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, "uno", string(v))
 
-	// Block 1 durable; block 2 rewrites the key
-	sync := func() {
-		p, err := h.beginBlockSync()
-		require.NoError(t, err)
-		require.NoError(t, p.finish())
-	}
-	sync()
+	syncHeap(t, h)
 	h.AdvanceBlock(2)
 	require.NoError(t, h.Put(key(1), []byte("two")))
-	require.NotEqual(t, off, h.index[key(1)].off, "a durable slot is never rewritten")
+	require.NotEqual(t, first, h.index[key(1)], "a durable slot is never rewritten")
 	dead, live := h.HoleRatio()
-	require.EqualValues(t, heapMinCap, dead, "the old slot is dead where it lies")
-	require.EqualValues(t, heapMinCap, live)
-	sync()
-
-	// A clean pass in block 3 takes the region (half dead) and moves
-	// the live entry out of it; the region is released only by the
-	// sync after it.  The region must not be the one block 3 appends
-	// to, so the file is pushed into a second region first.
+	require.EqualValues(t, entrySize(3), dead, "the old slot is dead where it lies")
+	require.EqualValues(t, entrySize(3), live)
+	// Fill the block's file past its size so it rolls, then kill most
+	// of what the first file holds
+	for i := byte(10); i < 40; i++ {
+		require.NoError(t, h.Put(key(i), make([]byte, 64)))
+	}
+	syncHeap(t, h)
+	require.Greater(t, len(h.files), 1, "the block's file rolled")
 	h.AdvanceBlock(3)
-	h.size = HeapRegionBytes // Block 3 appends into region 1
-	cleaned, err := h.clean(1 << 20)
+	for i := byte(10); i < 39; i++ {
+		require.NoError(t, h.Put(key(i), make([]byte, 64)))
+	}
+	syncHeap(t, h)
+
+	h.AdvanceBlock(4)
+	moved, err := h.clean(1 << 20)
 	require.NoError(t, err)
-	require.True(t, cleaned)
-	require.Equal(t, []int{0}, h.release, "not released yet: the copies are not durable")
-	require.False(t, h.regions[0].released)
-	scanned, moved := h.Cleaned()
-	require.EqualValues(t, 2*heapMinCap, scanned)
-	require.EqualValues(t, heapMinCap, moved, "one live entry copied, one dead skipped")
-	sync()
-	require.True(t, h.regions[0].released, "released after the sync")
-	dead, live = h.HoleRatio()
-	require.Zero(t, dead)
-	require.EqualValues(t, heapMinCap, live)
+	require.True(t, moved, "a mostly dead file is taken")
+	require.NotEmpty(t, h.release, "a file emptied by the pass waits for the sync")
+	for _, id := range h.release {
+		_, err := os.Stat(filepath.Join(h.Directory, dataName(id)))
+		require.NoError(t, err, "not deleted yet: the copies are not durable")
+	}
+	released := append([]uint32(nil), h.release...)
+	syncHeap(t, h)
+	for _, id := range released {
+		_, err := os.Stat(filepath.Join(h.Directory, dataName(id)))
+		require.ErrorIs(t, err, os.ErrNotExist, "deleted after the sync")
+	}
+	_, copied := h.Cleaned()
+	require.Greater(t, copied, uint64(0), "the live entries left in it were copied out")
 	v, err = h.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, "two", string(v))
+	for i := byte(10); i < 40; i++ {
+		_, err := h.Get(key(i))
+		require.NoError(t, err)
+	}
 }
 
-// Reopening replays the log: every synced value is back, the holes
-// are derived, and a block that was never synced is gone -- its
-// slots unnamed and its bytes cut from the file.
+// Reopening replays the generation: every synced value is back, the
+// files' accounting is derived, and a block that was never synced is
+// gone -- its slots unnamed and its bytes cut from the file.
 func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
@@ -83,21 +106,18 @@ func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	for i := byte(1); i <= 50; i++ {
 		require.NoError(t, h.Put(key(i), []byte{i}))
 	}
-	p, err := h.beginBlockSync()
-	require.NoError(t, err)
-	require.NoError(t, p.finish())
+	syncHeap(t, h)
 	h.AdvanceBlock(2)
-	require.NoError(t, h.Put(key(1), []byte("rewritten in block 2"))) // New slot, old pending
-	p, err = h.beginBlockSync()
-	require.NoError(t, err)
-	require.NoError(t, p.finish())
-	size := h.size
+	require.NoError(t, h.Put(key(1), []byte("rewritten in block 2")))
+	syncHeap(t, h)
+	size := h.cur.size
 	// Block 3: written, never synced -- the crash
 	h.AdvanceBlock(3)
 	require.NoError(t, h.Put(key(2), []byte("lost")))
 	require.NoError(t, h.Put(key(99), []byte("lost too")))
-	// Drop the store without Close: the OS has the bytes, the log has no delta
-	h.file.Close()
+	for _, hf := range h.files {
+		hf.f.Close()
+	}
 	h.log.Close()
 
 	r, err := OpenHeapStore(dir)
@@ -111,13 +131,16 @@ func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	require.Equal(t, []byte{2}, v, "block 3's rewrite was never durable")
 	_, err = r.Get(key(99))
 	require.ErrorIs(t, err, errNotFound)
-	require.Equal(t, size, r.size, "the file is cut back to the durable append point")
+	require.Len(t, r.files, 1)
+	for _, hf := range r.files {
+		require.Equal(t, size, hf.size, "the file is cut back to the durable append point")
+	}
 	dead, _ := r.HoleRatio()
-	require.EqualValues(t, heapMinCap, dead, "key 1's block-1 slot is dead where it lies")
+	require.EqualValues(t, entrySize(1), dead, "key 1's block-1 slot is dead where it lies")
 	require.EqualValues(t, 2, r.height, "the durable height: block 3 never synced")
 }
 
-// A torn delta at the end of the log is dropped whole.
+// A torn delta at the end of the generation is dropped whole.
 func TestHeapTornLogTailIsDropped(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
@@ -125,7 +148,7 @@ func TestHeapTornLogTailIsDropped(t *testing.T) {
 	h.AdvanceBlock(1)
 	require.NoError(t, h.Put(key(1), []byte("one")))
 	require.NoError(t, h.Close())
-	f, err := os.OpenFile(filepath.Join(dir, "index.log"), os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, indexName(1)), os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
 	_, err = f.Write([]byte{0x50, 0x41, 0x45, 0x48, 9, 9}) // A marker and six bytes of nothing
 	require.NoError(t, err)
@@ -137,14 +160,15 @@ func TestHeapTornLogTailIsDropped(t *testing.T) {
 	v, err := r.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, "one", string(v))
-	st, err := os.Stat(filepath.Join(dir, "index.log"))
+	st, err := os.Stat(filepath.Join(dir, indexName(1)))
 	require.NoError(t, err)
-	require.EqualValues(t, heapDeltaHdr+heapDeltaRec+4, st.Size(), "one whole delta of one key remains")
+	require.EqualValues(t, 2*(heapIndexHdr+4)+heapIndexRec, st.Size(), "the empty snapshot and one whole delta of one key remain")
 }
 
-// A snapshot carries the map and empties the log; what comes after is
-// replayed on top of it.
-func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
+// A snapshot starts a new generation in its own file and retires the
+// old one; the replay lands on the new one; and a generation whose
+// write was interrupted is ignored.
+func TestHeapSnapshotStartsAGenerationSafely(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
 	require.NoError(t, err)
@@ -156,32 +180,30 @@ func TestHeapSnapshotBoundsTheReplay(t *testing.T) {
 		for i := byte(1); i <= 20; i++ {
 			require.NoError(t, h.Put(key(i), []byte{byte(b), i}))
 		}
-		p, err := h.beginBlockSync()
-		require.NoError(t, err)
-		require.NoError(t, p.finish())
+		syncHeap(t, h)
 		if b == 20 {
-			_, err := h.compact() // Nothing to clean: one region, still being appended to
+			_, err := h.compact()
 			require.NoError(t, err)
-			st, err := os.Stat(filepath.Join(dir, "index.log"))
+			_, err = os.Stat(filepath.Join(dir, indexName(1)))
+			require.ErrorIs(t, err, os.ErrNotExist, "generation 1 retired")
+			_, err = os.Stat(filepath.Join(dir, indexName(2)))
 			require.NoError(t, err)
-			require.Zero(t, st.Size(), "the log is empty after the snapshot")
 		}
 	}
 	require.NoError(t, h.Close())
+	// A crash mid-snapshot leaves a .tmp; it is not a generation
+	require.NoError(t, os.WriteFile(filepath.Join(dir, indexName(3)+".tmp"), []byte("half"), 0o644))
 	r, err := OpenHeapStore(dir)
 	require.NoError(t, err)
 	defer r.Close()
+	require.EqualValues(t, 2, r.gen)
+	_, err = os.Stat(filepath.Join(dir, indexName(3)+".tmp"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 	for i := byte(1); i <= 20; i++ {
 		v, err := r.Get(key(i))
 		require.NoError(t, err)
 		require.Equal(t, []byte{30, i}, v)
 	}
-	// Everything fits in the region the blocks append to, which the
-	// cleaner never takes: blocks 1-29 lie dead behind block 30's live
-	// slots, and the accounting survives the reopen.
-	dead, live := r.HoleRatio()
-	require.EqualValues(t, 20*heapMinCap, live)
-	require.EqualValues(t, 29*20*heapMinCap, dead)
 }
 
 // A slot whose bytes were damaged is an error, never a value.
@@ -191,11 +213,11 @@ func TestHeapChecksumCatchesADamagedSlot(t *testing.T) {
 	require.NoError(t, err)
 	h.AdvanceBlock(1)
 	require.NoError(t, h.Put(key(1), []byte("intact")))
-	off := h.index[key(1)].off
+	s := h.index[key(1)]
 	require.NoError(t, h.Close())
-	f, err := os.OpenFile(filepath.Join(dir, "heap.dat"), os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, dataName(s.file)), os.O_WRONLY, 0o644)
 	require.NoError(t, err)
-	_, err = f.WriteAt([]byte("damaged"), off+heapHeader)
+	_, err = f.WriteAt([]byte("damaged"), int64(s.off)+heapHeader)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 	r, err := OpenHeapStore(dir)
@@ -205,76 +227,29 @@ func TestHeapChecksumCatchesADamagedSlot(t *testing.T) {
 	require.ErrorContains(t, err, "checksum")
 }
 
-// A shard built with the heap seals, compacts, closes and reopens as
-// a heap, through the same KV2 and KVShard surface.
-func TestHeapShardRoundTrip(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "shards")
-	kvs, err := NewKVShardHeapN(dir, 2, 1000)
-	require.NoError(t, err)
-	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
-	fr := NewFastRandom([]byte{7})
-	hot := make([][32]byte, 200)
-	for i := range hot {
-		hot[i] = fr.NextHash()
-	}
-	for b := uint64(1); b <= 45; b++ {
-		for _, k := range hot {
-			require.NoError(t, kvs.PutDyna(k, append([]byte{byte(b)}, k[:8]...)))
-		}
-		require.NoError(t, kvs.PutPerm(fr.NextHash(), []byte("perm")))
-		require.NoError(t, kvs.SealBlock(b))
-		if b%20 == 0 {
-			require.NoError(t, kvs.Compress())
-			_, err := kvs.MergeFinalized(b - MinFilterBlocks)
-			require.NoError(t, err)
-		}
-	}
-	for _, k := range hot {
-		v, err := kvs.GetDyna(k)
-		require.NoError(t, err)
-		require.Equal(t, byte(45), v[0])
-	}
-	_, dyna := kvs.Stats()
-	require.EqualValues(t, 45*200, dyna.PutTotal)
-	require.NoError(t, kvs.Close())
-
-	re, err := OpenKVShard(dir)
-	require.NoError(t, err)
-	defer re.Close()
-	require.NotNil(t, re.Shards[0].Heap, "reopened as a heap")
-	require.Nil(t, re.Shards[0].DynaKV)
-	for _, k := range hot {
-		v, err := re.GetDyna(k)
-		require.NoError(t, err)
-		require.Equal(t, byte(45), v[0])
-	}
-}
-
-// With the index files gone, the map is rebuilt from the data: the
-// highest committed copy of each key wins, an entry from the block
-// that never synced is dropped, and a damaged slot is skipped.
+// With the index gone, the map is rebuilt from the data: the highest
+// committed copy of each key wins, an entry from the block that never
+// synced is dropped.
 func TestHeapRepairReadsTheKeysFromTheData(t *testing.T) {
+	smallFiles(t)
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
 	require.NoError(t, err)
-	sync := func() {
-		p, err := h.beginBlockSync()
-		require.NoError(t, err)
-		require.NoError(t, p.finish())
-	}
 	h.AdvanceBlock(1)
 	for i := byte(1); i <= 10; i++ {
-		require.NoError(t, h.Put(key(i), []byte{1, i}))
+		require.NoError(t, h.Put(key(i), make([]byte, 100)))
 	}
-	sync()
+	syncHeap(t, h)
 	h.AdvanceBlock(2)
-	require.NoError(t, h.Put(key(1), []byte{2, 1})) // Newer copy, higher offset
-	sync()
+	require.NoError(t, h.Put(key(1), []byte{2, 1})) // Newer copy, in a later file
+	syncHeap(t, h)
 	h.AdvanceBlock(3)
 	require.NoError(t, h.Put(key(2), []byte{3, 2})) // Never synced: not committed
-	h.file.Close()
+	for _, hf := range h.files {
+		hf.f.Close()
+	}
 	h.log.Close()
-	require.NoError(t, os.Remove(filepath.Join(dir, "index.log")))
+	require.NoError(t, os.Remove(filepath.Join(dir, indexName(1))))
 
 	_, err = OpenHeapStore(dir)
 	require.ErrorIs(t, err, ErrHeapNeedsRepair)
@@ -286,13 +261,67 @@ func TestHeapRepairReadsTheKeysFromTheData(t *testing.T) {
 	require.Equal(t, []byte{2, 1}, v, "the block-2 copy wins")
 	v, err = r.Get(key(2))
 	require.NoError(t, err)
-	require.Equal(t, []byte{1, 2}, v, "block 3 never committed: its copy is dropped")
+	require.Len(t, v, 100, "block 3 never committed: its copy is dropped")
 	require.EqualValues(t, 10, r.LiveRecords())
 	require.NoError(t, r.Close())
 	re, err := OpenHeapStore(dir)
-	require.NoError(t, err, "the repair left a snapshot: an ordinary open")
+	require.NoError(t, err, "the repair left a generation: an ordinary open")
 	defer re.Close()
 	v, err = re.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, []byte{2, 1}, v)
+}
+
+// A shard built with the heap seals, compacts, closes and reopens as
+// a heap, through the same KV2 and KVShard surface, with files rolled
+// and deleted along the way.
+func TestHeapShardRoundTrip(t *testing.T) {
+	was := HeapFileBytes
+	HeapFileBytes = 256 << 10
+	defer func() { HeapFileBytes = was }()
+	dir := filepath.Join(t.TempDir(), "shards")
+	kvs, err := NewKVShardHeapN(dir, 2, 1000)
+	require.NoError(t, err)
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
+	fr := NewFastRandom([]byte{7})
+	hot := make([][32]byte, 200)
+	for i := range hot {
+		hot[i] = fr.NextHash()
+	}
+	for b := uint64(1); b <= 60; b++ {
+		for _, k := range hot {
+			require.NoError(t, kvs.PutDyna(k, append([]byte{byte(b)}, fr.RandBuff(100, 300)...)))
+		}
+		require.NoError(t, kvs.PutPerm(fr.NextHash(), []byte("perm")))
+		require.NoError(t, kvs.SealBlock(b))
+		if b%10 == 0 {
+			require.NoError(t, kvs.Compress())
+			if b > MinFilterBlocks {
+				_, err := kvs.MergeFinalized(b - MinFilterBlocks)
+				require.NoError(t, err)
+			}
+		}
+	}
+	for _, k := range hot {
+		v, err := kvs.GetDyna(k)
+		require.NoError(t, err)
+		require.Equal(t, byte(60), v[0])
+	}
+	_, dyna := kvs.Stats()
+	require.EqualValues(t, 60*200, dyna.PutTotal)
+	require.NoError(t, kvs.SealBlock(61)) // The sync that deletes what the last pass emptied
+	dead, live := kvs.Shards[0].Heap.HoleRatio()
+	require.Less(t, dead, 2*live, "the mover keeps dead bytes under twice the live set")
+	require.NoError(t, kvs.Close())
+
+	re, err := OpenKVShard(dir)
+	require.NoError(t, err)
+	defer re.Close()
+	require.NotNil(t, re.Shards[0].Heap, "reopened as a heap")
+	require.Nil(t, re.Shards[0].DynaKV)
+	for _, k := range hot {
+		v, err := re.GetDyna(k)
+		require.NoError(t, err)
+		require.Equal(t, byte(60), v[0])
+	}
 }
