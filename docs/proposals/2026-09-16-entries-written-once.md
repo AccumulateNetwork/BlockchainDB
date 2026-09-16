@@ -131,18 +131,27 @@ bodies have to be concatenated to be merged.  Instead:
   records of what the block appended, ~40 bytes a record.  The delta
   is what the window is made of; the live key filters (`keyfilter.go`)
   are built over deltas exactly as they are built over segments now.
-- **Merge and pack fold deltas into one sorted index per level**, on
-  the adapter's cadence, off the protocol path, with one filter over
-  the level: a k-way merge of 44-byte records instead of a copy of
-  ~300-byte bodies.  The walk length and the file count are bounded by
-  the index levels; a lookup resolves a key to `(file, offset,
-  length)` and does one `pread` of the data file.  A set is a merged
-  index over every shard's level, grouped by block range as today,
-  with no bodies in it.
+- **The long search is bucketed, and merged a bucket at a time.**  A
+  shard's index below the window is `PermBuckets` buckets (256 by
+  default; nothing about the number is special, and a modulus serves
+  as well as a mask), each holding a few sorted runs of 44-byte
+  records with a filter per run.  Every block the maintenance step
+  takes the next bucket in rotation, gathers that bucket's records
+  from the deltas sealed since the bucket was last merged, writes them
+  as a new run, and folds the bucket's runs by ratio; a delta older
+  than every bucket's last merge is dropped.  So the work every block
+  is a fixed slice, proportional to what arrived for one bucket, and
+  the big fold is rare and bounded per pass -- never a rewrite of the
+  shard's whole index, which would grow with the chain (1.2).  A
+  merge swaps one bucket's runs under that bucket's lock; the other
+  buckets keep answering.  A pack is the same fold across shards for
+  a block range, with no bodies in it.
 - **Reads keep their protocol-path rule** (1.3): the window is the
   last N blocks' deltas behind the live filters; an immutable key the
-  filters deny is absent; history and sets are reached only by
-  `GetDeep`.
+  filters deny is absent.  Below the window a key's bucket is probed
+  newest run first, one filter and one binary search per run, and
+  that is `GetDeep`'s walk; a lookup resolves a key to `(file,
+  offset, length)` and does one `pread` of the data file.
 
 ## The seal: one commit point per store per block
 
@@ -226,7 +235,8 @@ point" and closes #33.
    (`PermStore`, behind `KV2`'s permanent surface: `PutIfAbsent`,
    windowed `Get`, `GetDeep`, the two-half seal, `MergeBelow`,
    `historyBelow`, `DropBelow`, `attachCold`, the filter knobs), the
-   44-byte index record, and merge and pack over indexes.  Measured
+   44-byte index record, the bucketed long search merged a bucket per
+   block, and packs over indexes.  Measured
    alone first (`-stores 9 -dyna 0`), then with the heap under the
    full load, which is the acceptance run.
 3. The block's deltas in the data files and the store-level commit:
