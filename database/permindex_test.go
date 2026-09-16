@@ -12,7 +12,7 @@ import (
 // checksum verified, looked up resident and cold, merged newest-wins.
 func TestPermRunWriteLookupMerge(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "runs.dat")
+	path := filepath.Join(dir, permRunName(7))
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
 	require.NoError(t, err)
 	defer f.Close()
@@ -34,18 +34,19 @@ func TestPermRunWriteLookupMerge(t *testing.T) {
 	}
 	sortPermRecords(newer)
 
-	r1, err := writePermRun(f, 0, path, older)
+	r1, err := writePermRun(f, 0, 7, older, 1)
 	require.NoError(t, err)
-	r2, err := writePermRun(f, int64(r1.bytes), path, newer)
+	r2, err := writePermRun(f, int64(r1.bytes), 7, newer, 2)
 	require.NoError(t, err)
-	_, err = writePermRun(f, int64(r1.bytes+r2.bytes), path, []permRecord{older[3], older[2]})
+	_, err = writePermRun(f, int64(r1.bytes+r2.bytes), 7, []permRecord{older[3], older[2]}, 3)
 	require.Error(t, err, "unsorted records are refused")
 
 	// Reopen: resident and cold
-	rr, err := openPermRun(f, path, 0, true)
+	rr, err := openPermRun(f, 7, 0, true)
 	require.NoError(t, err)
 	require.EqualValues(t, 5000, rr.count)
-	cold, err := openPermRun(f, path, int64(r1.bytes), false)
+	require.EqualValues(t, 1, rr.height)
+	cold, err := openPermRun(f, 7, int64(r1.bytes), false)
 	require.NoError(t, err)
 	require.Nil(t, cold.bloom)
 	for _, rec := range older[:200] {
@@ -89,6 +90,6 @@ func TestPermRunWriteLookupMerge(t *testing.T) {
 	// A damaged run is refused
 	_, err = f.WriteAt([]byte{0xff, 0xff}, permRunHdr+40)
 	require.NoError(t, err)
-	_, err = openPermRun(f, path, 0, true)
+	_, err = openPermRun(f, 7, 0, true)
 	require.ErrorContains(t, err, "checksum")
 }

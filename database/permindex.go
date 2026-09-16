@@ -21,7 +21,7 @@ import (
 //
 // A run on disk:
 //
-//	header   magic "PRUN"(4) count(4) bloomBytes(4) bloomK(4) crc(4)
+//	header   magic "PRUN"(4) count(4) bloomBytes(4) bloomK(4) crc(4) height(8)
 //	records  count sorted 44-byte records: key(32) file(4) off(4) len(4)
 //	bloom    bloomBytes of filter over the keys
 //
@@ -38,7 +38,7 @@ type permRecord struct {
 
 const (
 	permRecSize   = 32 + 4 + 4 + 4
-	permRunHdr    = 4 + 4 + 4 + 4 + 4
+	permRunHdr    = 4 + 4 + 4 + 4 + 4 + 8
 	permRunMagic  = 0x5052554E // "PRUN"
 	permBloomBits = 12         // Bits per key in a run's filter
 	permBloomK    = 3
@@ -64,9 +64,11 @@ func getPermRecord(buf []byte) (r permRecord) {
 // resident when loaded and probed cold otherwise.
 type permRun struct {
 	path    string
-	off     int64 // Where the run starts in its file
+	file    uint32 // The run file's id
+	off     int64  // Where the run starts in its file
 	count   uint32
-	bloomAt int64 // Where the filter starts
+	height  uint64 // The block a delta is; the watermark a retired run is; 0 for a bucket's run
+	bloomAt int64  // Where the filter starts
 	bloom   *Bloom
 	k       int
 	bytes   uint32
@@ -75,7 +77,7 @@ type permRun struct {
 // writePermRun writes records, which must be sorted by key and free
 // of duplicates, as a run appended to w, and returns it.  The caller
 // fsyncs the file.
-func writePermRun(w io.WriterAt, at int64, path string, recs []permRecord) (*permRun, error) {
+func writePermRun(w io.WriterAt, at int64, file uint32, recs []permRecord, height uint64) (*permRun, error) {
 	if !sort.SliceIsSorted(recs, func(i, j int) bool { return bytes.Compare(recs[i].key[:], recs[j].key[:]) < 0 }) {
 		return nil, errors.New("perm run: records are not sorted")
 	}
@@ -85,6 +87,7 @@ func writePermRun(w io.WriterAt, at int64, path string, recs []permRecord) (*per
 	binary.LittleEndian.PutUint32(buf[4:], uint32(len(recs)))
 	binary.LittleEndian.PutUint32(buf[8:], uint32(bloom.NumBytes))
 	binary.LittleEndian.PutUint32(buf[12:], uint32(bloom.K))
+	binary.LittleEndian.PutUint64(buf[20:], height)
 	p := permRunHdr
 	for i, r := range recs {
 		if i > 0 && recs[i-1].key == r.key {
@@ -99,11 +102,12 @@ func writePermRun(w io.WriterAt, at int64, path string, recs []permRecord) (*per
 	if _, err := w.WriteAt(buf, at); err != nil {
 		return nil, err
 	}
-	return &permRun{path: path, off: at, count: uint32(len(recs)), bloomAt: at + int64(p), bloom: bloom, k: bloom.K, bytes: uint32(len(buf))}, nil
+	return &permRun{path: permRunName(file), file: file, off: at, count: uint32(len(recs)), height: height, bloomAt: at + int64(p), bloom: bloom, k: bloom.K, bytes: uint32(len(buf))}, nil
 }
 
 // openPermRun reads a run's header at off in f and verifies the run.
-func openPermRun(f *os.File, path string, off int64, resident bool) (*permRun, error) {
+func openPermRun(f *os.File, file uint32, off int64, resident bool) (*permRun, error) {
+	path := permRunName(file)
 	hdr := make([]byte, permRunHdr)
 	if _, err := f.ReadAt(hdr, off); err != nil {
 		return nil, err
@@ -111,7 +115,7 @@ func openPermRun(f *os.File, path string, off int64, resident bool) (*permRun, e
 	if binary.LittleEndian.Uint32(hdr) != permRunMagic {
 		return nil, fmt.Errorf("perm run at %s:%d: bad magic", path, off)
 	}
-	r := &permRun{path: path, off: off, count: binary.LittleEndian.Uint32(hdr[4:]), k: int(binary.LittleEndian.Uint32(hdr[12:]))}
+	r := &permRun{path: path, file: file, off: off, count: binary.LittleEndian.Uint32(hdr[4:]), k: int(binary.LittleEndian.Uint32(hdr[12:])), height: binary.LittleEndian.Uint64(hdr[20:])}
 	bloomBytes := binary.LittleEndian.Uint32(hdr[8:])
 	r.bloomAt = off + permRunHdr + int64(r.count)*permRecSize
 	r.bytes = permRunHdr + r.count*permRecSize + bloomBytes
