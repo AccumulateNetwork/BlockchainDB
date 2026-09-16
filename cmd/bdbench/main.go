@@ -64,6 +64,7 @@ type config struct {
 	seed          uint64
 	pprof         string
 	http          string
+	dynaHeap      bool
 }
 
 //go:embed live.html
@@ -91,6 +92,7 @@ func parseFlags() (config, error) {
 	flag.Uint64Var(&c.seed, "seed", 1, "random seed")
 	flag.StringVar(&c.pprof, "pprof", "", "serve net/http/pprof on this address (e.g. 127.0.0.1:6061)")
 	flag.StringVar(&c.http, "http", "127.0.0.1:8098", "serve the live page and the run's files here; empty disables")
+	flag.BoolVar(&c.dynaHeap, "dyna-heap", false, "dynamic layer as a heap with holes (proposal 2026-09-16) instead of sealed segments")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return c, fmt.Errorf("unexpected arguments: %q", flag.Args())
@@ -201,7 +203,11 @@ const (
 
 func openStore(c config, id int) (*store, error) {
 	dir := filepath.Join(c.dir, fmt.Sprintf("store-%d", id))
-	kv, err := blockchainDB.NewKVShardN(dir, c.shards, c.sealLimit)
+	open := blockchainDB.NewKVShardN
+	if c.dynaHeap {
+		open = blockchainDB.NewKVShardHeapN
+	}
+	kv, err := open(dir, c.shards, c.sealLimit)
 	if err != nil {
 		return nil, fmt.Errorf("open store %d: %w", id, err)
 	}
@@ -406,7 +412,7 @@ func main() {
 		"dir": c.dir, "stores": c.stores, "duration": c.duration.String(), "interval": c.interval.String(), "shards": c.shards,
 		"sealLimit": c.sealLimit, "window": c.window, "compressEvery": c.compressEvery, "packEvery": c.packEvery,
 		"dynaPuts": c.dynaPuts, "permPuts": c.permPuts, "reads": c.reads, "hotKeys": c.hotKeys,
-		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "started": time.Now().UTC().Format(time.RFC3339),
+		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "dynaHeap": c.dynaHeap, "started": time.Now().UTC().Format(time.RFC3339),
 	}, "", "  ")
 	if err := os.WriteFile(filepath.Join(c.dir, "run.json"), runJSON, 0o644); err != nil {
 		fail("run.json", err)

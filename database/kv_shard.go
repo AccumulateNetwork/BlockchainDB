@@ -227,7 +227,17 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 //
 // How many to ask for is a question about rate, not about size; see
 // DefaultNumShards.
+// NewKVShardHeapN is NewKVShardN with every shard's dynamic layer a
+// heap with holes (heap.go).
+func NewKVShardHeapN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2Heap)
+}
+
 func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2)
+}
+
+func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(string, uint64) (*KV2, error)) (kvs *KVShard, err error) {
 	if shards < 1 {
 		return nil, fmt.Errorf("a database needs at least one shard, asked for %d", shards)
 	}
@@ -241,7 +251,7 @@ func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, 
 	kvs.Shards = make([]*KV2, shards)
 	for i := range kvs.Shards { // Then create all the shards
 		shardDir := kvs.ShardDir(i)
-		if kvs.Shards[i], err = NewKV2(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
+		if kvs.Shards[i], err = newShard(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
 			return nil, err
 		}
 	}
@@ -460,7 +470,7 @@ func (k *KVShard) adoptBlockHeight() error {
 			shard.PermKV.AdvanceBlock(height)
 		}
 		if shard.DynaKV != nil { // So that its window is where the set's is
-			shard.DynaKV.AdvanceBlock(height)
+			shard.dyna().AdvanceBlock(height)
 		}
 	}
 	return nil
@@ -712,8 +722,8 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 		if shard.PermKV != nil {
 			add(&perm, shard.PermKV.Stats())
 		}
-		if shard.DynaKV != nil {
-			add(&dyna, shard.DynaKV.Stats())
+		if shard.Heap != nil || shard.DynaKV != nil {
+			add(&dyna, shard.dyna().Stats())
 		}
 	}
 	return perm, dyna

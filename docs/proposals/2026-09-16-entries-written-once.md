@@ -59,13 +59,17 @@ rewrites everything around it.  Instead:
 
 - **Entries live in a heap file per shard.**  An entry is
   `[len][key][value][checksum]`; its location is `(file, offset)`.
-- **A rewrite that fits reuses the slot.**  A value no larger than the
-  slot it replaces is written in place.  The soak's dynamic rewrites
-  are chain heads, BPT nodes and account state whose size is stable,
-  so this is the common case and it creates no garbage at all.
-- **A rewrite that does not fit appends and frees a hole.**  The new
-  entry goes to the end of the heap (or into a hole that fits); the
-  old slot becomes a hole.
+- **A rewrite within the block reuses the slot.**  A key written
+  again in the block that took its slot is rewritten in place when the
+  value fits: nothing durable names the slot yet.
+- **A rewrite in a later block takes a new slot.**  The slot the last
+  durable index names is never overwritten, or a crash between the
+  write and the block's sync would expose an uncommitted value under
+  a committed name.  The new entry goes into a hole that fits, or the
+  end of the heap; the old slot becomes a hole one sync later.  A key
+  rewritten every block therefore cycles two slots, its own and last
+  block's; the heap's size for such a key is twice the entry, not a
+  history of it.
 - **Holes are filled, not swept.**  Free space is kept by size class
   (`8 << n` bytes); a new entry takes the smallest hole that fits, or
   the end of the file.  Fragmentation is bounded by the size classes
@@ -155,7 +159,10 @@ commit point" and closes #33.
 1. The dynamic heap, behind the existing `KV2` dynamic surface (`Put`,
    `Get`, `Seal`, `CompactHistory` becoming the bounded move,
    `Stats`), so the sharding and the adapter do not change.  The
-   platform measures it alone (`-stores 9 -perm 0`).
+   platform measures it alone (`-stores 9 -perm 0`).  *Written:
+   `database/heap.go`, opened with `NewKVShardHeapN` / `NewKV2Heap`,
+   detected on open by its directory; `bdbench -dyna-heap`.  The
+   bounded move is not written yet; holes cycle by size class.*
 2. The permanent index deltas and the single block file, which also
    brings the seal to one commit point.
 3. Merge and pack over indexes.

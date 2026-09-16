@@ -2712,6 +2712,18 @@ func compactionRunWithin(history []*segment, ratio float64, budget uint64) (run 
 // the merge's rule: an uncommitted output sits below the newest active
 // segment and recoverOrphans deletes it, while the inputs are still
 // named.
+// beginBlockSync and compact are the dynaLayer surface (kv_2.go)
+// over Sync and CompactHistory.
+func (s *SegmentStore) beginBlockSync() (blockSync, error) {
+	p, err := s.beginSync()
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (s *SegmentStore) compact() (bool, error) { return s.CompactHistory() }
+
 func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	s.maint.Lock()
 	defer s.maint.Unlock()

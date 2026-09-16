@@ -13,6 +13,7 @@ import (
 
 const PermDirName = "perm"
 const DynaDirName = "dyna"
+const HeapDirName = "dyna-heap" // The dynamic layer as a heap with holes (heap.go)
 
 // KV2
 // Maintains 2 layers of key value pairs with different immutability characteristics:
@@ -59,7 +60,8 @@ type KV2 struct {
 	Mutex     sync.RWMutex
 	Directory string        // Directory where the PermKV and DynaKV directories are
 	PermKV    *SegmentStore // The Perm layer: sealed, immutable segments
-	DynaKV    *SegmentStore // The Dyna layer: sealed, mutable segments
+	DynaKV    *SegmentStore // The Dyna layer: sealed, mutable segments; nil when Heap is set
+	Heap      *HeapStore    // The Dyna layer as a heap with holes (heap.go); nil when DynaKV is set
 	// dWrites and pWrites count writes to each layer since the last
 	// Compress.  Atomic, because the writes that bump them run
 	// concurrently: KV2.Put takes the lock SHARED (see Put).
@@ -153,7 +155,53 @@ func (k *KV2) SetFilterBlocks(n uint64) (err error) {
 	if err = k.PermKV.SetFilterBlocks(n); err != nil {
 		return err
 	}
-	return k.DynaKV.SetFilterBlocks(n)
+	return k.dyna().SetFilterBlocks(n)
+}
+
+// dynaLayer is what KV2 asks of its dynamic layer, whichever of the
+// two it opened: sealed mutable segments (SegmentStore) or the heap
+// with holes (HeapStore).
+type dynaLayer interface {
+	Open() error
+	Close() error
+	Get(key [32]byte) ([]byte, error)
+	GetDeep(key [32]byte) ([]byte, error)
+	Put(key [32]byte, value []byte) error
+	AdvanceBlock(height uint64)
+	LiveRecords() uint64
+	SetFilterBlocks(n uint64) error
+	SetSealLimit(limit uint64) error
+	beginBlockSync() (blockSync, error)
+	compact() (bool, error)
+	Stats() StoreStats
+}
+
+// blockSync is the second half of a block sync, finished outside the
+// shard's lock.
+type blockSync interface{ finish() error }
+
+// dyna is the dynamic layer this shard opened.
+func (k *KV2) dyna() dynaLayer {
+	if k.Heap != nil {
+		return k.Heap
+	}
+	return k.DynaKV
+}
+
+// NewKV2Heap is NewKV2 with the dynamic layer as a heap with holes.
+func NewKV2Heap(directory string, sealLimit uint64) (kv2 *KV2, err error) {
+	if kv2, err = NewKV2(directory, sealLimit); err != nil {
+		return nil, err
+	}
+	if err = kv2.DynaKV.Close(); err != nil {
+		return nil, err
+	}
+	os.RemoveAll(filepath.Join(directory, DynaDirName))
+	kv2.DynaKV = nil
+	if kv2.Heap, err = NewHeapStore(filepath.Join(directory, HeapDirName)); err != nil {
+		return nil, err
+	}
+	return kv2, nil
 }
 
 func OpenKV2(directory string) (kv2 *KV2, err error) {
@@ -163,6 +211,13 @@ func OpenKV2(directory string) (kv2 *KV2, err error) {
 	dynaDirName := filepath.Join(directory, DynaDirName) // Add directory names
 	if kv2.PermKV, err = OpenSegmentStore(permDirName); err != nil {
 		return nil, err
+	}
+	// The dynamic layer is whichever the store was built with
+	if _, statErr := os.Stat(filepath.Join(directory, HeapDirName)); statErr == nil {
+		if kv2.Heap, err = OpenHeapStore(filepath.Join(directory, HeapDirName)); err != nil {
+			return nil, err
+		}
+		return kv2, nil
 	}
 	if kv2.DynaKV, err = OpenSegmentStore(dynaDirName); err != nil {
 		return nil, err
@@ -191,7 +246,7 @@ func (k *KV2) Open() error {
 			k.SealLimit = int(DefaultBloomCapacity)
 		}
 	}
-	if err := k.DynaKV.Open(); err != nil {
+	if err := k.dyna().Open(); err != nil {
 		return err
 	}
 	k.opened.Store(true)
@@ -213,7 +268,7 @@ func (k *KV2) Close() error {
 	defer k.Mutex.Unlock()
 	k.opened.Store(false)
 	err := k.PermKV.Close()
-	if dynaErr := k.DynaKV.Close(); err == nil {
+	if dynaErr := k.dyna().Close(); err == nil {
 		err = dynaErr
 	}
 	return err
@@ -225,7 +280,7 @@ func (k *KV2) GetDyna(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
 
-	if value, err = k.DynaKV.Get(key); err != nil { // Not in DynaKV, then return whatever
+	if value, err = k.dyna().Get(key); err != nil { // Not in DynaKV, then return whatever
 		return nil, err
 	}
 	return value, nil
@@ -284,7 +339,7 @@ func (k *KV2) Get(key [32]byte) (value []byte, err error) {
 	defer k.Mutex.RUnlock()
 
 	// Check and see if this is a key that has been changed
-	value, err = k.DynaKV.Get(key)
+	value, err = k.dyna().Get(key)
 	switch {
 	case err == nil:
 		return value, nil
@@ -308,7 +363,7 @@ func (k *KV2) GetDeep(key [32]byte) (value []byte, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
 
-	value, err = k.DynaKV.GetDeep(key)
+	value, err = k.dyna().GetDeep(key)
 	switch {
 	case err == nil:
 		return value, nil
@@ -326,7 +381,7 @@ func (k *KV2) PutDyna(key [32]byte, value []byte) (writes int, err error) {
 	k.Mutex.RLock()                                        // Shared: see Put (issue #66)
 	defer k.Mutex.RUnlock()
 	k.dWrites.Add(1)
-	if err = k.DynaKV.Put(key, value); err != nil {
+	if err = k.dyna().Put(key, value); err != nil {
 		return int(k.dWrites.Load()), err
 	}
 	autoSeal, err = k.sealDynaIfFull()
@@ -388,8 +443,8 @@ func (k *KV2) sealPermIfFull() (p *pendingSeal, err error) {
 // replayed in full on every open.  The caller must hold the KV2 lock,
 // shared or exclusive; see sealPermIfFull.
 func (k *KV2) sealDynaIfFull() (p *pendingSeal, err error) {
-	if k.SealLimit <= 0 || k.DynaKV.LiveRecords() < uint64(k.SealLimit) {
-		return nil, nil
+	if k.Heap != nil || k.SealLimit <= 0 || k.DynaKV.LiveRecords() < uint64(k.SealLimit) {
+		return nil, nil // A heap is never sealed: it has no tail to fill
 	}
 	return k.DynaKV.beginSealNext()
 }
@@ -437,8 +492,8 @@ func (k *KV2) sealDynaIfFull() (p *pendingSeal, err error) {
 func (k *KV2) Seal(height uint64) (meta SegmentMeta, err error) {
 	k.Mutex.Lock()
 	perm, err := k.PermKV.beginSeal(height)
-	dyna, dynaErr := k.DynaKV.beginSync()
-	k.DynaKV.AdvanceBlock(height + 1)
+	dyna, dynaErr := k.dyna().beginBlockSync()
+	k.dyna().AdvanceBlock(height + 1)
 	k.Mutex.Unlock()
 
 	// Both halves finish regardless of the other: a failure to sync
@@ -517,12 +572,12 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 	k.Mutex.RLock()
 	defer k.Mutex.RUnlock()
 
-	if value2, err2 := k.DynaKV.Get(key); err2 == nil { // Check.  Is this a DynaKV key?
+	if value2, err2 := k.dyna().Get(key); err2 == nil { // Check.  Is this a DynaKV key?
 		if bytes.Equal(value, value2) { // If the key is in DynaKV, it stays there.
 			return int(k.dWrites.Load()), nil //       If the value is not changed, do nothing
 		}
 		k.dWrites.Add(1)
-		if err = k.DynaKV.Put(key, value); err != nil { // If the value DID change, update
+		if err = k.dyna().Put(key, value); err != nil { // If the value DID change, update
 			return int(k.dWrites.Load()), err
 		}
 		autoSeal, err = k.sealDynaIfFull()
@@ -553,7 +608,7 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 		return int(k.dWrites.Load()), nil
 	}
 	k.dWrites.Add(1)
-	if err = k.DynaKV.Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
+	if err = k.dyna().Put(key, value); err != nil { // If the perm value changed, it is now a DynaKV
 		return int(k.dWrites.Load()), err
 	}
 	autoSeal, err = k.sealDynaIfFull()
@@ -594,7 +649,7 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 //
 // TODO: Cleanse PermKV of keys in DynaKV
 func (k *KV2) Compress() error {
-	if _, err := k.DynaKV.CompactHistory(); err != nil {
+	if _, err := k.dyna().compact(); err != nil {
 		return err
 	}
 	k.Mutex.Lock()
