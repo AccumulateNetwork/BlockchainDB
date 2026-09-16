@@ -325,3 +325,49 @@ func TestHeapShardRoundTrip(t *testing.T) {
 		require.Equal(t, byte(60), v[0])
 	}
 }
+
+// A key rewritten between the mover's copy and its naming leaves the
+// copy dead on arrival: the put's value stands, and the copy's bytes
+// are accounted dead in the mover's file.
+func TestHeapMoveIsDeadOnArrivalIfTheKeyWasRewritten(t *testing.T) {
+	smallFiles(t) // Nine 112-byte entries to a file
+	h, err := NewHeapStore(heapDir(t))
+	require.NoError(t, err)
+	defer h.Close()
+	h.AdvanceBlock(1)
+	for i := byte(1); i <= 20; i++ {
+		require.NoError(t, h.Put(key(i), make([]byte, 64)))
+	}
+	syncHeap(t, h)
+	// Two more blocks rewriting every key but 20 leave key 20 the one
+	// live entry in a file otherwise dead: the mover's next pick
+	for b := uint64(2); b <= 3; b++ {
+		h.AdvanceBlock(b)
+		for i := byte(1); i <= 19; i++ {
+			require.NoError(t, h.Put(key(i), make([]byte, 64)))
+		}
+		syncHeap(t, h)
+	}
+	h.AdvanceBlock(4)
+	moverHook = func() {
+		require.NoError(t, h.Put(key(20), []byte("rewritten while moving")))
+	}
+	defer func() { moverHook = nil }()
+	deadBefore, _ := h.HoleRatio()
+	moved, err := h.clean(1 << 20)
+	require.NoError(t, err)
+	require.True(t, moved)
+	_, copied := h.Cleaned()
+	require.GreaterOrEqual(t, copied, uint64(entrySize(64)), "key 20 was among the entries copied")
+	v, err := h.Get(key(20))
+	require.NoError(t, err)
+	require.Equal(t, "rewritten while moving", string(v), "the put wins")
+	// Every copied entry left its old slot dead; key 20's copy is dead
+	// as well, since the put took the key elsewhere before it was named
+	dead, _ := h.HoleRatio()
+	require.EqualValues(t, deadBefore+int64(copied)+entrySize(64), dead, "the old slots and the unwanted copy are dead")
+	syncHeap(t, h)
+	v, err = h.Get(key(20))
+	require.NoError(t, err)
+	require.Equal(t, "rewritten while moving", string(v))
+}

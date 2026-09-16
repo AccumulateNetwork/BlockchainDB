@@ -714,6 +714,12 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 		dst.HistorySegments += s.HistorySegments
 		dst.ActiveSegments += s.ActiveSegments
 		dst.ResidentBloomBytes += s.ResidentBloomBytes
+		dst.ResidentIndexBytes += s.ResidentIndexBytes
+		dst.HeapFiles += s.HeapFiles
+		dst.HeapLiveBytes += s.HeapLiveBytes
+		dst.HeapDeadBytes += s.HeapDeadBytes
+		dst.HeapScannedBytes += s.HeapScannedBytes
+		dst.HeapMovedBytes += s.HeapMovedBytes
 	}
 	for _, shard := range k.Shards {
 		if shard == nil {

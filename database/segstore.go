@@ -814,6 +814,16 @@ type StoreStats struct {
 	HistorySegments    int    // Segments in history now
 	ActiveSegments     int    // Segments in the window now
 	ResidentBloomBytes uint64 // History filter memory held, of BloomResidentBytes
+
+	// The heap's own figures (heap.go), zero for a segment store: the
+	// key map's resident bytes, its data files, what is live and dead
+	// in them, and what the mover has scanned and copied so far.
+	ResidentIndexBytes uint64
+	HeapFiles          int
+	HeapLiveBytes      uint64
+	HeapDeadBytes      uint64
+	HeapScannedBytes   uint64
+	HeapMovedBytes     uint64
 }
 
 // storeCounters is StoreStats as the store keeps it: atomics, because

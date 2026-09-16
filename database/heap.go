@@ -101,6 +101,8 @@ type heapFile struct {
 	size       int64
 	live, dead int64
 	cleaning   bool // Taken by the pass in progress
+	inflight   int  // Copies reserved in it and not yet written: its size runs ahead of its bytes
+	releasing  bool // Emptied by a pass; deleted by the next sync
 }
 
 // slot is where an entry lives: its file, its offset there, the value
@@ -532,6 +534,9 @@ func (h *HeapStore) reserve(mover bool, size int64) (hf *heapFile, off int64, er
 	hf.live += size
 	h.liveBytes += size
 	h.dirty[hf.id] = hf
+	if mover {
+		hf.inflight++
+	}
 	return hf, off, nil
 }
 
@@ -756,6 +761,10 @@ func (h *HeapStore) Snapshot() error {
 	return h.startGeneration()
 }
 
+// moverHook, when set, runs between the mover's copy and its naming:
+// the window in which a put can make a copy dead on arrival.
+var moverHook func()
+
 // heapMove is one live entry the mover copies: where it was, where
 // it goes, and the bytes to write there.
 type heapMove struct {
@@ -771,11 +780,12 @@ type heapMove struct {
 // the mover's file, at most budget bytes per pass, and marks a file
 // left with nothing live for deletion once the delta naming the
 // copies is durable.  The pass syncs its own copies, so they never
-// land in a block's barrier, and holds the shard's lock only to
-// choose and reserve and again to name, never across the copy or its
+// land in a block's barrier, and it holds the shard's lock only to
+// pick, to plan, and to name: never across a read, a write or an
 // fsync (spec 1.6).  A byte released never costs more than a byte
 // copied unless the size bound forces it (spec 1.2).
 func (h *HeapStore) clean(budget int64) (bool, error) {
+	// 1. Under the lock: pick the files
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -785,30 +795,55 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 		h.mu.Unlock()
 		return false, nil // The last pass's deletions are still waiting on a sync
 	}
-	var moves []heapMove
 	var taken []*heapFile
-	var copied int64
-	for len(taken) < HeapCleanFiles && copied < budget {
+	for len(taken) < HeapCleanFiles {
 		hf := h.pickFile()
 		if hf == nil {
 			break
 		}
 		hf.cleaning = true
 		taken = append(taken, hf)
-		m, n, err := h.planFile(hf, budget-copied)
+	}
+	h.mu.Unlock()
+	if len(taken) == 0 {
+		return false, nil
+	}
+	// 2. Without the lock: read them.  A picked file is neither the
+	// block's nor the mover's, so its bytes do not change; only what
+	// the index says of them can, and that is checked under the lock
+	contents := make([][]byte, len(taken))
+	for i, hf := range taken {
+		contents[i] = make([]byte, hf.size)
+		if _, err := hf.f.ReadAt(contents[i], 0); err != nil {
+			h.mu.Lock()
+			for _, hf := range taken {
+				hf.cleaning = false
+			}
+			h.mu.Unlock()
+			return false, err
+		}
+	}
+	// 3. Under the lock: decide what is live and reserve each copy's
+	// slot in the mover's file; the mover's files leave the dirty set,
+	// since the pass syncs them itself
+	h.mu.Lock()
+	var moves []heapMove
+	var copied int64
+	for i, hf := range taken {
+		m, n, err := h.planFile(hf, contents[i], budget-copied)
 		if err != nil {
 			h.mu.Unlock()
 			return false, err
 		}
 		moves = append(moves, m...)
 		copied += n
+		if copied >= budget {
+			break
+		}
 	}
 	for _, hf := range taken {
 		hf.cleaning = false
 	}
-	// The mover's file is dirty with the copies; the block's sync must
-	// not have to wait for them, so they are synced here and taken off
-	// the dirty set
 	var movFiles []*heapFile
 	for _, m := range moves {
 		if len(movFiles) == 0 || movFiles[len(movFiles)-1] != m.hf {
@@ -819,22 +854,36 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 		delete(h.dirty, hf.id)
 	}
 	h.mu.Unlock()
-	if len(taken) == 0 {
-		return false, nil
+	// 4. Without the lock: write the copies and make them durable
+	fail := func(err error) (bool, error) {
+		h.mu.Lock()
+		for _, m := range moves {
+			m.hf.inflight-- // Reserved, never written: dead, and read no further
+			h.kill(m.to)
+		}
+		h.mu.Unlock()
+		return false, err
 	}
 	for _, m := range moves {
 		if _, err := m.hf.f.WriteAt(m.entry, int64(m.to.off)); err != nil {
-			return false, err
+			return fail(err)
 		}
 	}
 	for _, hf := range movFiles {
 		if err := fsync(hf.f); err != nil {
-			return false, err
+			return fail(err)
 		}
 	}
+	if moverHook != nil {
+		moverHook() // Tests: a put between the copy and its naming
+	}
+	// 5. Under the lock: name the copies, unless the key was rewritten
+	// meanwhile, in which case the copy is dead on arrival; and mark
+	// the files the pass emptied
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, m := range moves {
+		m.hf.inflight--
 		s, live := h.index[m.key]
 		if live && s == m.from {
 			h.index[m.key] = m.to
@@ -846,6 +895,7 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	}
 	for _, hf := range taken {
 		if hf.live == 0 && hf != h.cur && hf != h.mov {
+			hf.releasing = true
 			h.release = append(h.release, hf.id)
 		}
 	}
@@ -860,7 +910,7 @@ func (h *HeapStore) pickFile() *heapFile {
 	var pick *heapFile
 	best := 0.0
 	for _, hf := range h.files {
-		if hf == h.cur || hf == h.mov || hf.cleaning || hf.dead == 0 {
+		if hf == h.cur || hf == h.mov || hf.cleaning || hf.inflight > 0 || hf.releasing || hf.dead == 0 {
 			continue
 		}
 		if f := float64(hf.dead) / float64(hf.size); f > best {
@@ -873,14 +923,11 @@ func (h *HeapStore) pickFile() *heapFile {
 	return pick
 }
 
-// planFile reads one file and reserves, in the mover's file, a slot
-// for each live entry in it up to budget bytes; the rest wait for the
-// next pass.  The caller holds the lock.
-func (h *HeapStore) planFile(hf *heapFile, budget int64) (moves []heapMove, copied int64, err error) {
-	buf := make([]byte, hf.size)
-	if _, err = hf.f.ReadAt(buf, 0); err != nil {
-		return nil, 0, err
-	}
+// planFile walks one file's bytes, read outside the lock, and
+// reserves in the mover's file a slot for each entry the index still
+// names, up to budget bytes; the rest wait for the next pass.  The
+// caller holds the lock.
+func (h *HeapStore) planFile(hf *heapFile, buf []byte, budget int64) (moves []heapMove, copied int64, err error) {
 	var at int64
 	for at < int64(len(buf)) {
 		size, _, key, value, ok := decodeEntry(buf[at:])
@@ -959,20 +1006,23 @@ func RepairHeapStore(directory string, committed uint64) (*HeapStore, error) {
 	return h, nil
 }
 
-// Stats maps the heap's counters onto the store's report: every read
-// is answered from the key map (LiveHit), there are no segments, and
-// the resident memory is the key map.
+// Stats is the heap's report in the store's terms: puts and lookups
+// as the segment layer counts them (every hit is answered from the
+// key map, so they are all LiveHit), and the heap's own figures.
 func (h *HeapStore) Stats() StoreStats {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return StoreStats{
 		PutTotal:           h.putTotal.Load(),
 		PutNew:             h.putAppend.Load(),
-		PutDuplicate:       h.putInPlace.Load(),
 		LookupTotal:        h.lookups.Load(),
 		LiveHit:            h.hits.Load(),
-		ActiveSegments:     len(h.files),
-		ResidentBloomBytes: uint64(len(h.index)) * (32 + 24),
+		ResidentIndexBytes: uint64(len(h.index)) * (32 + 24),
+		HeapFiles:          len(h.files),
+		HeapLiveBytes:      uint64(h.liveBytes),
+		HeapDeadBytes:      uint64(h.deadBytes),
+		HeapScannedBytes:   h.cleanedBytes.Load(),
+		HeapMovedBytes:     h.movedBytes.Load(),
 	}
 }
 

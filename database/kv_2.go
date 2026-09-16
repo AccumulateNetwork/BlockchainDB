@@ -155,7 +155,10 @@ func (k *KV2) SetFilterBlocks(n uint64) (err error) {
 	if err = k.PermKV.SetFilterBlocks(n); err != nil {
 		return err
 	}
-	return k.dyna().SetFilterBlocks(n)
+	if k.DynaKV == nil {
+		return nil // A heap has no window
+	}
+	return k.DynaKV.SetFilterBlocks(n)
 }
 
 // dynaLayer is what KV2 asks of its dynamic layer, whichever of the
@@ -169,8 +172,6 @@ type dynaLayer interface {
 	Put(key [32]byte, value []byte) error
 	AdvanceBlock(height uint64)
 	LiveRecords() uint64
-	SetFilterBlocks(n uint64) error
-	SetSealLimit(limit uint64) error
 	beginBlockSync() (blockSync, error)
 	compact() (bool, error)
 	Stats() StoreStats
