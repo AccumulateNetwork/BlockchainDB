@@ -117,3 +117,77 @@ func TestPermStoreTiersAndReopen(t *testing.T) {
 	_, err = r.Get(fr.NextHash())
 	require.ErrorIs(t, err, errNotFound)
 }
+
+// A shard built with both layers as files seals, merges, packs,
+// closes and reopens as files, through the same KV2 and KVShard
+// surface; permanent keys are found in the window and, once past it,
+// by GetDeep; dynamic keys keep their last value.
+func TestFilesShardRoundTrip(t *testing.T) {
+	every := PermMergeEvery
+	PermMergeEvery = 8
+	defer func() { PermMergeEvery = every }()
+	dir := filepath.Join(t.TempDir(), "shards")
+	kvs, err := NewKVShardFilesN(dir, 2, 1000)
+	require.NoError(t, err)
+	require.NoError(t, kvs.SetFilterBlocks(MinFilterBlocks))
+	fr := NewFastRandom([]byte{9})
+	hot := make([][32]byte, 100)
+	for i := range hot {
+		hot[i] = fr.NextHash()
+	}
+	var perm [][32]byte
+	for b := uint64(1); b <= 3*MinFilterBlocks; b++ {
+		for _, k := range hot {
+			require.NoError(t, kvs.PutDyna(k, append([]byte{byte(b)}, k[:4]...)))
+		}
+		for i := 0; i < 50; i++ {
+			k := fr.NextHash()
+			perm = append(perm, k)
+			require.NoError(t, kvs.PutPerm(k, append([]byte{byte(b)}, k[:4]...)))
+		}
+		require.NoError(t, kvs.SealBlock(b))
+		if b%10 == 0 {
+			require.NoError(t, kvs.Compress())
+			_, err := kvs.MergeFinalized(b)
+			require.NoError(t, err)
+		}
+	}
+	for _, k := range hot {
+		v, err := kvs.GetDyna(k)
+		require.NoError(t, err)
+		require.Equal(t, byte(3*MinFilterBlocks), v[0])
+	}
+	recent := perm[len(perm)-50:]
+	old := perm[:50]
+	for _, k := range recent {
+		_, err := kvs.GetPerm(k)
+		require.NoError(t, err, "in the window")
+	}
+	for _, k := range old {
+		_, err := kvs.GetPerm(k)
+		require.ErrorIs(t, err, errNotFound, "past the window")
+		v, err := kvs.Shards[kvs.ShardIndex(k[:])].GetPermDeep(k)
+		require.NoError(t, err, "found deep")
+		require.Equal(t, byte(1), v[0])
+	}
+	_, packed, err := kvs.PackFinalized(3 * MinFilterBlocks)
+	require.NoError(t, err)
+	require.True(t, packed)
+	require.NoError(t, kvs.Close())
+
+	re, err := OpenKVShard(dir)
+	require.NoError(t, err)
+	defer re.Close()
+	require.NotNil(t, re.Shards[0].Perm, "reopened as files")
+	require.NotNil(t, re.Shards[0].Heap)
+	for _, k := range hot {
+		v, err := re.GetDyna(k)
+		require.NoError(t, err)
+		require.Equal(t, byte(3*MinFilterBlocks), v[0])
+	}
+	for _, k := range old {
+		v, err := re.Shards[re.ShardIndex(k[:])].GetPermDeep(k)
+		require.NoError(t, err, "the retired run came back")
+		require.Equal(t, byte(1), v[0])
+	}
+}

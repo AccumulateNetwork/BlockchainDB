@@ -65,6 +65,7 @@ type config struct {
 	pprof         string
 	http          string
 	dynaHeap      bool
+	permFiles     bool
 	phase         bool
 }
 
@@ -94,6 +95,7 @@ func parseFlags() (config, error) {
 	flag.StringVar(&c.pprof, "pprof", "", "serve net/http/pprof on this address (e.g. 127.0.0.1:6061)")
 	flag.StringVar(&c.http, "http", "127.0.0.1:8098", "serve the live page and the run's files here; empty disables")
 	flag.BoolVar(&c.dynaHeap, "dyna-heap", false, "dynamic layer as a heap with holes (proposal 2026-09-16) instead of sealed segments")
+	flag.BoolVar(&c.permFiles, "perm-files", false, "both layers as files of entries: the heap and the permanent layer with buckets of keys (implies -dyna-heap)")
 	flag.BoolVar(&c.phase, "maintenance-phase", false, "offset each store's maintenance cadence by its share of the period, so stores in lockstep do not all maintain at once")
 	flag.Parse()
 	if flag.NArg() != 0 {
@@ -221,6 +223,9 @@ func openStore(c config, id int) (*store, error) {
 	open := blockchainDB.NewKVShardN
 	if c.dynaHeap {
 		open = blockchainDB.NewKVShardHeapN
+	}
+	if c.permFiles {
+		open = blockchainDB.NewKVShardFilesN
 	}
 	kv, err := open(dir, c.shards, c.sealLimit)
 	if err != nil {
@@ -504,7 +509,7 @@ func main() {
 		"dir": c.dir, "stores": c.stores, "duration": c.duration.String(), "interval": c.interval.String(), "shards": c.shards,
 		"sealLimit": c.sealLimit, "window": c.window, "compressEvery": c.compressEvery, "packEvery": c.packEvery,
 		"dynaPuts": c.dynaPuts, "permPuts": c.permPuts, "reads": c.reads, "hotKeys": c.hotKeys,
-		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "dynaHeap": c.dynaHeap, "maintenancePhase": c.phase, "started": time.Now().UTC().Format(time.RFC3339),
+		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "dynaHeap": c.dynaHeap || c.permFiles, "permFiles": c.permFiles, "maintenancePhase": c.phase, "started": time.Now().UTC().Format(time.RFC3339),
 	}, "", "  ")
 	if err := os.WriteFile(filepath.Join(c.dir, "run.json"), runJSON, 0o644); err != nil {
 		fail("run.json", err)

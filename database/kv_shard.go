@@ -103,6 +103,9 @@ func (k *KVShard) attachSets() (err error) {
 		if shard == nil || shard.PermKV == nil {
 			continue
 		}
+		if shard.PermKV == nil {
+			continue // A file-backed permanent layer keeps its own deep history
+		}
 		if err = shard.PermKV.attachCold(shardSets{k.Sets, i}); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
@@ -195,6 +198,9 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 	// again, which commits and retires them
 	if newest, ok := kVShard.Sets.Newest(); ok {
 		for i, shard := range kVShard.Shards {
+			if shard.PermKV == nil {
+				continue
+			}
 			if _, err = shard.PermKV.DropBelow(newest.Last + 1); err != nil {
 				return nil, fmt.Errorf("shard %d: %w", i, err)
 			}
@@ -231,6 +237,12 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 // heap with holes (heap.go).
 func NewKVShardHeapN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
 	return newKVShardN(directory, shards, sealLimit, NewKV2Heap)
+}
+
+// NewKVShardFilesN is NewKVShardN with both layers as files of entries
+// (heap.go, perm.go).
+func NewKVShardFilesN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2Files)
 }
 
 func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
@@ -467,7 +479,7 @@ func (k *KVShard) adoptBlockHeight() error {
 			continue
 		}
 		if shard.PermKV != nil {
-			shard.PermKV.AdvanceBlock(height)
+			shard.perm().AdvanceBlock(height)
 		}
 		if shard.DynaKV != nil { // So that its window is where the set's is
 			shard.dyna().AdvanceBlock(height)
@@ -481,7 +493,9 @@ func (k *KVShard) adoptBlockHeight() error {
 func (k *KVShard) useSharedBlockRecord() {
 	for _, shard := range k.Shards {
 		if shard != nil && shard.PermKV != nil {
-			shard.PermKV.ExternalBlockRecord = true
+			if shard.PermKV != nil {
+				shard.PermKV.ExternalBlockRecord = true
+			}
 		}
 	}
 }
@@ -602,6 +616,19 @@ func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
 // pack is done, and whichever of the two lands first, the drop that
 // follows removes what the set holds.
 func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err error) {
+	// A file-backed permanent layer packs within the shard: its
+	// buckets retire into one run of keys, no bodies, no set file
+	if len(k.Shards) > 0 && k.Shards[0].Perm != nil {
+		for i, shard := range k.Shards {
+			if err = shard.Open(); err != nil {
+				return meta, false, fmt.Errorf("shard %d: %w", i, err)
+			}
+			if err = shard.Perm.Pack(); err != nil {
+				return meta, false, fmt.Errorf("shard %d: %w", i, err)
+			}
+		}
+		return meta, true, nil
+	}
 	// One pack at a time.  Every guard in here and below is a
 	// check-then-act on state another pack can change: two calls read
 	// the same watermark and pack the same segments into overlapping
@@ -726,7 +753,7 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 			continue
 		}
 		if shard.PermKV != nil {
-			add(&perm, shard.PermKV.Stats())
+			add(&perm, shard.perm().Stats())
 		}
 		if shard.Heap != nil || shard.DynaKV != nil {
 			add(&dyna, shard.dyna().Stats())

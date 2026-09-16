@@ -1061,6 +1061,28 @@ func (p *PermStore) Stats() StoreStats {
 	}
 }
 
+// beginPermSeal and mergeBelow are the permLayer surface (kv_2.go).
+func (p *PermStore) beginPermSeal(height uint64) (blockSync, error) {
+	s, err := p.beginSeal(height)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (p *PermStore) mergeBelow(uint64) (bool, error) { return true, p.Merge() }
+
+// SetFilterBlocks sets the window.
+func (p *PermStore) SetFilterBlocks(n uint64) error {
+	if n < MinFilterBlocks {
+		return fmt.Errorf("perm: filter blocks %d below the minimum %d", n, MinFilterBlocks)
+	}
+	p.mu.Lock()
+	p.window_n = n
+	p.mu.Unlock()
+	return nil
+}
+
 // keyPrefixBucket is the bucket a key belongs to.
 func keyPrefixBucket(key [32]byte) int { return int(key[0]) }
 

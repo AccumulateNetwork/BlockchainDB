@@ -2734,6 +2734,28 @@ func (s *SegmentStore) beginBlockSync() (blockSync, error) {
 
 func (s *SegmentStore) compact() (bool, error) { return s.CompactHistory() }
 
+// beginPermSeal and mergeBelow are the permLayer surface (kv_2.go)
+// over beginSeal and MergeBelow.
+func (s *SegmentStore) beginPermSeal(height uint64) (blockSync, error) {
+	p, err := s.beginSeal(height)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, nil
+	}
+	return segSeal{p}, nil
+}
+
+type segSeal struct{ p *pendingSeal }
+
+func (s segSeal) finish() error { _, err := s.p.finish(); return err }
+
+func (s *SegmentStore) mergeBelow(height uint64) (bool, error) {
+	_, merged, err := s.MergeBelow(height)
+	return merged, err
+}
+
 func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	s.maint.Lock()
 	defer s.maint.Unlock()
