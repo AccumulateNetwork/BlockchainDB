@@ -153,45 +153,40 @@ bodies have to be concatenated to be merged.  Instead:
   that is `GetDeep`'s walk; a lookup resolves a key to `(file,
   offset, length)` and does one `pread` of the data file.
 
-### Sizing the buckets (simulated)
+### Sizing the buckets
 
 `TestPermSizingSim` (`go test ./database/ -run TestPermSizingSim -v
 -args -sim`) models one shard at the soak's rate, 1,040 permanent
-records a block, over a day, a week and a month, against the store as
-it is (segments folded by copying bodies every 20 blocks under the
-ratio rule, packed every 1,000).  What it shows:
+records a block, against the store as it is (segments folded by
+copying bodies every 20 blocks under the ratio rule, packed every
+1,000 blocks).  Its first result was a warning: a bucket that is
+never drained holds 1/B of the whole chain, so with any fixed count
+the largest fold grows with the age of the store (256 buckets: 14 MB
+at a day, 102 at a week, 460 at a month), against 1.2.
 
-| per shard | today | 256 buckets, fixed | 256 buckets, split at 32 MB |
-|---|---|---|---|
-| bytes written per block for maintenance | 2.5 MB (bodies and index) | 0.42-0.67 MB (index only) | 0.42-0.66 MB |
-| largest single pass, day / week / month | 358 MB (a pack) | 14 / 102 / 460 MB | 14 / 35 / 35 MB |
-| buckets, day / week / month | | 256 | 256 / 1,024 / 4,096 |
-| runs a lookup below the window probes | | 3.4-3.9 | 3.4-4.3 |
-| files (runs share 64 MB run files), month | | 1,768 | 1,768 |
+The bound is the pack watermark, which the store already has.  Every
+`PackEvery` (1,000) blocks the finished history is packed and dropped
+from the shard; the buckets cover only the history above the
+watermark, and since the keys are hashes their shares are even.  A
+bucket then holds at most 1,000 blocks of its share -- ~4,000
+records, ~180 KB, at 256 buckets -- so a fold is bounded by the pack
+period, not the chain, and nothing needs to split.  The count is a
+free choice; 256 keeps runs small and a merge's lock small.
 
-- **The number of buckets is not a constant.**  With any fixed count
-  the largest fold is 1/B of the shard's index and grows with the
-  chain; a bucket that splits at a size bounds the fold at that size
-  whatever the age (1.2, bounded per pass), and the count follows the
-  index: about the index's bytes over the split size.  Start at 256 a
-  shard; split at 32 MB, so a fold is never more than ~35 MB of
-  44-byte records, off the protocol path.
-- **Maintenance writes drop four to six times**, and every one of
-  them is an index byte: no body is ever copied.  The pack's 358 MB
-  copy is gone.
-- **The fold ratio stays 0.25.**  A ratio of 0.1 halves the runs a
-  lookup probes but nearly doubles the bytes written.
-- **Every bucket is merged every 256 blocks** (B/256 buckets a block),
-  which keeps the recent sections at ~6 MB a shard; one bucket a block
-  would leave records waiting hours once the count grows.
-- **Filters are budgeted, not all resident.**  Within a 64 MB budget
-  per shard the newest runs' filters are in memory and a miss below
-  the window costs 5-6 probes of which 2-3 are cold (K one-byte reads
-  each, as the store probes cold filters today); the window itself is
-  settled by the live filters in memory.  The budget is the store's
-  to set (1.2: memory follows the working set).
-- **A merge locks one bucket**, 1/B of the index; the rest keep
-  answering.
+Per shard per block that comes to about: the block's delta (46 KB),
+the bucket runs (46 KB), their folds (~46 KB) and the pack amortized
+(46 MB of index every 1,000 blocks, 46 KB): ~180 KB a block against
+today's 2.5 MB, every byte an index byte.  The pack is index-only,
+46 MB a shard in place of 358 MB of bodies, and the chain's growth
+lives where it lives today: in the sets below the watermark, grouped
+by block range with one filter per finished group, reached only by
+`GetDeep`.  Filters for the buckets and the newest sets stay
+resident within a budget; older groups are probed cold, as now.
+
+Ratio 0.25 stays (0.1 halves the runs a lookup probes but nearly
+doubles the bytes written); every bucket is merged every 256 blocks
+(B/256 buckets a block), which keeps the recent sections at a few MB
+a shard.
 
 ## The seal: one commit point per store per block
 
