@@ -105,36 +105,70 @@ ever copied.
 ## The permanent layer: append-only data, merged indexes
 
 The permanent layer is write-once; it has no garbage.  Its merges and
-packs exist to bound the file count and the length of a history walk
-(2.7).  Both are properties of the *index*, so:
+packs exist to bound the file count and the length of a lookup's walk
+(2.7), and both are properties of the *index*.  Today (`segstore.go`,
+`seal.go`, `blockset.go`) each block seals a segment -- a body file and
+an index file with an embedded filter -- and `MergeBelow` folds
+segments with `concatSegments`, which copies every body byte-verbatim
+into a new body and rebuilds the index over it; `PackFinalized` copies
+the bodies again into a cross-shard set file.  An index record is 48
+bytes, `key, offset, length`, with no file identifier: several bodies
+are only ever addressed through an out-of-band base, which is why the
+bodies have to be concatenated to be merged.  Instead:
 
-- **A shard's data is one growing file** (or one per `PackEvery`
-  blocks).  A block's records are appended; nothing is ever copied.
-- **Each block seals an index delta**: the sorted `(key, offset)` pairs
-  of the records the block appended, with its filter (2.5).
-- **Merge and pack fold index deltas** into one sorted index per shard
-  per level, on the adapter's cadence, off the protocol path, exactly
-  as today's tiers do -- but moving ~40 B per record instead of ~300.
-  The walk length and the file count are bounded by the index tiers;
-  the data file is never in the walk (a key resolves to an offset,
-  then one `pread`).
+- **A shard's data is a sequence of fixed-size files, appended and
+  never moved**, the heap's file model (`HeapFileBytes`): a block's
+  records go to the end of the current file, and a record is
+  `(file, offset, length)`.  Nothing is ever copied; a file is deleted
+  only by `DropBelow` when a pack no longer needs it -- and packs no
+  longer copy either, so a data file lives until the retention policy
+  above the store says otherwise.
+- **An index record carries the file.**  `key(32) file(4) offset(4)
+  length(4)`, 44 bytes, sorted by key as today.  `mergeIndexes` and
+  `indexWriter` already merge indexes without touching a body; with
+  the file in the record they need no bases.
+- **Each block seals an index delta** with its filter: the sorted
+  records of what the block appended, ~40 bytes a record.  The delta
+  is what the window is made of; the live key filters (`keyfilter.go`)
+  are built over deltas exactly as they are built over segments now.
+- **Merge and pack fold deltas into one sorted index per level**, on
+  the adapter's cadence, off the protocol path, with one filter over
+  the level: a k-way merge of 44-byte records instead of a copy of
+  ~300-byte bodies.  The walk length and the file count are bounded by
+  the index levels; a lookup resolves a key to `(file, offset,
+  length)` and does one `pread` of the data file.  A set is a merged
+  index over every shard's level, grouped by block range as today,
+  with no bodies in it.
+- **Reads keep their protocol-path rule** (1.3): the window is the
+  last N blocks' deltas behind the live filters; an immutable key the
+  filters deny is absent; history and sets are reached only by
+  `GetDeep`.
 
 ## The seal: one commit point per store per block
 
-With indexes as the sealed object a block is one barrier round per
-store rather than four per shard:
+Today a non-empty block costs each shard four barriers -- the data
+fsync, the index file's, the manifest's temp file, the directory --
+and the store two more for its block record (`seal.go`,
+`commitJSON`).  Nine stores of eight shards ask the device for about
+360 barriers a second before any maintenance runs, and the platform
+measured every seal goroutine waiting in `fsync` (#94).
 
-1. Every shard's data appends (permanent) and slot writes (dynamic)
-   for the block are fsynced, in parallel: one round.
-2. The block's index deltas -- permanent `(key, offset)` and dynamic
-   `(key, location)` for every key the block touched -- are written to
-   one per-store block file and fsynced: one round.
-3. The store's manifest names the block file: the existing commit,
-   one round.
+With deltas as the sealed object, a block's permanent index delta is
+appended to the same data file right after the block's records, and
+the dynamic layer's delta after its entries the same way, so that:
 
-Three rounds per store per block, none per shard beyond the parallel
-data sync, in place of four rounds per shard.  This is 1.8's "one
-commit point" and closes #33.
+1. Every shard fsyncs its data files once: entries and delta together,
+   in parallel across shards -- one round.
+2. The store's block record names, for every shard, the file and
+   offset of the block's deltas: the existing `block.json` commit,
+   temp file and directory -- one round.
+
+Two rounds per store per block, in place of four per shard plus two.
+Recovery trusts a delta only if its own checksum holds and every entry
+it names checks, since one fsync does not order the delta's bytes
+after the entries'; a delta that fails is the block that did not
+commit, exactly as a torn delta is today.  This is 1.8's "one commit
+point" and closes #33.
 
 ## Durability and crash consistency (1.8)
 
@@ -188,6 +222,12 @@ commit point" and closes #33.
    max 1.5 s, 58 blocks missed).  The heap's remaining tail (p90
    150-250 ms in the minutes the mover copies most) is the mover's
    own fsync volume in the device queue, which the pass size paces.
-2. The permanent index deltas and the single block file, which also
-   brings the seal to one commit point.
-3. Merge and pack over indexes.
+2. The permanent layer as files of records with index deltas
+   (`PermStore`, behind `KV2`'s permanent surface: `PutIfAbsent`,
+   windowed `Get`, `GetDeep`, the two-half seal, `MergeBelow`,
+   `historyBelow`, `DropBelow`, `attachCold`, the filter knobs), the
+   44-byte index record, and merge and pack over indexes.  Measured
+   alone first (`-stores 9 -dyna 0`), then with the heap under the
+   full load, which is the acceptance run.
+3. The block's deltas in the data files and the store-level commit:
+   one barrier round per shard, one per store.
