@@ -428,7 +428,8 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 	}
 	var height uint64
 	var holes, live int64
-	var scanned, moved uint64
+	var scanned, moved, syncs, syncBytes uint64
+	var heapFsync, deltaSync time.Duration
 	for _, s := range stores {
 		if s.height > height {
 			height = s.height
@@ -439,6 +440,8 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 				holes, live = holes+h, live+l
 				sc, mv := sh.Heap.Cleaned()
 				scanned, moved = scanned+sc, moved+mv
+				n, b, hf, ds := sh.Heap.SyncCost()
+				syncs, syncBytes, heapFsync, deltaSync = syncs+n, syncBytes+b, heapFsync+hf, deltaSync+ds
 			}
 		}
 	}
@@ -450,6 +453,8 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		"maintenanceInFlight": t.inFlight.Load(), "mismatches": t.mismatches.Load(),
 		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
 		"heapScannedMB": float64(scanned) / 1e6, "heapMovedMB": float64(moved) / 1e6,
+		"heapSyncs": syncs, "heapSyncKBAvg": float64(syncBytes) / 1e3 / float64(max(syncs, 1)),
+		"heapFsyncMsAvg": float64(heapFsync) / 1e6 / float64(max(syncs, 1)), "heapDeltaMsAvg": float64(deltaSync) / 1e6 / float64(max(syncs, 1)),
 	})
 	return b
 }

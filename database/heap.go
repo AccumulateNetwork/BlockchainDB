@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // HeapStore is the dynamic layer as an append-and-clean heap (proposal
@@ -72,6 +73,7 @@ type HeapStore struct {
 	touched   map[[32]byte]struct{}
 	release   []int
 	snapshots int
+	syncedTo  int64 // The append point at the last sync
 
 	closed    bool
 	liveBytes int64 // Capacity of every named slot
@@ -79,6 +81,9 @@ type HeapStore struct {
 	putTotal, putInPlace, putAppend atomic.Uint64
 	lookups, hits                   atomic.Uint64
 	cleanedBytes, movedBytes        atomic.Uint64
+	// The sync's cost, split: nanoseconds in the heap's fsync and in
+	// the delta's write and fsync, and the syncs and bytes they covered
+	syncs, syncHeapNs, syncLogNs, syncBytes atomic.Uint64
 }
 
 // region is the accounting for one HeapRegionBytes of the heap.
@@ -170,7 +175,7 @@ func (h *HeapStore) Open() (err error) {
 	h.index = map[[32]byte]slot{}
 	h.touched = map[[32]byte]struct{}{}
 	h.closed = false
-	h.size, h.liveBytes, h.regions, h.release = 0, 0, nil, nil
+	h.size, h.liveBytes, h.regions, h.release, h.syncedTo = 0, 0, nil, nil, 0
 	if err = h.loadSnapshot(); err != nil {
 		return err
 	}
@@ -322,6 +327,7 @@ type heapSync struct {
 	h       *HeapStore
 	delta   []byte
 	release []int
+	bytes   int64 // Appended since the last sync: what the heap's fsync covers
 }
 
 // beginBlockSync takes the block's delta under the lock; finish makes
@@ -332,7 +338,8 @@ func (h *HeapStore) beginBlockSync() (blockSync, error) {
 	if h.closed || h.file == nil {
 		return nil, errStoreClosed
 	}
-	p := &heapSync{h: h, release: h.release}
+	p := &heapSync{h: h, release: h.release, bytes: h.size - h.syncedTo}
+	h.syncedTo = h.size
 	h.release = nil
 	if len(h.touched) > 0 || len(p.release) > 0 {
 		p.delta = h.encodeDelta()
@@ -372,15 +379,21 @@ func (p *heapSync) finish() error {
 	if p.delta == nil {
 		return nil
 	}
+	t := time.Now()
 	if err := fsync(h.file); err != nil {
 		return err
 	}
+	h.syncHeapNs.Add(uint64(time.Since(t)))
+	t = time.Now()
 	if _, err := h.log.Write(p.delta); err != nil {
 		return err
 	}
 	if err := fsync(h.log); err != nil {
 		return err
 	}
+	h.syncLogNs.Add(uint64(time.Since(t)))
+	h.syncs.Add(1)
+	h.syncBytes.Add(uint64(p.bytes))
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, r := range p.release {
@@ -660,7 +673,7 @@ func (h *HeapStore) deriveExtent() error {
 		}
 		h.regions[r].live += int64(s.cap)
 	}
-	h.size = end
+	h.size, h.syncedTo = end, end
 	if err := h.file.Truncate(end); err != nil {
 		return err
 	}
@@ -705,6 +718,13 @@ func (h *HeapStore) HoleRatio() (dead, live int64) {
 		dead += r.dead
 	}
 	return dead, h.liveBytes
+}
+
+// SyncCost reports the block syncs so far: how many, the bytes their
+// heap fsyncs covered, and the time spent in the heap's fsync and in
+// the delta's write and fsync.
+func (h *HeapStore) SyncCost() (syncs, bytes uint64, heapFsync, delta time.Duration) {
+	return h.syncs.Load(), h.syncBytes.Load(), time.Duration(h.syncHeapNs.Load()), time.Duration(h.syncLogNs.Load())
 }
 
 // Cleaned reports what the cleaner has scanned and what it had to
