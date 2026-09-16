@@ -533,9 +533,12 @@ func (h *HeapStore) reserve(mover bool, size int64) (hf *heapFile, off int64, er
 	hf.size += size
 	hf.live += size
 	h.liveBytes += size
-	h.dirty[hf.id] = hf
 	if mover {
+		// The pass syncs its own file; the block's sync must never
+		// capture it as dirty, or the block waits for the copies
 		hf.inflight++
+	} else {
+		h.dirty[hf.id] = hf
 	}
 	return hf, off, nil
 }
@@ -835,8 +838,8 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	// 3. Under the lock, a chunk of entries at a time: decide what is
 	// live and reserve each copy's slot in the mover's file.  A pass
 	// walks up to a million entries; taking the lock per chunk keeps
-	// each hold to a millisecond or so.  The mover's files leave the
-	// dirty set, since the pass syncs them itself
+	// each hold to a millisecond or so.  A block sync may begin
+	// between chunks; the mover's file is never in its dirty set
 	var moves []heapMove
 	var copied int64
 	for i, hf := range taken {
@@ -864,16 +867,13 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	for _, hf := range taken {
 		hf.cleaning = false
 	}
+	h.mu.Unlock()
 	var movFiles []*heapFile
 	for _, m := range moves {
 		if len(movFiles) == 0 || movFiles[len(movFiles)-1] != m.hf {
 			movFiles = append(movFiles, m.hf)
 		}
 	}
-	for _, hf := range movFiles {
-		delete(h.dirty, hf.id)
-	}
-	h.mu.Unlock()
 	// The copies' bytes are laid out outside the lock
 	for i := range moves {
 		m := &moves[i]
