@@ -771,8 +771,13 @@ type heapMove struct {
 	key      [32]byte
 	from, to slot
 	hf       *heapFile
+	height   uint64 // The block the copy is written as
+	value    []byte
 	entry    []byte
 }
+
+// heapPlanChunk is how many entries a pass plans per lock hold.
+const heapPlanChunk = 4096
 
 // clean is the mover: it takes the files with the most dead bytes --
 // once HeapCleanRatio of each is dead, or the deadest whatever its
@@ -827,24 +832,35 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 		entries[i] = decodeFile(buf)
 		h.cleanedBytes.Add(uint64(hf.size))
 	}
-	// 3. Under the lock: decide what is live and reserve each copy's
-	// slot in the mover's file; the mover's files leave the dirty set,
-	// since the pass syncs them itself
-	h.mu.Lock()
+	// 3. Under the lock, a chunk of entries at a time: decide what is
+	// live and reserve each copy's slot in the mover's file.  A pass
+	// walks up to a million entries; taking the lock per chunk keeps
+	// each hold to a millisecond or so.  The mover's files leave the
+	// dirty set, since the pass syncs them itself
 	var moves []heapMove
 	var copied int64
 	for i, hf := range taken {
-		m, n, err := h.planFile(hf, entries[i], budget-copied)
-		if err != nil {
+		for at := 0; at < len(entries[i]) && copied < budget; at += heapPlanChunk {
+			end := at + heapPlanChunk
+			if end > len(entries[i]) {
+				end = len(entries[i])
+			}
+			h.mu.Lock()
+			m, n, err := h.planFile(hf, entries[i][at:end], budget-copied)
 			h.mu.Unlock()
-			return false, err
-		}
-		moves = append(moves, m...)
-		copied += n
-		if copied >= budget {
-			break
+			if err != nil {
+				h.mu.Lock()
+				for _, hf := range taken {
+					hf.cleaning = false
+				}
+				h.mu.Unlock()
+				return false, err
+			}
+			moves = append(moves, m...)
+			copied += n
 		}
 	}
+	h.mu.Lock()
 	for _, hf := range taken {
 		hf.cleaning = false
 	}
@@ -858,6 +874,11 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 		delete(h.dirty, hf.id)
 	}
 	h.mu.Unlock()
+	// The copies' bytes are laid out outside the lock
+	for i := range moves {
+		m := &moves[i]
+		m.entry = encodeEntry(m.height, m.key, m.value)
+	}
 	// 4. Without the lock: write the copies and make them durable
 	fail := func(err error) (bool, error) {
 		h.mu.Lock()
@@ -971,7 +992,7 @@ func (h *HeapStore) planFile(hf *heapFile, entries []heapEntry, budget int64) (m
 		ns := slot{file: to.id, off: uint32(off), n: uint32(len(e.value)), block: h.height}
 		// The copy is this block's write of the key: it carries this
 		// height, so a repair scan prefers it to the original
-		moves = append(moves, heapMove{key: e.key, from: s, to: ns, hf: to, entry: encodeEntry(h.height, e.key, e.value)})
+		moves = append(moves, heapMove{key: e.key, from: s, to: ns, hf: to, height: h.height, value: e.value})
 		copied += e.size
 	}
 	return moves, copied, nil
