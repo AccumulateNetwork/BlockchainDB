@@ -135,6 +135,15 @@ func (s *samples) add(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// addAll takes a block's worth of samples under one lock: forty
+// thousand reads a block, nine stores, made the recorder's lock a
+// fifth of the benchmark's CPU.
+func (s *samples) addAll(v []time.Duration) {
+	s.mu.Lock()
+	s.v = append(s.v, v...)
+	s.mu.Unlock()
+}
+
 func (s *samples) take() []time.Duration {
 	s.mu.Lock()
 	v := s.v
@@ -209,6 +218,8 @@ type store struct {
 	last        map[[32]byte][]byte
 	height      uint64
 	phase       uint64 // Blocks this store's maintenance cadence is offset by
+	// A block's samples, handed to the tallies once per block
+	dynaT, permT, readT []time.Duration
 	maintaining atomic.Bool
 	maintWG     sync.WaitGroup
 }
@@ -257,6 +268,12 @@ func openStore(c config, id int) (*store, error) {
 func (s *store) block(c config, t *tallies) error {
 	s.height++
 	start := time.Now()
+	s.dynaT, s.permT, s.readT = s.dynaT[:0], s.permT[:0], s.readT[:0]
+	defer func() {
+		t.dynaPut.addAll(s.dynaT)
+		t.permPut.addAll(s.permT)
+		t.readT.addAll(s.readT)
+	}()
 	for i := 0; i < c.dynaPuts; i++ {
 		r := float64(s.rnd.UintN(1<<20)) / (1 << 20)
 		k := s.hot[int(r*r*float64(c.hotKeys))%c.hotKeys]
@@ -265,7 +282,7 @@ func (s *store) block(c config, t *tallies) error {
 		if err := s.kv.PutDyna(k, v); err != nil {
 			return fmt.Errorf("store %d PutDyna: %w", s.id, err)
 		}
-		t.dynaPut.add(time.Since(at))
+		s.dynaT = append(s.dynaT, time.Since(at))
 		if len(s.last) < checked || s.last[k] != nil {
 			s.last[k] = v
 		}
@@ -277,7 +294,7 @@ func (s *store) block(c config, t *tallies) error {
 		if err := s.kv.PutPerm(k, v); err != nil {
 			return fmt.Errorf("store %d PutPerm: %w", s.id, err)
 		}
-		t.permPut.add(time.Since(at))
+		s.permT = append(s.permT, time.Since(at))
 		if len(s.permKeys) < permSample {
 			s.permKeys = append(s.permKeys, k)
 		} else if s.rnd.UintN(64) == 0 { // Keep the sample spread across every age
@@ -298,7 +315,7 @@ func (s *store) block(c config, t *tallies) error {
 		}
 		at := time.Now()
 		v, err := get(k)
-		t.readT.add(time.Since(at))
+		s.readT = append(s.readT, time.Since(at))
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "not found") {
 			return fmt.Errorf("store %d read: %w", s.id, err)
 		}
