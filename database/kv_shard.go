@@ -82,6 +82,13 @@ type KVShard struct {
 	// found" for data that is on disk.
 	Shards []*KV2
 
+	// Maintenance in rotation (Compress): the height last sealed, the
+	// height at the last call, and the shard next in line
+	maintMu   sync.Mutex
+	sealed    uint64
+	maintAt   uint64
+	maintNext int
+
 	// Sets holds the finalized Perm data that has left the shards: one
 	// block-set file per completed set of blocks, packed from every
 	// shard's merged segment (blockset.go).  Each shard's Perm layer
@@ -102,6 +109,9 @@ func (k *KVShard) attachSets() (err error) {
 	for i, shard := range k.Shards {
 		if shard == nil || shard.PermKV == nil {
 			continue
+		}
+		if shard.PermKV == nil {
+			continue // A file-backed permanent layer keeps its own deep history
 		}
 		if err = shard.PermKV.attachCold(shardSets{k.Sets, i}); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
@@ -169,6 +179,7 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 			return nil, err
 		}
 	}
+	kVShard.phaseSnapshots()
 	kVShard.useSharedBlockRecord()
 	if err = kVShard.adoptBlockHeight(); err != nil {
 		return nil, err
@@ -195,6 +206,9 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 	// again, which commits and retires them
 	if newest, ok := kVShard.Sets.Newest(); ok {
 		for i, shard := range kVShard.Shards {
+			if shard.PermKV == nil {
+				continue
+			}
 			if _, err = shard.PermKV.DropBelow(newest.Last + 1); err != nil {
 				return nil, fmt.Errorf("shard %d: %w", i, err)
 			}
@@ -227,7 +241,34 @@ func NewKVShard(directory string, sealLimit uint64) (kvs *KVShard, err error) {
 //
 // How many to ask for is a question about rate, not about size; see
 // DefaultNumShards.
+// NewKVShardHeapN is NewKVShardN with every shard's dynamic layer a
+// heap with holes (heap.go).
+func NewKVShardHeapN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2Heap)
+}
+
+// NewKVShardFilesN is NewKVShardN with both layers as files of entries
+// (heap.go, perm.go).
+func NewKVShardFilesN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2Files)
+}
+
 func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, err error) {
+	return newKVShardN(directory, shards, sealLimit, NewKV2)
+}
+
+// phaseSnapshots spreads the heap shards' key-map snapshots over the
+// snapshot period, so that a store's shards do not all write theirs
+// on the same block.
+func (k *KVShard) phaseSnapshots() {
+	for i, shard := range k.Shards {
+		if shard.Heap != nil {
+			shard.Heap.SetSnapshotPhase(uint64(i) * HeapSnapshotBlocks / uint64(len(k.Shards)))
+		}
+	}
+}
+
+func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(string, uint64) (*KV2, error)) (kvs *KVShard, err error) {
 	if shards < 1 {
 		return nil, fmt.Errorf("a database needs at least one shard, asked for %d", shards)
 	}
@@ -241,10 +282,11 @@ func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, 
 	kvs.Shards = make([]*KV2, shards)
 	for i := range kvs.Shards { // Then create all the shards
 		shardDir := kvs.ShardDir(i)
-		if kvs.Shards[i], err = NewKV2(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
+		if kvs.Shards[i], err = newShard(shardDir, sealLimit); err != nil { // Create the KV2 for each shard
 			return nil, err
 		}
 	}
+	kvs.phaseSnapshots()
 	kvs.useSharedBlockRecord()
 	if kvs.Sets, err = NewSetStore(kvs.setDir()); err != nil {
 		return nil, err
@@ -446,6 +488,9 @@ func (k *KVShard) writeBlockHeight(height uint64) (err error) {
 // with the block it belongs to
 func (k *KVShard) adoptBlockHeight() error {
 	height, err := k.readBlockHeight()
+	k.maintMu.Lock()
+	k.sealed = height
+	k.maintMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -457,10 +502,10 @@ func (k *KVShard) adoptBlockHeight() error {
 			continue
 		}
 		if shard.PermKV != nil {
-			shard.PermKV.AdvanceBlock(height)
+			shard.perm().AdvanceBlock(height)
 		}
 		if shard.DynaKV != nil { // So that its window is where the set's is
-			shard.DynaKV.AdvanceBlock(height)
+			shard.dyna().AdvanceBlock(height)
 		}
 	}
 	return nil
@@ -471,7 +516,9 @@ func (k *KVShard) adoptBlockHeight() error {
 func (k *KVShard) useSharedBlockRecord() {
 	for _, shard := range k.Shards {
 		if shard != nil && shard.PermKV != nil {
-			shard.PermKV.ExternalBlockRecord = true
+			if shard.PermKV != nil {
+				shard.PermKV.ExternalBlockRecord = true
+			}
 		}
 	}
 }
@@ -519,7 +566,13 @@ func (k *KVShard) SealBlock(height uint64) (err error) {
 			return err
 		}
 	}
-	return k.writeBlockHeight(height + 1)
+	if err = k.writeBlockHeight(height + 1); err != nil {
+		return err
+	}
+	k.maintMu.Lock()
+	k.sealed = height + 1
+	k.maintMu.Unlock()
+	return nil
 }
 
 // MergeFinalized
@@ -592,6 +645,19 @@ func (k *KVShard) MergeFinalized(height uint64) (mergedShards int, err error) {
 // pack is done, and whichever of the two lands first, the drop that
 // follows removes what the set holds.
 func (k *KVShard) PackFinalized(height uint64) (meta SetMeta, packed bool, err error) {
+	// A file-backed permanent layer packs within the shard: its
+	// buckets retire into one run of keys, no bodies, no set file
+	if len(k.Shards) > 0 && k.Shards[0].Perm != nil {
+		for i, shard := range k.Shards {
+			if err = shard.Open(); err != nil {
+				return meta, false, fmt.Errorf("shard %d: %w", i, err)
+			}
+			if err = shard.Perm.Pack(); err != nil {
+				return meta, false, fmt.Errorf("shard %d: %w", i, err)
+			}
+		}
+		return meta, true, nil
+	}
 	// One pack at a time.  Every guard in here and below is a
 	// check-then-act on state another pack can change: two calls read
 	// the same watermark and pack the same segments into overlapping
@@ -704,16 +770,22 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 		dst.HistorySegments += s.HistorySegments
 		dst.ActiveSegments += s.ActiveSegments
 		dst.ResidentBloomBytes += s.ResidentBloomBytes
+		dst.ResidentIndexBytes += s.ResidentIndexBytes
+		dst.HeapFiles += s.HeapFiles
+		dst.HeapLiveBytes += s.HeapLiveBytes
+		dst.HeapDeadBytes += s.HeapDeadBytes
+		dst.HeapScannedBytes += s.HeapScannedBytes
+		dst.HeapMovedBytes += s.HeapMovedBytes
 	}
 	for _, shard := range k.Shards {
 		if shard == nil {
 			continue
 		}
 		if shard.PermKV != nil {
-			add(&perm, shard.PermKV.Stats())
+			add(&perm, shard.perm().Stats())
 		}
-		if shard.DynaKV != nil {
-			add(&dyna, shard.DynaKV.Stats())
+		if shard.Heap != nil || shard.DynaKV != nil {
+			add(&dyna, shard.dyna().Stats())
 		}
 	}
 	return perm, dyna
@@ -722,11 +794,59 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {
-	for i, kvs := range k.Shards {
-		if err = kvs.Open(); err != nil {
+	if len(k.Shards) > 0 {
+		if err = k.Shards[0].Open(); err != nil {
+			return fmt.Errorf("shard 0: %w", err)
+		}
+	}
+	if len(k.Shards) == 0 || k.Shards[0].Heap == nil {
+		// Segment-store shards: a bounded pass on every shard, as before
+		for i, kvs := range k.Shards {
+			if err = kvs.Open(); err != nil {
+				return fmt.Errorf("shard %d: %w", i, err)
+			}
+			if err = kvs.Compress(); err != nil {
+				return fmt.Errorf("shard %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	// Heap shards: one slice of the store's maintenance, sized by the
+	// blocks since the last call.  The store's mover rate is
+	// HeapStoreCleanBytes per HeapCleanPeriod blocks; a call takes the
+	// shards next in rotation, as many as the elapsed blocks earn, each
+	// with its share of what those blocks earned.  Called every
+	// HeapCleanPeriod blocks it moves the whole budget over every
+	// shard; called every block it moves a little on the next shard,
+	// and the copies reach the device as a trickle rather than every
+	// shard's pass at once -- which, at nine stores in lockstep, was
+	// 300 MB and 72 barriers in one second, and queued the seals'
+	// fsyncs behind them for the next four.  A hundred shards spread
+	// the same rate a hundred ways, and each call locks one.
+	k.maintMu.Lock()
+	n := len(k.Shards)
+	elapsed := k.sealed - k.maintAt
+	if k.maintAt == 0 || elapsed > HeapCleanPeriod {
+		elapsed = HeapCleanPeriod
+	}
+	k.maintAt = k.sealed
+	due := int(uint64(n) * elapsed / HeapCleanPeriod)
+	if due < 1 {
+		due = 1
+	}
+	if due > n {
+		due = n
+	}
+	budget := HeapStoreCleanBytes * int64(elapsed) / int64(HeapCleanPeriod) / int64(due)
+	start := k.maintNext
+	k.maintNext = (start + due) % n
+	k.maintMu.Unlock()
+	for j := 0; j < due; j++ {
+		i := (start + j) % n
+		if err = k.Shards[i].Open(); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
-		if err = kvs.Compress(); err != nil {
+		if err = k.Shards[i].compress(budget); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
 	}

@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/csv"
 	"encoding/json"
@@ -64,6 +65,9 @@ type config struct {
 	seed          uint64
 	pprof         string
 	http          string
+	dynaHeap      bool
+	permFiles     bool
+	phase         bool
 }
 
 //go:embed live.html
@@ -91,6 +95,9 @@ func parseFlags() (config, error) {
 	flag.Uint64Var(&c.seed, "seed", 1, "random seed")
 	flag.StringVar(&c.pprof, "pprof", "", "serve net/http/pprof on this address (e.g. 127.0.0.1:6061)")
 	flag.StringVar(&c.http, "http", "127.0.0.1:8098", "serve the live page and the run's files here; empty disables")
+	flag.BoolVar(&c.dynaHeap, "dyna-heap", false, "dynamic layer as a heap with holes (proposal 2026-09-16) instead of sealed segments")
+	flag.BoolVar(&c.permFiles, "perm-files", false, "both layers as files of entries: the heap and the permanent layer with buckets of keys (implies -dyna-heap)")
+	flag.BoolVar(&c.phase, "maintenance-phase", false, "offset each store's maintenance cadence by its share of the period, so stores in lockstep do not all maintain at once")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return c, fmt.Errorf("unexpected arguments: %q", flag.Args())
@@ -129,6 +136,15 @@ func (s *samples) add(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// addAll takes a block's worth of samples under one lock: forty
+// thousand reads a block, nine stores, made the recorder's lock a
+// fifth of the benchmark's CPU.
+func (s *samples) addAll(v []time.Duration) {
+	s.mu.Lock()
+	s.v = append(s.v, v...)
+	s.mu.Unlock()
+}
+
 func (s *samples) take() []time.Duration {
 	s.mu.Lock()
 	v := s.v
@@ -149,10 +165,23 @@ func pct(sorted []time.Duration, p float64) time.Duration {
 func ms(d time.Duration) string { return strconv.FormatFloat(float64(d)/1e6, 'f', 1, 64) }
 func us(d time.Duration) string { return strconv.FormatInt(int64(d/time.Microsecond), 10) }
 
+// recent is one block as the live page sees it: when it ended and
+// what it and its seal cost.
+type recent struct {
+	at          time.Time
+	block, seal time.Duration
+	store       int
+}
+
 // tallies is what every store adds to and the report takes from.
 type tallies struct {
 	blockTimes, sealTimes, dynaPut, permPut, readT samples
 	blocks, over, mismatches                       atomic.Uint64
+	inFlight                                       atomic.Int64 // Maintenance passes running now
+
+	ringMu sync.Mutex
+	ring   [1024]recent // The last blocks, for the live state
+	ringN  uint64
 
 	mu      sync.Mutex
 	passes  map[string]int
@@ -188,10 +217,13 @@ type store struct {
 	// A few hot keys are checked on read: the value the store returns
 	// must be the value last written.  A platform that only times
 	// answers cannot tell a fast wrong answer from a fast right one.
-	last        map[[32]byte][]byte
-	height      uint64
-	maintaining atomic.Bool
-	maintWG     sync.WaitGroup
+	last   map[[32]byte][]byte
+	height uint64
+	phase  uint64 // Blocks this store's maintenance cadence is offset by
+	// A block's samples, handed to the tallies once per block
+	dynaT, permT, readT []time.Duration
+	maintaining         atomic.Bool
+	maintWG             sync.WaitGroup
 }
 
 const (
@@ -201,7 +233,14 @@ const (
 
 func openStore(c config, id int) (*store, error) {
 	dir := filepath.Join(c.dir, fmt.Sprintf("store-%d", id))
-	kv, err := blockchainDB.NewKVShardN(dir, c.shards, c.sealLimit)
+	open := blockchainDB.NewKVShardN
+	if c.dynaHeap {
+		open = blockchainDB.NewKVShardHeapN
+	}
+	if c.permFiles {
+		open = blockchainDB.NewKVShardFilesN
+	}
+	kv, err := open(dir, c.shards, c.sealLimit)
 	if err != nil {
 		return nil, fmt.Errorf("open store %d: %w", id, err)
 	}
@@ -215,6 +254,9 @@ func openStore(c config, id int) (*store, error) {
 	}
 	s := &store{id: id, kv: kv, rnd: blockchainDB.NewFastRandom(seed), hot: make([][32]byte, c.hotKeys),
 		permKeys: make([][32]byte, 0, permSample), last: make(map[[32]byte][]byte, checked)}
+	if c.phase && c.compressEvery > 0 {
+		s.phase = uint64(id) * c.compressEvery / uint64(c.stores)
+	}
 	// Hot dynamic keys are rewritten with a skew (index = hot * r^2, so
 	// the low indexes take most writes); permanent keys are always new,
 	// and a bounded sample of them, across all ages, is what the
@@ -228,6 +270,12 @@ func openStore(c config, id int) (*store, error) {
 func (s *store) block(c config, t *tallies) error {
 	s.height++
 	start := time.Now()
+	s.dynaT, s.permT, s.readT = s.dynaT[:0], s.permT[:0], s.readT[:0]
+	defer func() {
+		t.dynaPut.addAll(s.dynaT)
+		t.permPut.addAll(s.permT)
+		t.readT.addAll(s.readT)
+	}()
 	for i := 0; i < c.dynaPuts; i++ {
 		r := float64(s.rnd.UintN(1<<20)) / (1 << 20)
 		k := s.hot[int(r*r*float64(c.hotKeys))%c.hotKeys]
@@ -236,19 +284,19 @@ func (s *store) block(c config, t *tallies) error {
 		if err := s.kv.PutDyna(k, v); err != nil {
 			return fmt.Errorf("store %d PutDyna: %w", s.id, err)
 		}
-		t.dynaPut.add(time.Since(at))
+		s.dynaT = append(s.dynaT, time.Since(at))
 		if len(s.last) < checked || s.last[k] != nil {
 			s.last[k] = v
 		}
 	}
 	for i := 0; i < c.permPuts; i++ {
 		k := s.rnd.NextHash()
-		v := s.rnd.RandBuff(c.valueMin, c.valueMax)
+		v := permValue(k, c.valueMin, c.valueMax)
 		at := time.Now()
 		if err := s.kv.PutPerm(k, v); err != nil {
 			return fmt.Errorf("store %d PutPerm: %w", s.id, err)
 		}
-		t.permPut.add(time.Since(at))
+		s.permT = append(s.permT, time.Since(at))
 		if len(s.permKeys) < permSample {
 			s.permKeys = append(s.permKeys, k)
 		} else if s.rnd.UintN(64) == 0 { // Keep the sample spread across every age
@@ -259,19 +307,31 @@ func (s *store) block(c config, t *tallies) error {
 	for i := 0; i < c.reads; i++ {
 		var k [32]byte
 		var get func([32]byte) ([]byte, error)
+		perm := false
 		switch pick := s.rnd.UintN(6); {
 		case pick < 3:
 			k, get = s.hot[int(s.rnd.UintN(uint(c.hotKeys)))], s.kv.GetDyna
 		case pick < 5 && len(s.permKeys) > 0:
-			k, get = s.permKeys[int(s.rnd.UintN(uint(len(s.permKeys))))], s.kv.GetPerm
+			// A permanent key of any age, through the deep read the
+			// adapter uses for anything older than the window (Get
+			// answers the permanent layer's window only, by design)
+			k, get, perm = s.permKeys[int(s.rnd.UintN(uint(len(s.permKeys))))], s.kv.GetDeep, true
 		default:
 			k, get = s.rnd.NextHash(), s.kv.Get
 		}
 		at := time.Now()
 		v, err := get(k)
-		t.readT.add(time.Since(at))
+		s.readT = append(s.readT, time.Since(at))
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "not found") {
 			return fmt.Errorf("store %d read: %w", s.id, err)
+		}
+		// A permanent key that was written must come back, with the
+		// value its key derives; a checked hot key must come back as
+		// last written.  A platform that only times answers cannot
+		// tell a fast wrong answer, or a fast "not found", from a
+		// right one.
+		if perm && (err != nil || !bytes.Equal(v, permValue(k, c.valueMin, c.valueMax))) {
+			t.mismatches.Add(1)
 		}
 		if want, ok := s.last[k]; ok && err == nil && string(v) != string(want) {
 			t.mismatches.Add(1)
@@ -281,16 +341,21 @@ func (s *store) block(c config, t *tallies) error {
 	if err := s.kv.SealBlock(s.height); err != nil {
 		return fmt.Errorf("store %d SealBlock: %w", s.id, err)
 	}
-	t.sealTimes.add(time.Since(at))
+	sealTook := time.Since(at)
+	t.sealTimes.add(sealTook)
 	took := time.Since(start)
 	t.blockTimes.add(took)
 	t.blocks.Add(1)
+	t.ringMu.Lock()
+	t.ring[t.ringN%uint64(len(t.ring))] = recent{at: time.Now(), block: took, seal: sealTook, store: s.id}
+	t.ringN++
+	t.ringMu.Unlock()
 	if took > c.interval {
 		t.over.Add(1)
 	} else {
 		time.Sleep(c.interval - took)
 	}
-	if c.compressEvery > 0 && s.height%c.compressEvery == 0 {
+	if c.compressEvery > 0 && (s.height+s.phase)%c.compressEvery == 0 {
 		s.maintain(c, t)
 	}
 	return nil
@@ -307,9 +372,11 @@ func (s *store) maintain(c config, t *tallies) {
 	}
 	height := s.height
 	s.maintWG.Add(1)
+	t.inFlight.Add(1)
 	go func() {
 		defer s.maintWG.Done()
 		defer s.maintaining.Store(false)
+		defer t.inFlight.Add(-1)
 		at := time.Now()
 		err := s.kv.Compress()
 		t.note("compress", time.Since(at))
@@ -353,6 +420,8 @@ func procIO() (read, write uint64) {
 	return
 }
 
+// dirSize counts the bytes the files occupy, not their apparent size:
+// a heap releases regions with punched holes and keeps its length.
 func dirSize(dir string) (files int, bytes int64) {
 	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -360,11 +429,138 @@ func dirSize(dir string) (files int, bytes int64) {
 		}
 		if info, err := d.Info(); err == nil {
 			files++
-			bytes += info.Size()
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				bytes += st.Blocks * 512
+			} else {
+				bytes += info.Size()
+			}
 		}
 		return nil
 	})
 	return
+}
+
+// liveState is what the page shows between report rows: the last ten
+// seconds of blocks and seals, and the run's running totals.  Written
+// to live.json every two seconds.
+func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
+	t.ringMu.Lock()
+	cut := time.Now().Add(-10 * time.Second)
+	var bt, st []time.Duration
+	var perStore [][]time.Duration
+	n := t.ringN
+	if n > uint64(len(t.ring)) {
+		n = uint64(len(t.ring))
+	}
+	for i := uint64(0); i < n; i++ {
+		r := t.ring[(t.ringN-1-i)%uint64(len(t.ring))]
+		if r.at.Before(cut) {
+			break
+		}
+		bt = append(bt, r.block)
+		st = append(st, r.seal)
+		for len(perStore) <= r.store {
+			perStore = append(perStore, nil)
+		}
+		perStore[r.store] = append(perStore[r.store], r.seal)
+	}
+	t.ringMu.Unlock()
+	// Each store's seal p90 over the same window: a tail that is one
+	// store's looks different from a tail every store shares
+	storeP90 := make([]float64, len(perStore))
+	for i, v := range perStore {
+		sort.Slice(v, func(a, b int) bool { return v[a] < v[b] })
+		storeP90[i] = float64(pct(v, .9)) / 1e6
+	}
+	sort.Slice(bt, func(i, j int) bool { return bt[i] < bt[j] })
+	sort.Slice(st, func(i, j int) bool { return st[i] < st[j] })
+	over := 0
+	for _, d := range bt {
+		if d > c.interval {
+			over++
+		}
+	}
+	var height uint64
+	hs := sumHeap(stores)
+	holes, live, scanned, moved, syncs, syncBytes, heapFsync, deltaSync := hs.holes, hs.live, hs.scanned, hs.moved, hs.syncs, hs.bytes, hs.fsync, hs.delta
+	var permMerges, permFolds, permPacks, permIndexBytes uint64
+	for _, s := range stores {
+		if s.height > height {
+			height = s.height
+		}
+		for _, sh := range s.kv.Shards {
+			if sh.Perm != nil {
+				m, f, pk, ib := sh.Perm.Counters()
+				permMerges, permFolds, permPacks, permIndexBytes = permMerges+m, permFolds+f, permPacks+pk, permIndexBytes+ib
+			}
+		}
+	}
+	b, _ := json.Marshal(map[string]any{
+		"elapsedSec": int(time.Since(start).Seconds()), "blocks": t.blocks.Load(), "height": height,
+		"last10s": map[string]any{"blocks": len(bt), "over": over,
+			"blockP50ms": float64(pct(bt, .5)) / 1e6, "blockP90ms": float64(pct(bt, .9)) / 1e6, "blockMaxMs": float64(pct(bt, 1)) / 1e6,
+			"sealP50ms": float64(pct(st, .5)) / 1e6, "sealP90ms": float64(pct(st, .9)) / 1e6, "sealMaxMs": float64(pct(st, 1)) / 1e6,
+			"storeSealP90ms": storeP90},
+		"maintenanceInFlight": t.inFlight.Load(), "mismatches": t.mismatches.Load(),
+		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
+		"heapScannedMB": float64(scanned) / 1e6, "heapMovedMB": float64(moved) / 1e6,
+		"heapSyncs": syncs, "heapSyncKBAvg": float64(syncBytes) / 1e3 / float64(max(syncs, 1)),
+		"permMerges": permMerges, "permFolds": permFolds, "permPacks": permPacks, "permIndexMB": float64(permIndexBytes) / 1e6,
+		"heapFsyncMsAvg": float64(heapFsync) / 1e6 / float64(max(syncs, 1)), "heapDeltaMsAvg": float64(deltaSync) / 1e6 / float64(max(syncs, 1)),
+		"heapReleases": hs.releases, "heapReleaseMs": hs.release.Milliseconds(), "heapSnapshots": hs.snapshots, "heapSnapshotMs": hs.snapshot.Milliseconds(),
+	})
+	return b
+}
+
+// heapSplit sums the heap layer's counters across the stores: the
+// mover's and the sync's cost, cumulative since the start.
+type heapSplit struct {
+	holes, live                  int64
+	scanned, moved, syncs, bytes uint64
+	fsync, delta                 time.Duration
+	releases, snapshots          uint64
+	release, snapshot            time.Duration
+}
+
+func (a heapSplit) minus(b heapSplit) heapSplit {
+	return heapSplit{holes: a.holes, live: a.live,
+		scanned: a.scanned - b.scanned, moved: a.moved - b.moved, syncs: a.syncs - b.syncs, bytes: a.bytes - b.bytes,
+		fsync: a.fsync - b.fsync, delta: a.delta - b.delta, releases: a.releases - b.releases, snapshots: a.snapshots - b.snapshots,
+		release: a.release - b.release, snapshot: a.snapshot - b.snapshot}
+}
+
+func sumHeap(stores []*store) (hs heapSplit) {
+	for _, s := range stores {
+		for _, sh := range s.kv.Shards {
+			if sh.Heap == nil {
+				continue
+			}
+			h, l := sh.Heap.HoleRatio()
+			hs.holes, hs.live = hs.holes+h, hs.live+l
+			sc, mv := sh.Heap.Cleaned()
+			hs.scanned, hs.moved = hs.scanned+sc, hs.moved+mv
+			n, b, hf, ds := sh.Heap.SyncCost()
+			hs.syncs, hs.bytes, hs.fsync, hs.delta = hs.syncs+n, hs.bytes+b, hs.fsync+hf, hs.delta+ds
+			r, rt, sn, st := sh.Heap.MoverCost()
+			hs.releases, hs.release, hs.snapshots, hs.snapshot = hs.releases+r, hs.release+rt, hs.snapshots+sn, hs.snapshot+st
+		}
+	}
+	return hs
+}
+
+// permValue is the value a permanent key carries: derived from the
+// key, so that any read of the key can be checked without remembering
+// what was written.  Its length spreads over [min, max] by the key.
+func permValue(k [32]byte, min, max uint) []byte {
+	n := int(min)
+	if max > min {
+		n += int(k[31]) * int(max-min) / 255
+	}
+	v := make([]byte, n)
+	for i := 0; i < n; i += len(k) {
+		copy(v[i:], k[:])
+	}
+	return v
 }
 
 func fail(what string, err error) {
@@ -406,7 +602,7 @@ func main() {
 		"dir": c.dir, "stores": c.stores, "duration": c.duration.String(), "interval": c.interval.String(), "shards": c.shards,
 		"sealLimit": c.sealLimit, "window": c.window, "compressEvery": c.compressEvery, "packEvery": c.packEvery,
 		"dynaPuts": c.dynaPuts, "permPuts": c.permPuts, "reads": c.reads, "hotKeys": c.hotKeys,
-		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "started": time.Now().UTC().Format(time.RFC3339),
+		"valueMin": c.valueMin, "valueMax": c.valueMax, "seed": c.seed, "dynaHeap": c.dynaHeap || c.permFiles, "permFiles": c.permFiles, "maintenancePhase": c.phase, "started": time.Now().UTC().Format(time.RFC3339),
 	}, "", "  ")
 	if err := os.WriteFile(filepath.Join(c.dir, "run.json"), runJSON, 0o644); err != nil {
 		fail("run.json", err)
@@ -439,7 +635,9 @@ func main() {
 	_ = csvw.Write([]string{"minute", "blocks", "over_budget", "block_p50_ms", "block_p90_ms", "block_max_ms",
 		"seal_p50_ms", "seal_p90_ms", "seal_max_ms", "dyna_put_p99_us", "perm_put_p99_us", "read_p99_us",
 		"compress_passes", "compress_s", "merge_passes", "merge_s", "pack_passes", "pack_s", "skipped",
-		"read_MBps", "write_MBps", "store_MB", "files", "perm_history", "dyna_history", "bloom_MB", "mismatches"})
+		"read_MBps", "write_MBps", "store_MB", "files", "perm_history", "dyna_history", "bloom_MB", "mismatches",
+		"heap_syncs", "heap_fsync_ms_avg", "heap_sync_MB_avg", "heap_moved_MB", "heap_hole_MB", "heap_live_MB",
+		"heap_releases", "heap_release_ms", "heap_snapshots", "heap_snapshot_ms"})
 	csvw.Flush()
 
 	fmt.Printf("bdbench: %d store(s) x %d shards, seal limit %d, window %d, maintenance every %d blocks, pack every %d; per block per store %d dyna + %d perm puts, %d reads; %s blocks for %s; %s\n",
@@ -450,6 +648,7 @@ func main() {
 	deadline := start.Add(c.duration)
 	ioR0, ioW0 := procIO()
 	period := start
+	var heap0 heapSplit
 
 	report := func() {
 		elapsed := time.Since(period)
@@ -483,11 +682,20 @@ func main() {
 		}
 		minute := int(time.Since(start) / time.Minute)
 		mism := t.mismatches.Load()
-		fmt.Printf("%3dm blocks %4d | block p50/p90/max %s/%s/%s ms | seal p50/p90/max %s/%s/%s ms | put p99 dyna %s perm %s us | read p99 %s us | maint compress %d (%.1fs) merge %d (%.1fs) pack %d (%.1fs) skipped %d | disk r %.0f w %.0f MB/s | store %.0f MB %d files | history perm %d dyna %d | bloom %.0f MB | mismatches %d%s\n",
+		heap1 := sumHeap(stores)
+		hs := heap1.minus(heap0)
+		heap0 = heap1
+		heapNote := ""
+		if hs.syncs > 0 {
+			heapNote = fmt.Sprintf(" | heap fsync %.1f ms x %d (%.1f MB) moved %.0f MB hole %.0f MB live %.0f MB releases %d (%d ms) snapshots %d (%d ms)",
+				float64(hs.fsync)/1e6/float64(hs.syncs), hs.syncs, float64(hs.bytes)/1e6/float64(hs.syncs), float64(hs.moved)/1e6, float64(hs.holes)/1e6, float64(hs.live)/1e6,
+				hs.releases, hs.release.Milliseconds(), hs.snapshots, hs.snapshot.Milliseconds())
+		}
+		fmt.Printf("%3dm blocks %4d | block p50/p90/max %s/%s/%s ms | seal p50/p90/max %s/%s/%s ms | put p99 dyna %s perm %s us | read p99 %s us | maint compress %d (%.1fs) merge %d (%.1fs) pack %d (%.1fs) skipped %d | disk r %.0f w %.0f MB/s | store %.0f MB %d files | history perm %d dyna %d | bloom %.0f MB | mismatches %d%s%s\n",
 			minute, len(bt), ms(pct(bt, .5)), ms(pct(bt, .9)), ms(pct(bt, 1)), ms(pct(st, .5)), ms(pct(st, .9)), ms(pct(st, 1)),
 			us(pct(dp, .99)), us(pct(pp, .99)), us(pct(rt, .99)),
 			passes["compress"], spent["compress"].Seconds(), passes["merge"], spent["merge"].Seconds(), passes["pack"], spent["pack"].Seconds(), skipped,
-			rMB, wMB, float64(bytes)/1e6, files, permHist, dynaHist, float64(bloom)/1e6, mism, note)
+			rMB, wMB, float64(bytes)/1e6, files, permHist, dynaHist, float64(bloom)/1e6, mism, heapNote, note)
 		_ = csvw.Write([]string{strconv.Itoa(minute), strconv.Itoa(len(bt)), strconv.FormatUint(over, 10),
 			ms(pct(bt, .5)), ms(pct(bt, .9)), ms(pct(bt, 1)), ms(pct(st, .5)), ms(pct(st, .9)), ms(pct(st, 1)),
 			us(pct(dp, .99)), us(pct(pp, .99)), us(pct(rt, .99)),
@@ -497,9 +705,30 @@ func main() {
 			strconv.FormatFloat(rMB, 'f', 1, 64), strconv.FormatFloat(wMB, 'f', 1, 64),
 			strconv.FormatFloat(float64(bytes)/1e6, 'f', 0, 64), strconv.Itoa(files),
 			strconv.Itoa(permHist), strconv.Itoa(dynaHist), strconv.FormatFloat(float64(bloom)/1e6, 'f', 1, 64),
-			strconv.FormatUint(mism, 10)})
+			strconv.FormatUint(mism, 10),
+			strconv.FormatUint(hs.syncs, 10), strconv.FormatFloat(float64(hs.fsync)/1e6/float64(max(hs.syncs, 1)), 'f', 1, 64),
+			strconv.FormatFloat(float64(hs.bytes)/1e6/float64(max(hs.syncs, 1)), 'f', 1, 64), strconv.FormatFloat(float64(hs.moved)/1e6, 'f', 0, 64),
+			strconv.FormatFloat(float64(hs.holes)/1e6, 'f', 0, 64), strconv.FormatFloat(float64(hs.live)/1e6, 'f', 0, 64),
+			strconv.FormatUint(hs.releases, 10), strconv.FormatInt(hs.release.Milliseconds(), 10),
+			strconv.FormatUint(hs.snapshots, 10), strconv.FormatInt(hs.snapshot.Milliseconds(), 10)})
 		csvw.Flush()
 	}
+
+	// The live state, every two seconds, beside the per-minute rows
+	liveStop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				_ = os.WriteFile(filepath.Join(c.dir, "live.json"), t.liveState(c, stores, start), 0o644)
+			case <-liveStop:
+				return
+			}
+		}
+	}()
+	defer close(liveStop)
 
 	// Every store drives its own blocks; the first error stops the run.
 	stop := make(chan struct{})
@@ -550,6 +779,39 @@ wait:
 		if err := s.kv.Close(); err != nil {
 			fail("close", err)
 		}
+	}
+	// Every store is reopened and read back: every sampled permanent
+	// key with its derived value, every checked hot key with its last
+	// value.  What a seal made durable must be there after a close
+	// and an open, and a run that loses one fails.
+	var wrong int
+	for _, s := range stores {
+		re, err := blockchainDB.OpenKVShard(s.kv.Directory)
+		if err != nil {
+			fail(fmt.Sprintf("store %d reopen", s.id), err)
+		}
+		bad := 0
+		for i, k := range s.permKeys {
+			if v, err := re.GetDeep(k); err != nil || !bytes.Equal(v, permValue(k, c.valueMin, c.valueMax)) {
+				if bad < 3 {
+					fmt.Printf("  sampled key %d of %d: err=%v got %d bytes want %d\n", i, len(s.permKeys), err, len(v), len(permValue(k, c.valueMin, c.valueMax)))
+				}
+				bad++
+			}
+		}
+		for k, want := range s.last {
+			if v, err := re.GetDyna(k); err != nil || !bytes.Equal(v, want) {
+				bad++
+			}
+		}
+		fmt.Printf("reopen store %d: %d permanent + %d dynamic keys read back, %d wrong\n", s.id, len(s.permKeys), len(s.last), bad)
+		wrong += bad
+		if err := re.Close(); err != nil {
+			fail("close after reopen", err)
+		}
+	}
+	if wrong > 0 {
+		fail("reopen", fmt.Errorf("%d keys lost or wrong after close and reopen", wrong))
 	}
 	if runErr != nil {
 		fail("run", runErr)

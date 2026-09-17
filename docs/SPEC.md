@@ -527,9 +527,29 @@ resident filter memory; and the count of reads that returned a value
 other than the last written, which fails the run.  A minute whose seal
 p90 exceeds `-seal-budget` (100 ms) is flagged.
 
+It checks answers, not only times: permanent values derive from their
+keys, so every sampled permanent read is checked for presence and
+content; checked hot keys must read as last written; and at the end
+every store is closed, reopened and every sampled key of both layers
+read back.  A run that loses one fails (1.8).
+
 What a healthy store must show on it: block time under the interval,
 the seal bounded and flat with age, put and read p99 flat with age,
-and maintenance passes bounded per pass (1.2).  A change to the
+maintenance passes bounded per pass (1.2), zero wrong answers, and
+every store reading back after reopen.
+
+The instrument has to be sound before a number is the store's.  The
+disk is shared by every store under test, and an SSD that is never
+trimmed stalls every fsync on the box for tens of seconds at a time
+under a sustained write load; that reads as a seal tail and is not
+one.  A run is read with the per-minute heap split and the two-second
+store and device timelines (`cmd/bdbench/tools`), which tell a device
+stall from a store tail, and a run on a disk that stalls is compared
+by its clean minutes or not at all.  A disk that never receives
+discards will do this, so the measurement disk must be trimmed and
+verified trimmed before a run counts; the operator's notes for the
+machine a given run was made on are kept with that machine, not in
+this repository.  A change to the
 protocol path or to maintenance is measured here before it is measured
 under Accumulate, because here the seal's wait is the store's own and
 not the executor's.
