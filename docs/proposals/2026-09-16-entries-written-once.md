@@ -229,13 +229,34 @@ point" and closes #33.
 
 ## Durability and crash consistency (1.8)
 
-- **A file is deleted one seal late.**  A file emptied by the mover
-  is deleted only after the delta naming the mover's copies out of it
-  is durable.  Until then the durable index still names its slots,
-  and a crash must find them intact: never unlink what a durable
-  index names.  The adapter never asks the store for an old version
-  (its pre-images are memoized on its side), so deletion waits on the
-  seal and on nothing else.
+- **A file is deleted one seal late, by the mover.**  A file emptied
+  by the mover leaves the map only after the delta naming the mover's
+  copies out of it is durable.  Until then the durable index still
+  names its slots, and a crash must find them intact: never unlink
+  what a durable index names.  The unlink itself is the mover's, at
+  its next pass, so no block's seal holds the store lock over a
+  directory operation; between the two the file is unnamed on disk,
+  which an open deletes as such.  The adapter never asks the store
+  for an old version (its pre-images are memoized on its side), so
+  deletion waits on the seal and on nothing else.
+- **A seal is one fsync per file it touched, outside the lock.**  The
+  block's delta is written into the data file behind the block's
+  entries before the fsync, so one barrier covers both, in both
+  layers; replay trusts the last delta only if every entry it names
+  checks.  A put that lands during the seal belongs to the next
+  block: the seal takes the block's records under the lock and
+  releases it before the barrier.
+- **What the manifest does not name is still replayed if a seal
+  wrote it.**  The permanent layer's manifest is committed by
+  maintenance, not by seals, so the seals roll data files the
+  manifest has not seen.  Open takes data files in id order past the
+  manifest's next id for as long as they exist, and replays their
+  deltas; a run file past the manifest's next run id is maintenance
+  output a crash left unnamed, which open removes, so the id is free
+  for exclusive creation again and no file is ever published over
+  (1.7).  A merge lost this way is done again from the pending
+  deltas, which is why the manifest need only be committed every
+  eighth merge, or when a fold leaves run files to drop.
 - **A torn slot is detected, not misread.**  Every entry carries its
   length and a checksum; an entry above the committed height is a
   block that never synced.  An index entry is durable only after the
@@ -302,7 +323,30 @@ point" and closes #33.
    file too.  Alone, the heap seals at 44-54 ms p50 at nine stores
    (57-64 with two barriers).  The mover finds a file's live entries
    through the index rather than by scanning the file, because nine
-   stores' scans together starved the block loops for CPU.  Still to
-   do: the store-level commit (one block record naming every
-   shard's deltas) and the per-store data file, so that a hundred
-   shards cost a block one barrier.
+   stores' scans together starved the block loops for CPU.  The
+   mover's budget is the store's (`HeapStoreCleanBytes`), shared
+   among its shards: with one shard and a shard's budget the store
+   grew to 6 GB in five minutes.  A merge reads only its due
+   buckets' slice of each pending delta (the run is sorted, the
+   slice is found by a binary search on the first key byte) instead
+   of every pending delta whole at every pass.
+
+   *Measured, 2026-09-17:* every "bad minute" of the day's runs --
+   seal p50 unchanged, p90 200-450 ms, the heap's fsync average
+   3-8x its usual 12-22 ms -- was the disk, not the store.  A
+   2-second timeline showed every fsync on the box stepping to
+   100-330 ms for 30-40 s at once, with nothing in the store
+   changing (no snapshot, the same mover volume and release cadence)
+   and with one shard per store (9 barriers/s) exactly as with eight
+   (72/s).  The instrument's root volume is on LUKS without discards
+   and has never been trimmed.  Until it is, runs are compared by
+   their clean minutes; the per-minute row carries the heap's split
+   (fsync average and bytes, snapshots, releases, moved bytes) and
+   each store's seal p90 so a stall can be told from a tail.
+
+   Still to do: the store-level commit (one block record naming
+   every shard's deltas) and the per-store data file, so that a
+   hundred shards cost a block one barrier.  With one shard per
+   store, which is that layout by another name, the heap sealed at
+   40-42 ms p50 and 55-58 ms p90 in clean minutes, and the files
+   store at 46-49 / 53-57.
