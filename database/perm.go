@@ -116,7 +116,12 @@ const PermBuckets = 256
 
 // PermMergeEvery is how many blocks pass between merges of one
 // bucket: PermBuckets/PermMergeEvery buckets are merged each block.
-var PermMergeEvery uint64 = 256
+// It bounds how many deltas wait unmerged, which every deep read
+// probes and every merge reads a slice of: at 256, read p99 climbed
+// from 7 to 47 us over five minutes and merge work from 157 to 305 s
+// a minute.  One window's worth keeps both flat; the extra folds
+// cost a fraction of the index bytes.
+var PermMergeEvery uint64 = MinFilterBlocks
 
 // PermFileBytes is the size data files and run files are rolled at.
 var PermFileBytes int64 = 64 << 20
