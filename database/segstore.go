@@ -2732,7 +2732,7 @@ func (s *SegmentStore) beginBlockSync() (blockSync, error) {
 	return p, nil
 }
 
-func (s *SegmentStore) compact() (bool, error) { return s.CompactHistory() }
+func (s *SegmentStore) compact(int64) (bool, error) { return s.CompactHistory() }
 
 // beginPermSeal and mergeBelow are the permLayer surface (kv_2.go)
 // over beginSeal and MergeBelow.

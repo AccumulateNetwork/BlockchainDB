@@ -175,7 +175,7 @@ type dynaLayer interface {
 	AdvanceBlock(height uint64)
 	LiveRecords() uint64
 	beginBlockSync() (blockSync, error)
-	compact() (bool, error)
+	compact(budget int64) (bool, error) // A heap moves at most budget bytes; a segment store ignores it
 	Stats() StoreStats
 }
 
@@ -706,8 +706,11 @@ func (k *KV2) Put(key [32]byte, value []byte) (writes int, err error) {
 // weight rather than a wrong answer.
 //
 // TODO: Cleanse PermKV of keys in DynaKV
-func (k *KV2) Compress() error {
-	if _, err := k.dyna().compact(); err != nil {
+func (k *KV2) Compress() error { return k.compress(HeapCleanBytes) }
+
+// compress is Compress with the mover's budget for this call.
+func (k *KV2) compress(budget int64) error {
+	if _, err := k.dyna().compact(budget); err != nil {
 		return err
 	}
 	k.Mutex.Lock()

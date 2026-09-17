@@ -95,18 +95,20 @@ type PermStore struct {
 		file uint32
 		off  int64
 	}
-	syncMu      sync.Mutex // Serializes seals with each other and with manifest commits
-	mergesSince int        // Merges since the manifest was last committed
-	closed      bool
+	syncMu        sync.Mutex // Serializes seals with each other and with manifest commits
+	manifestAt    uint64     // The height the manifest was last committed at
+	manifestDirty bool       // Merges since then
+	closed        bool
 
 	putTotal, putDuplicate, lookups, windowHits, deepHits atomic.Uint64
 	mergeRuns, foldRuns, packRuns                         atomic.Uint64
 	indexBytes                                            atomic.Uint64
 }
 
-// PermManifestEvery is how many merges may pass between manifest
-// commits when no fold made one necessary.
-var PermManifestEvery = 8
+// PermManifestBlocks is how many blocks may pass between manifest
+// commits when no fold made one necessary.  Counted in blocks so the
+// caller's cadence does not set the commit cadence.
+var PermManifestBlocks uint64 = 160
 
 // PermBuckets is how many buckets a shard's history above the
 // watermark is kept in, by the key's first byte.
@@ -481,7 +483,7 @@ func (p *PermStore) Close() error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.mergesSince > 0 {
+	if p.manifestDirty {
 		if err = p.commitManifest(); err != nil {
 			return err
 		}
@@ -952,11 +954,10 @@ func (p *PermStore) Merge() error {
 	// unnamed.
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.mergesSince++
-	if len(folds) == 0 && p.mergesSince < PermManifestEvery {
+	p.manifestDirty = true
+	if len(folds) == 0 && p.height-p.manifestAt < PermManifestBlocks {
 		return nil
 	}
-	p.mergesSince = 0
 	if err := p.commitManifest(); err != nil {
 		return err
 	}
@@ -1130,6 +1131,9 @@ func (p *PermStore) commitManifest() error {
 	p.mu.Unlock()
 	err = p.writeManifest(buf)
 	p.mu.Lock()
+	if err == nil {
+		p.manifestAt, p.manifestDirty = p.height, false
+	}
 	return err
 }
 

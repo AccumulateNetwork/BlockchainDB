@@ -38,7 +38,7 @@ func TestHeapCrashChild(t *testing.T) {
 		require.NoError(t, p.finish(), "child: finish")
 		fmt.Printf("CHECKPOINT %d\n", b)
 		if b%4 == 0 {
-			_, err := h.compact()
+			_, err := h.compact(HeapCleanBytes)
 			require.NoError(t, err, "child: compact")
 		}
 	}

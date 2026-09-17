@@ -86,7 +86,7 @@ func TestPermStoreReopenWithoutManifestCommit(t *testing.T) {
 	}
 	// Keep going until a merge is left uncommitted (a fold commits)
 	last := uint64(3 * MinFilterBlocks)
-	for p.mergesSince == 0 {
+	for !p.manifestDirty {
 		last++
 		require.Less(t, last, uint64(6*MinFilterBlocks), "a merge without a fold must come")
 		p.AdvanceBlock(last)

@@ -182,9 +182,9 @@ func TestHeapSnapshotStartsAGenerationSafely(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
 	require.NoError(t, err)
-	every := HeapSnapshotEvery
-	HeapSnapshotEvery = 1
-	defer func() { HeapSnapshotEvery = every }()
+	every := HeapSnapshotBlocks
+	HeapSnapshotBlocks = 1
+	defer func() { HeapSnapshotBlocks = every }()
 	for b := uint64(1); b <= 30; b++ {
 		h.AdvanceBlock(b)
 		for i := byte(1); i <= 20; i++ {
@@ -192,7 +192,7 @@ func TestHeapSnapshotStartsAGenerationSafely(t *testing.T) {
 		}
 		syncHeap(t, h)
 		if b == 20 {
-			_, err := h.compact()
+			_, err := h.compact(HeapCleanBytes)
 			require.NoError(t, err)
 			_, err = os.Stat(filepath.Join(dir, indexName(1)))
 			require.ErrorIs(t, err, os.ErrNotExist, "generation 1 retired")
@@ -322,12 +322,15 @@ func TestHeapShardRoundTrip(t *testing.T) {
 	}
 	_, dyna := kvs.Stats()
 	require.EqualValues(t, 60*200, dyna.PutTotal)
-	// A pass for what the last ten blocks left dead, and the sync that
-	// deletes what it emptied
-	require.NoError(t, kvs.Compress())
-	require.NoError(t, kvs.SealBlock(61))
-	require.NoError(t, kvs.Compress())
-	require.NoError(t, kvs.SealBlock(62))
+	// Maintenance is a slice per call, sized by the blocks since the
+	// last: a call a block over a few blocks visits every shard with
+	// budget to spare for what the last ten blocks left dead, and each
+	// seal releases what the pass before it emptied
+	for b := uint64(61); b <= 64; b++ {
+		require.NoError(t, kvs.SealBlock(b))
+		require.NoError(t, kvs.Compress())
+	}
+	require.NoError(t, kvs.SealBlock(65))
 	dead, live := kvs.Shards[0].Heap.HoleRatio()
 	require.Less(t, dead, 2*live+HeapFileBytes, "dead bytes are bounded: at most the current file, which the mover never takes, beyond the live set")
 	require.NoError(t, kvs.Close())

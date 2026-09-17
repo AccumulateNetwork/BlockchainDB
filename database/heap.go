@@ -103,10 +103,10 @@ type HeapStore struct {
 	// snapshot, so the map a snapshot writes is exactly the state of
 	// the last finished delta and no delta is in flight into a log
 	// about to be retired.
-	syncMu    sync.Mutex
-	log       *os.File
-	gen       uint64
-	snapshots int
+	syncMu sync.Mutex
+	log    *os.File
+	gen    uint64
+	snapAt uint64 // The block the key map was last snapshotted at
 
 	closed    bool
 	liveBytes int64
@@ -124,26 +124,6 @@ type HeapStore struct {
 	// written and the time in them
 	releases, releaseNs, snapshotsN, snapshotNs atomic.Uint64
 	unlink                                      []uint32 // Released files not yet deleted
-	// The bytes one mover pass may copy; 0 means HeapCleanBytes.  A
-	// store's budget is HeapStoreCleanBytes however many shards it
-	// has, so a shard gets its share (SetCleanBudget).
-	budget int64
-}
-
-// SetCleanBudget sets the bytes one mover pass may copy.
-func (h *HeapStore) SetCleanBudget(n int64) {
-	h.mu.Lock()
-	h.budget = n
-	h.mu.Unlock()
-}
-
-func (h *HeapStore) cleanBudget() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	if h.budget > 0 {
-		return h.budget
-	}
-	return HeapCleanBytes
 }
 
 // heapFile is one data file and its accounting.
@@ -243,10 +223,22 @@ var (
 	HeapBoundOn    = 1.5
 )
 
-// HeapSnapshotEvery is how many compact calls pass between key-map
+// HeapSnapshotBlocks is how many blocks pass between key-map
 // snapshots; between them the generation's deltas are what open
-// replays.
-var HeapSnapshotEvery = 5
+// replays.  Counted in blocks, not maintenance calls, so the cadence
+// of the caller does not set the cadence of the snapshots.
+var HeapSnapshotBlocks uint64 = 100
+
+// HeapSnapshotPinnedFiles is how many files' worth of bytes may be
+// held only by their deltas before a snapshot is taken early,
+// whatever the block count.
+var HeapSnapshotPinnedFiles int64 = 2
+
+// HeapCleanPeriod is the blocks over which a store spends
+// HeapStoreCleanBytes: the store's mover rate is the one divided by
+// the other, and a maintenance call moves what the blocks since the
+// last call earned (KVShard.Compress).
+var HeapCleanPeriod uint64 = 20
 
 // entrySize is the bytes an entry of n value bytes takes, aligned.
 func entrySize(n int) int64 {
@@ -1076,22 +1068,33 @@ func (h *HeapStore) unlinkReleased() error {
 	return nil
 }
 
-// compact is the heap's maintenance on the adapter's cadence: one
-// bounded mover pass, and every HeapSnapshotEvery calls a new index
-// generation, which bounds the replay on open.
-func (h *HeapStore) compact() (bool, error) {
+// compact is one slice of the heap's maintenance: the released
+// files unlinked, a mover pass bounded by budget bytes copied, and
+// every HeapSnapshotBlocks a new index generation, which bounds the
+// replay on open.
+func (h *HeapStore) compact(budget int64) (bool, error) {
 	if err := h.unlinkReleased(); err != nil {
 		return false, err
 	}
-	moved, err := h.clean(h.cleanBudget())
+	moved, err := h.clean(budget)
 	if err != nil {
 		return moved, err
 	}
+	// A snapshot is due by age, or when the files it would free
+	// outweigh it: a file whose only live bytes are deltas cannot go
+	// until a snapshot supersedes them, so the space those files hold
+	// is what a snapshot buys, and it is taken when that exceeds
+	// HeapSnapshotPinned
 	h.mu.Lock()
-	h.snapshots++
-	due := h.snapshots >= HeapSnapshotEvery
+	var pinned int64
+	for _, hf := range h.files {
+		if hf != h.cur && hf != h.mov && hf.deltas > 0 && hf.live == hf.deltas {
+			pinned += hf.size
+		}
+	}
+	due := h.height-h.snapAt >= HeapSnapshotBlocks || pinned >= HeapSnapshotPinnedFiles*HeapFileBytes
 	if due {
-		h.snapshots = 0
+		h.snapAt = h.height
 	}
 	h.mu.Unlock()
 	if due {

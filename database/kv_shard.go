@@ -82,6 +82,13 @@ type KVShard struct {
 	// found" for data that is on disk.
 	Shards []*KV2
 
+	// Maintenance in rotation (Compress): the height last sealed, the
+	// height at the last call, and the shard next in line
+	maintMu   sync.Mutex
+	sealed    uint64
+	maintAt   uint64
+	maintNext int
+
 	// Sets holds the finalized Perm data that has left the shards: one
 	// block-set file per completed set of blocks, packed from every
 	// shard's merged segment (blockset.go).  Each shard's Perm layer
@@ -172,7 +179,6 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 			return nil, err
 		}
 	}
-	kVShard.shareCleanBudget()
 	kVShard.useSharedBlockRecord()
 	if err = kVShard.adoptBlockHeight(); err != nil {
 		return nil, err
@@ -250,16 +256,6 @@ func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, 
 	return newKVShardN(directory, shards, sealLimit, NewKV2)
 }
 
-// shareCleanBudget gives each heap shard its share of the store's
-// mover budget (HeapStoreCleanBytes).
-func (k *KVShard) shareCleanBudget() {
-	for _, shard := range k.Shards {
-		if shard.Heap != nil {
-			shard.Heap.SetCleanBudget(HeapStoreCleanBytes / int64(len(k.Shards)))
-		}
-	}
-}
-
 func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(string, uint64) (*KV2, error)) (kvs *KVShard, err error) {
 	if shards < 1 {
 		return nil, fmt.Errorf("a database needs at least one shard, asked for %d", shards)
@@ -278,7 +274,6 @@ func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(s
 			return nil, err
 		}
 	}
-	kvs.shareCleanBudget()
 	kvs.useSharedBlockRecord()
 	if kvs.Sets, err = NewSetStore(kvs.setDir()); err != nil {
 		return nil, err
@@ -480,6 +475,9 @@ func (k *KVShard) writeBlockHeight(height uint64) (err error) {
 // with the block it belongs to
 func (k *KVShard) adoptBlockHeight() error {
 	height, err := k.readBlockHeight()
+	k.maintMu.Lock()
+	k.sealed = height
+	k.maintMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -555,7 +553,13 @@ func (k *KVShard) SealBlock(height uint64) (err error) {
 			return err
 		}
 	}
-	return k.writeBlockHeight(height + 1)
+	if err = k.writeBlockHeight(height + 1); err != nil {
+		return err
+	}
+	k.maintMu.Lock()
+	k.sealed = height + 1
+	k.maintMu.Unlock()
+	return nil
 }
 
 // MergeFinalized
@@ -777,11 +781,59 @@ func (k *KVShard) Stats() (perm, dyna StoreStats) {
 // Compress
 // Compress all the shards
 func (k *KVShard) Compress() (err error) {
-	for i, kvs := range k.Shards {
-		if err = kvs.Open(); err != nil {
+	if len(k.Shards) > 0 {
+		if err = k.Shards[0].Open(); err != nil {
+			return fmt.Errorf("shard 0: %w", err)
+		}
+	}
+	if len(k.Shards) == 0 || k.Shards[0].Heap == nil {
+		// Segment-store shards: a bounded pass on every shard, as before
+		for i, kvs := range k.Shards {
+			if err = kvs.Open(); err != nil {
+				return fmt.Errorf("shard %d: %w", i, err)
+			}
+			if err = kvs.Compress(); err != nil {
+				return fmt.Errorf("shard %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	// Heap shards: one slice of the store's maintenance, sized by the
+	// blocks since the last call.  The store's mover rate is
+	// HeapStoreCleanBytes per HeapCleanPeriod blocks; a call takes the
+	// shards next in rotation, as many as the elapsed blocks earn, each
+	// with its share of what those blocks earned.  Called every
+	// HeapCleanPeriod blocks it moves the whole budget over every
+	// shard; called every block it moves a little on the next shard,
+	// and the copies reach the device as a trickle rather than every
+	// shard's pass at once -- which, at nine stores in lockstep, was
+	// 300 MB and 72 barriers in one second, and queued the seals'
+	// fsyncs behind them for the next four.  A hundred shards spread
+	// the same rate a hundred ways, and each call locks one.
+	k.maintMu.Lock()
+	n := len(k.Shards)
+	elapsed := k.sealed - k.maintAt
+	if k.maintAt == 0 || elapsed > HeapCleanPeriod {
+		elapsed = HeapCleanPeriod
+	}
+	k.maintAt = k.sealed
+	due := int(uint64(n) * elapsed / HeapCleanPeriod)
+	if due < 1 {
+		due = 1
+	}
+	if due > n {
+		due = n
+	}
+	budget := HeapStoreCleanBytes * int64(elapsed) / int64(HeapCleanPeriod) / int64(due)
+	start := k.maintNext
+	k.maintNext = (start + due) % n
+	k.maintMu.Unlock()
+	for j := 0; j < due; j++ {
+		i := (start + j) % n
+		if err = k.Shards[i].Open(); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
-		if err = kvs.Compress(); err != nil {
+		if err = k.Shards[i].compress(budget); err != nil {
 			return fmt.Errorf("shard %d: %w", i, err)
 		}
 	}
