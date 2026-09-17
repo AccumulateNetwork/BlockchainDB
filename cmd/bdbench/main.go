@@ -441,6 +441,7 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 	var holes, live int64
 	var scanned, moved, syncs, syncBytes uint64
 	var heapFsync, deltaSync time.Duration
+	var permMerges, permFolds, permPacks, permIndexBytes uint64
 	for _, s := range stores {
 		if s.height > height {
 			height = s.height
@@ -454,6 +455,10 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 				n, b, hf, ds := sh.Heap.SyncCost()
 				syncs, syncBytes, heapFsync, deltaSync = syncs+n, syncBytes+b, heapFsync+hf, deltaSync+ds
 			}
+			if sh.Perm != nil {
+				m, f, pk, ib := sh.Perm.Counters()
+				permMerges, permFolds, permPacks, permIndexBytes = permMerges+m, permFolds+f, permPacks+pk, permIndexBytes+ib
+			}
 		}
 	}
 	b, _ := json.Marshal(map[string]any{
@@ -465,6 +470,7 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
 		"heapScannedMB": float64(scanned) / 1e6, "heapMovedMB": float64(moved) / 1e6,
 		"heapSyncs": syncs, "heapSyncKBAvg": float64(syncBytes) / 1e3 / float64(max(syncs, 1)),
+		"permMerges": permMerges, "permFolds": permFolds, "permPacks": permPacks, "permIndexMB": float64(permIndexBytes) / 1e6,
 		"heapFsyncMsAvg": float64(heapFsync) / 1e6 / float64(max(syncs, 1)), "heapDeltaMsAvg": float64(deltaSync) / 1e6 / float64(max(syncs, 1)),
 	})
 	return b

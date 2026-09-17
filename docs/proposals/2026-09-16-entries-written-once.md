@@ -188,6 +188,19 @@ doubles the bytes written); every bucket is merged every 256 blocks
 (B/256 buckets a block), which keeps the recent sections at a few MB
 a shard.
 
+### Shards partition keys, not files (measured)
+
+The dynamic layer alone, nine stores, five minutes: seal p50 54-65 ms
+at 8 storage shards, 67-79 ms at 64, 75-86 ms at 128, with a burst of
+lost blocks every other minute at 64 and 128 and 8x and 16x the
+files.  Every shard's files sync on their own at every block, so the
+barrier count rises with the shard count; a hundred-plus shards are
+right for spreading the retiring work and shrinking every lock, and
+they must not each bring a barrier.  A block's records for every
+shard go into one per-store append file, shard-tagged, and each
+shard's index points into it: one data fsync per store however many
+shards.
+
 ## The seal: one commit point per store per block
 
 Today a non-empty block costs each shard four barriers -- the data
@@ -267,11 +280,13 @@ point" and closes #33.
    150-250 ms in the minutes the mover copies most) is the mover's
    own fsync volume in the device queue, which the pass size paces.
 2. The permanent layer as files of records with index deltas
-   (`PermStore`, behind `KV2`'s permanent surface: `PutIfAbsent`,
-   windowed `Get`, `GetDeep`, the two-half seal, `MergeBelow`,
-   `historyBelow`, `DropBelow`, `attachCold`, the filter knobs), the
-   44-byte index record, the bucketed long search merged a bucket per
-   block, and packs over indexes.  Measured
+   (`PermStore`, behind `KV2`'s permanent surface), the 44-byte index
+   record, the bucketed long search merged in rotation, and packs over
+   indexes.  *First cut built and wired (`perm.go`,
+   `NewKVShardFilesN`, `bdbench -perm-files`); its first full-load run
+   put the seal at 59 ms p50 in minute 1, then climbing to 209 by
+   minute 5 because maintenance shared the seal's run file; fixed,
+   remeasured next.*  Measured
    alone first (`-stores 9 -dyna 0`), then with the heap under the
    full load, which is the acceptance run.
 3. The block's deltas in the data files and the store-level commit:

@@ -1070,6 +1070,12 @@ func (p *PermStore) dropUnreferencedRunFiles() error {
 	return nil
 }
 
+// Counters reports the maintenance so far: merge runs, folds, packs,
+// and the index bytes written.
+func (p *PermStore) Counters() (merges, folds, packs, indexBytes uint64) {
+	return p.mergeRuns.Load(), p.foldRuns.Load(), p.packRuns.Load(), p.indexBytes.Load()
+}
+
 // Stats is the store's report.
 func (p *PermStore) Stats() StoreStats {
 	p.mu.RLock()
