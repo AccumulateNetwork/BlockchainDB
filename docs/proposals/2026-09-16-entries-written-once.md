@@ -344,9 +344,32 @@ point" and closes #33.
    (fsync average and bytes, snapshots, releases, moved bytes) and
    each store's seal p90 so a stall can be told from a tail.
 
+   *Maintenance is a slice per call, in rotation.*  The heap's
+   remaining tail in clean minutes was the mover's own delivery: on
+   the adapter's cadence every shard of every store ran its pass in
+   the same second -- 300 MB and 72 barriers at once at nine stores
+   -- and the seals' fsyncs queued behind it for the next four
+   seconds (device write time 24 s in a 2-second window against 1-3
+   otherwise).  A store's mover rate is now `HeapStoreCleanBytes` per
+   `HeapCleanPeriod` blocks, and a `Compress` call takes the shards
+   next in rotation, as many as the blocks since the last call earn,
+   each with its share: called every block it moves a little on one
+   shard, and a hundred shards spread the same rate a hundred ways
+   with one shard locked at a time.  The permanent layer's merge
+   already worked this way (buckets due by blocks elapsed).
+   Snapshots are by block count, or early when the files held only
+   by their deltas outweigh two data files; the manifest commits by
+   block count.
+
+   *Measured on that build (before the every-block cadence), nine
+   stores, eight shards, clean minutes:* the heap alone 36-38 ms p50
+   / 48-60 p90 in every minute; the files store 36-38 / 50-52, where
+   the day before it was 60 / 370-450 in every minute after the first
+   -- the seal's second barrier, the merge's three, and its reread of
+   every pending delta were the tail.  One shard per store: 37-39 /
+   51-54.
+
    Still to do: the store-level commit (one block record naming
    every shard's deltas) and the per-store data file, so that a
-   hundred shards cost a block one barrier.  With one shard per
-   store, which is that layout by another name, the heap sealed at
-   40-42 ms p50 and 55-58 ms p90 in clean minutes, and the files
-   store at 46-49 / 53-57.
+   hundred shards cost a block one barrier; one shard per store is
+   that layout by another name and measures the same as eight now.
