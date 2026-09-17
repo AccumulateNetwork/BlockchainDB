@@ -418,6 +418,11 @@ under load.  The acceptance run must show:
    157 to 210 ms: the profile put 40% of the CPU in the deep read's
    binary search over bucket runs, a pread a probe; a resident run
    now keeps a fence of every 32nd key and a lookup is one read.
+   Measured: read p99 6-7 us instead of 9-10, block time flat at
+   178-181 ms from minute 3 on instead of climbing, all nine stores
+   read back clean again.  What remains in the deep read is one read
+   of the run's chunk and one of the entry, which is the floor for
+   an index that does not fit in memory.
 
    Still to do: the store-level commit (one block record naming
    every shard's deltas) and the per-store data file, so that a
