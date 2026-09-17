@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/csv"
 	"encoding/json"
@@ -290,7 +291,7 @@ func (s *store) block(c config, t *tallies) error {
 	}
 	for i := 0; i < c.permPuts; i++ {
 		k := s.rnd.NextHash()
-		v := s.rnd.RandBuff(c.valueMin, c.valueMax)
+		v := permValue(k, c.valueMin, c.valueMax)
 		at := time.Now()
 		if err := s.kv.PutPerm(k, v); err != nil {
 			return fmt.Errorf("store %d PutPerm: %w", s.id, err)
@@ -306,11 +307,15 @@ func (s *store) block(c config, t *tallies) error {
 	for i := 0; i < c.reads; i++ {
 		var k [32]byte
 		var get func([32]byte) ([]byte, error)
+		perm := false
 		switch pick := s.rnd.UintN(6); {
 		case pick < 3:
 			k, get = s.hot[int(s.rnd.UintN(uint(c.hotKeys)))], s.kv.GetDyna
 		case pick < 5 && len(s.permKeys) > 0:
-			k, get = s.permKeys[int(s.rnd.UintN(uint(len(s.permKeys))))], s.kv.GetPerm
+			// A permanent key of any age, through the deep read the
+			// adapter uses for anything older than the window (Get
+			// answers the permanent layer's window only, by design)
+			k, get, perm = s.permKeys[int(s.rnd.UintN(uint(len(s.permKeys))))], s.kv.GetDeep, true
 		default:
 			k, get = s.rnd.NextHash(), s.kv.Get
 		}
@@ -319,6 +324,14 @@ func (s *store) block(c config, t *tallies) error {
 		s.readT = append(s.readT, time.Since(at))
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "not found") {
 			return fmt.Errorf("store %d read: %w", s.id, err)
+		}
+		// A permanent key that was written must come back, with the
+		// value its key derives; a checked hot key must come back as
+		// last written.  A platform that only times answers cannot
+		// tell a fast wrong answer, or a fast "not found", from a
+		// right one.
+		if perm && (err != nil || !bytes.Equal(v, permValue(k, c.valueMin, c.valueMax))) {
+			t.mismatches.Add(1)
 		}
 		if want, ok := s.last[k]; ok && err == nil && string(v) != string(want) {
 			t.mismatches.Add(1)
@@ -533,6 +546,21 @@ func sumHeap(stores []*store) (hs heapSplit) {
 		}
 	}
 	return hs
+}
+
+// permValue is the value a permanent key carries: derived from the
+// key, so that any read of the key can be checked without remembering
+// what was written.  Its length spreads over [min, max] by the key.
+func permValue(k [32]byte, min, max uint) []byte {
+	n := int(min)
+	if max > min {
+		n += int(k[31]) * int(max-min) / 255
+	}
+	v := make([]byte, n)
+	for i := 0; i < n; i += len(k) {
+		copy(v[i:], k[:])
+	}
+	return v
 }
 
 func fail(what string, err error) {
@@ -751,6 +779,39 @@ wait:
 		if err := s.kv.Close(); err != nil {
 			fail("close", err)
 		}
+	}
+	// Every store is reopened and read back: every sampled permanent
+	// key with its derived value, every checked hot key with its last
+	// value.  What a seal made durable must be there after a close
+	// and an open, and a run that loses one fails.
+	var wrong int
+	for _, s := range stores {
+		re, err := blockchainDB.OpenKVShard(s.kv.Directory)
+		if err != nil {
+			fail(fmt.Sprintf("store %d reopen", s.id), err)
+		}
+		bad := 0
+		for i, k := range s.permKeys {
+			if v, err := re.GetDeep(k); err != nil || !bytes.Equal(v, permValue(k, c.valueMin, c.valueMax)) {
+				if bad < 3 {
+					fmt.Printf("  sampled key %d of %d: err=%v got %d bytes want %d\n", i, len(s.permKeys), err, len(v), len(permValue(k, c.valueMin, c.valueMax)))
+				}
+				bad++
+			}
+		}
+		for k, want := range s.last {
+			if v, err := re.GetDyna(k); err != nil || !bytes.Equal(v, want) {
+				bad++
+			}
+		}
+		fmt.Printf("reopen store %d: %d permanent + %d dynamic keys read back, %d wrong\n", s.id, len(s.permKeys), len(s.last), bad)
+		wrong += bad
+		if err := re.Close(); err != nil {
+			fail("close after reopen", err)
+		}
+	}
+	if wrong > 0 {
+		fail("reopen", fmt.Errorf("%d keys lost or wrong after close and reopen", wrong))
 	}
 	if runErr != nil {
 		fail("run", runErr)
