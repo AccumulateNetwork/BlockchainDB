@@ -952,7 +952,19 @@ func (p *PermStore) Merge() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.manifestDirty = true
-	if len(folds) == 0 && p.height-p.manifestAt < PermManifestBlocks {
+	// A commit is due by age, or when a fold left a run file that
+	// nothing references, since only a commit can drop it.  A fold
+	// alone is not a reason: with a merge every block a bucket folds
+	// on nearly every call, and a commit each time was two barriers
+	// a shard a block.
+	droppable := false
+	for _, rf := range p.runs {
+		if rf.refs == 0 && rf != p.maintRun {
+			droppable = true
+			break
+		}
+	}
+	if !droppable && p.height-p.manifestAt < PermManifestBlocks {
 		return nil
 	}
 	if err := p.syncRunFiles(); err != nil {
@@ -1197,8 +1209,13 @@ func (p *PermStore) encodeManifest() ([]byte, error) {
 	for id := range p.files {
 		m.DataFiles = append(m.DataFiles, id)
 	}
-	for id := range p.runs {
-		m.RunFiles = append(m.RunFiles, id)
+	// Only the run files kept: a file nothing references is dropped
+	// once this manifest is durable, and a durable manifest must never
+	// name a file that is gone (1.7, 1.8)
+	for id, rf := range p.runs {
+		if rf.refs > 0 || rf == p.maintRun {
+			m.RunFiles = append(m.RunFiles, id)
+		}
 	}
 	sort.Slice(m.DataFiles, func(i, j int) bool { return m.DataFiles[i] < m.DataFiles[j] })
 	sort.Slice(m.RunFiles, func(i, j int) bool { return m.RunFiles[i] < m.RunFiles[j] })
