@@ -101,9 +101,10 @@ type heapFile struct {
 	f          *os.File
 	size       int64
 	live, dead int64
-	cleaning   bool // Taken by the pass in progress
-	inflight   int  // Copies reserved in it and not yet written: its size runs ahead of its bytes
-	releasing  bool // Emptied by a pass; deleted by the next sync
+	firstBlock uint64 // The block that first appended to it
+	cleaning   bool   // Taken by the pass in progress
+	inflight   int    // Copies reserved in it and not yet written: its size runs ahead of its bytes
+	releasing  bool   // Emptied by a pass; deleted by the next sync
 }
 
 // slot is where an entry lives: its file, its offset there, the value
@@ -126,8 +127,16 @@ const (
 	heapIndexRec = 32 + 4 + 4 + 4
 )
 
-// HeapFileBytes is the size a data file is rolled at.
+// HeapFileBytes is the size a data file is rolled at, and
+// HeapFileBlocks the age: a shard that appends little per block (many
+// shards, or a quiet one) would otherwise keep one file current for
+// long stretches, and the current file is never the mover's, so its
+// dead bytes could not be reclaimed (measured at 64 shards: 34 KB a
+// block, no file rolled in three minutes, the store growing 2.3 GB a
+// minute with the mover idle).
 var HeapFileBytes int64 = 16 << 20
+
+var HeapFileBlocks uint64 = 64
 
 // HeapCleanBytes bounds one mover pass by the bytes it copies.  The
 // pass syncs its own copies, so the bound is not about a block's
@@ -588,10 +597,11 @@ func (h *HeapStore) reserve(mover bool, size int64) (hf *heapFile, off int64, er
 	if mover {
 		at = &h.mov
 	}
-	if *at == nil || (*at).size+size > HeapFileBytes {
+	if *at == nil || (*at).size+size > HeapFileBytes || (!mover && h.height >= (*at).firstBlock+HeapFileBlocks) {
 		if *at, err = h.newFile(); err != nil {
 			return nil, 0, err
 		}
+		(*at).firstBlock = h.height
 	}
 	hf = *at
 	off = hf.size
