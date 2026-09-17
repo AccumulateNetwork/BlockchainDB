@@ -428,4 +428,22 @@ under load.  The acceptance run must show:
    every shard's deltas) and the per-store data file, so that a
    hundred shards cost a block one barrier; one shard per store is
    that layout by another name and measures the same as eight now.
-   The 30-minute acceptance run waits on the trimmed disk.
+   The 30-minute acceptance run (2026-09-17, after the disk was
+   trimmed; nine files stores, maintenance every block, phase
+   offset): 16,164 blocks, every minute's seal p90 between 42 and
+   57 ms against the 100 ms budget, the heap's fsync average flat
+   at 10-14 ms, no mismatch, and all nine stores reopened and read
+   every sampled key back with 0 wrong.  The device's write ticks
+   per two-second window were p50 1.9 s, max 14.3 s: no stall.
+   Block p50 rose from 129 ms to ~170 ms over the first five
+   minutes as the window filled and then held at 170-193 ms.  In
+   minutes 28 and 30 the process read 56 and 120 MB/s from the
+   drive and read p99 went from 7-8 us to 52-59 us, which at 40,000
+   lookups a block put block p50 at 250-300 ms and p90 at 370-460
+   ms; the seal did not move.  The store was 68-74 GB on a 64 GB
+   box whose page cache had been full since minute 10: lookups of
+   permanent keys of all ages had begun to miss the cache.  That
+   is the floor for an index that does not fit in memory, not a
+   cost that grows with the store's age in the store's own work,
+   and it is where a resident permanent index (or a bigger box)
+   would show.  Run: accept-30m, 2026-09-17 08:00.

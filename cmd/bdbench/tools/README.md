@@ -31,5 +31,6 @@ p50 unchanged, p90 200-500 ms) and different here: a stall raises the
 heap's fsync average for every store at once, the device's write ticks
 with it, and the store's own counters (moved, snapshots, releases) show
 no step.  A store tail lines up with a step in one of those counters
-and the device stays quiet.  See `docs/runbooks/disk-trim.md` for the
-disk this was learned on.
+and the device stays quiet.  The disk this was learned on, and how it
+was fixed, are in the operator's machine notes rather than here: on this
+machine `~/infrastructure/disk-trim.md`.

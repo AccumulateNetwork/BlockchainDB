@@ -545,8 +545,11 @@ under a sustained write load; that reads as a seal tail and is not
 one.  A run is read with the per-minute heap split and the two-second
 store and device timelines (`cmd/bdbench/tools`), which tell a device
 stall from a store tail, and a run on a disk that stalls is compared
-by its clean minutes or not at all.  `docs/runbooks/disk-trim.md`
-records the disk this was learned on and how it is verified.  A change to the
+by its clean minutes or not at all.  A disk that never receives
+discards will do this, so the measurement disk must be trimmed and
+verified trimmed before a run counts; the operator's notes for the
+machine a given run was made on are kept with that machine, not in
+this repository.  A change to the
 protocol path or to maintenance is measured here before it is measured
 under Accumulate, because here the seal's wait is the store's own and
 not the executor's.
