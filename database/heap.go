@@ -185,8 +185,17 @@ var HeapFileBlocks uint64 = 64
 // cadence (~4 MB, of which a quarter to a third is live).
 var HeapCleanBytes int64 = 4 << 20
 
-// HeapCleanFiles bounds a pass by files taken as well.
-var HeapCleanFiles = 4
+// HeapCleanFiles and HeapScanBytes bound a pass by the files it takes
+// and the bytes it reads: with hot keys most of a file is dead and
+// costs nothing to copy, so what limits the mover's pace is how much
+// it looks at.  At the soak's rate a shard makes ~50 MB of dead bytes
+// per cadence; a pass that scans 128 MB releases more than that with
+// room to spare (four 16 MB files did not, and the store floated with
+// the size bound engaged).
+var (
+	HeapCleanFiles       = 8
+	HeapScanBytes  int64 = 128 << 20
+)
 
 // HeapCleanRatio is the dead fraction a file must reach before the
 // mover takes it -- unless the heap is over its size bound, when the
@@ -1084,18 +1093,33 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 		h.mu.Unlock()
 		return false, nil // The last pass's deletions are still waiting on a sync
 	}
+	// A file with nothing live in it needs no scan and no copy: it is
+	// released outright, any number of them a pass, one sync late as
+	// every release is.  Without this the pass's file count paced the
+	// mover at about the rate dead bytes appeared, and the store
+	// floated with the size bound engaged.
+	emptied := 0
+	for _, hf := range h.files {
+		if hf.live == 0 && hf != h.cur && hf != h.mov && !hf.cleaning && hf.inflight == 0 && !hf.releasing && hf.size > 0 {
+			hf.releasing = true
+			h.release = append(h.release, hf.id)
+			emptied++
+		}
+	}
 	var taken []*heapFile
-	for len(taken) < HeapCleanFiles {
+	var scan int64
+	for len(taken) < HeapCleanFiles && scan < HeapScanBytes {
 		hf := h.pickFile()
 		if hf == nil {
 			break
 		}
 		hf.cleaning = true
 		taken = append(taken, hf)
+		scan += hf.size
 	}
 	h.mu.Unlock()
 	if len(taken) == 0 {
-		return false, nil
+		return emptied > 0, nil
 	}
 	// 2. Without the lock: read and decode them.  A picked file is
 	// neither the block's nor the mover's, so its bytes do not change;
