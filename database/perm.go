@@ -986,9 +986,26 @@ func (p *PermStore) Pack() error {
 	return p.dropUnreferencedRunFiles()
 }
 
-// commitManifest writes perm.json aside and renames it into place.
-// The caller holds the lock.
+// commitManifest writes perm.json: encoded under the lock, written,
+// fsynced and renamed with the lock released, so that a merge's
+// manifest commit -- every twenty blocks, per shard -- is not a
+// barrier the shard's puts and seal wait behind (spec 1.6).  A delta
+// the seal appends meanwhile lies after the offset the manifest
+// records, and open replays it.  The caller holds the lock and gets
+// it back.
 func (p *PermStore) commitManifest() error {
+	buf, err := p.encodeManifest()
+	if err != nil {
+		return err
+	}
+	p.mu.Unlock()
+	err = p.writeManifest(buf)
+	p.mu.Lock()
+	return err
+}
+
+// encodeManifest is the manifest as of now.  The caller holds the lock.
+func (p *PermStore) encodeManifest() ([]byte, error) {
 	m := permManifest{Version: 1, Height: p.height, FilterBlocks: p.window_n, Rotation: p.rotation, NextData: p.nextID, NextRun: p.nextRun}
 	ref := func(r *permRun, rf *runFile, height uint64) permRunRef {
 		return permRunRef{File: rf.id, Off: r.off, Height: height}
@@ -1022,14 +1039,16 @@ func (p *PermStore) commitManifest() error {
 	sort.Slice(m.DataFiles, func(i, j int) bool { return m.DataFiles[i] < m.DataFiles[j] })
 	sort.Slice(m.RunFiles, func(i, j int) bool { return m.RunFiles[i] < m.RunFiles[j] })
 	sort.Slice(m.DeltaFiles, func(i, j int) bool { return m.DeltaFiles[i] < m.DeltaFiles[j] })
-	// Deltas sealed after this commit append to the current run file
+	// Deltas sealed after this point append to the current delta file
 	// from its end; open replays from there
 	m.DeltasFile, m.DeltasOff = p.curRun.id, p.curRun.size
 	p.deltasFrom.file, p.deltasFrom.off = m.DeltasFile, m.DeltasOff
-	buf, err := json.MarshalIndent(m, "", " ")
-	if err != nil {
-		return err
-	}
+	return json.MarshalIndent(m, "", " ")
+}
+
+// writeManifest writes the encoded manifest aside, fsyncs it, renames
+// it into place and fsyncs the directory.  No lock is held.
+func (p *PermStore) writeManifest(buf []byte) error {
 	path := filepath.Join(p.Directory, "perm.json")
 	tmp := path + segTmpSuffix
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
