@@ -141,10 +141,11 @@ type permBucket struct {
 
 // runFile is a file of runs and how many runs still reference it.
 type runFile struct {
-	id   uint32
-	f    *os.File
-	size int64
-	refs int
+	id       uint32
+	f        *os.File
+	size     int64
+	refs     int
+	unsynced bool // Runs written since the file was last fsynced
 }
 
 func permDataName(id uint32) string { return fmt.Sprintf("perm-%06d.dat", id) }
@@ -484,6 +485,9 @@ func (p *PermStore) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.manifestDirty {
+		if err = p.syncRunFiles(); err != nil {
+			return err
+		}
 		if err = p.commitManifest(); err != nil {
 			return err
 		}
@@ -896,12 +900,15 @@ func (p *PermStore) Merge() error {
 			run *permRun
 		}{b: j.b, run: run})
 	}
-	if err := fsync(rf.f); err != nil {
-		return err
-	}
+	// No barrier here: a bucket's run is named by the manifest alone,
+	// so it needs to be durable before the manifest commit and not
+	// before.  Every merge call once ended with an fsync of its run
+	// file, which at a call per shard per block was 72-144 barriers
+	// a second at nine stores and doubled every seal's fsync.
 	// Swap: the new runs join their buckets; then fold what the ratio
 	// says, one bucket at a time
 	p.mu.Lock()
+	rf.unsynced = true
 	for _, w := range written {
 		bk := &p.buckets[w.b]
 		bk.runs = append(bk.runs, w.run)
@@ -928,20 +935,10 @@ func (p *PermStore) Merge() error {
 	p.pending = keep
 	folds := p.planFolds()
 	p.mu.Unlock()
-	// The folds' runs are written without a barrier each and synced
-	// once, before the manifest that names them
-	var synced []*runFile
+	// The folds' runs are written without a barrier too; the manifest
+	// commit syncs every run file written since the last
 	for _, f := range folds {
-		rf, err := p.fold(f)
-		if err != nil {
-			return err
-		}
-		if rf != nil && (len(synced) == 0 || synced[len(synced)-1] != rf) {
-			synced = append(synced, rf)
-		}
-	}
-	for _, rf := range synced {
-		if err := fsync(rf.f); err != nil {
+		if _, err := p.fold(f); err != nil {
 			return err
 		}
 	}
@@ -957,6 +954,9 @@ func (p *PermStore) Merge() error {
 	p.manifestDirty = true
 	if len(folds) == 0 && p.height-p.manifestAt < PermManifestBlocks {
 		return nil
+	}
+	if err := p.syncRunFiles(); err != nil {
+		return err
 	}
 	if err := p.commitManifest(); err != nil {
 		return err
@@ -1033,6 +1033,7 @@ func (p *PermStore) fold(f permFold) (*runFile, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rf.size = at + int64(run.bytes)
+	rf.unsynced = true
 	bk = &p.buckets[f.b]
 	if f.at+f.count > len(bk.runs) {
 		return rf, nil
@@ -1110,10 +1111,44 @@ func (p *PermStore) Pack() error {
 	for b := range p.buckets {
 		p.buckets[b] = permBucket{merged: height}
 	}
+	if err := p.syncRunFiles(); err != nil {
+		return err
+	}
 	if err := p.commitManifest(); err != nil {
 		return err
 	}
 	return p.dropUnreferencedRunFiles()
+}
+
+// syncRunFiles makes every run file written since its last fsync
+// durable, with the lock released for the barriers.  Maintenance is
+// one pass at a time, so nothing writes a run file meanwhile.  The
+// caller holds the lock and gets it back.
+func (p *PermStore) syncRunFiles() error {
+	var dirty []*runFile
+	for _, rf := range p.runs {
+		if rf.unsynced {
+			dirty = append(dirty, rf)
+		}
+	}
+	if len(dirty) == 0 {
+		return nil
+	}
+	p.mu.Unlock()
+	var err error
+	for _, rf := range dirty {
+		if err = fsync(rf.f); err != nil {
+			break
+		}
+	}
+	p.mu.Lock()
+	if err != nil {
+		return err
+	}
+	for _, rf := range dirty {
+		rf.unsynced = false
+	}
+	return nil
 }
 
 // commitManifest writes perm.json: encoded under the lock, written,
