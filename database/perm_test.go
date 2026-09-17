@@ -90,9 +90,8 @@ func TestPermStoreTiersAndReopen(t *testing.T) {
 		}
 		sealPerm(t, p, b)
 	}
-	// A torn delta after the last seal: the crash
-	rf := p.curRun
-	_, err = rf.f.WriteAt([]byte("PRUNgarbage"), rf.size)
+	// A torn entry after the last seal: the crash
+	_, err = p.cur.f.WriteAt([]byte{9, 0, 0, 0, 1, 2, 3, 4, 5, 6}, p.cur.size)
 	require.NoError(t, err)
 	last := keys[len(keys)-perBlock:]
 	for _, hf := range p.files {
@@ -104,7 +103,7 @@ func TestPermStoreTiersAndReopen(t *testing.T) {
 	r, err := OpenPermStore(dir)
 	require.NoError(t, err)
 	defer r.Close()
-	require.EqualValues(t, 3*MinFilterBlocks+5, r.height-1+1, "the replayed deltas set the height")
+	require.EqualValues(t, 3*MinFilterBlocks+6, r.height, "the replayed deltas leave the height at the next block, as the seal does")
 	for i, k := range last {
 		v, err := r.Get(k)
 		require.NoError(t, err, "a delta replayed after the manifest")

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,14 +23,19 @@ import (
 //	perm-N.dat   entries, [len][height][key][value][crc] (heap.go's
 //	             layout), appended in the order written, rolled at
 //	             PermFileBytes; never rewritten
-//	deltas-N.dat the seal's run file: a block's delta appended at every
-//	             seal; open replays the deltas after the manifest from
-//	             these files alone
 //	runs-N.dat   maintenance's run file: a bucket's run at every merge,
-//	             a retired run at every pack; never the seal's, so their
-//	             barriers never share an inode; both kinds are rolled
-//	             at PermFileBytes and deleted once no run in them is
-//	             referenced
+//	             a retired run at every pack; rolled at PermFileBytes
+//	             and deleted once no run in it is referenced
+//
+// A block's delta -- its records' run, with its filter -- is appended
+// to the block's data file right behind the block's entries, as an
+// entry under the reserved key heap.go's deltas use, so a block is
+// ONE fsync per shard for the permanent layer: entries and delta
+// together.  Open replays the deltas in the data files after the
+// point the manifest records, verifies the last one's entries by
+// their checksums before trusting it, and cuts the newest data file
+// back to the last delta.
+//
 //	perm.json    the manifest: which runs are the window, the buckets
 //	             and the retired history, and where in the run files
 //	             the deltas not yet in the manifest begin
@@ -71,7 +77,6 @@ type PermStore struct {
 	dirty  map[uint32]*heapFile
 
 	runs      map[uint32]*runFile // Run files, by id
-	curRun    *runFile            // The run file the seal appends deltas to
 	maintRun  *runFile            // The run file maintenance appends to: never the seal's, so their barriers never share an inode
 	nextRun   uint32
 	live      map[[32]byte]permRecord // This block's records
@@ -117,7 +122,8 @@ var PermFoldRatio = 0.25
 type permDelta struct {
 	height uint64
 	run    *permRun
-	rf     *runFile
+	f      *os.File // The data file the delta lies in
+	data   uint32   // Its id
 }
 
 type permBucket struct {
@@ -128,23 +134,15 @@ type permBucket struct {
 
 // runFile is a file of runs and how many runs still reference it.
 type runFile struct {
-	id     uint32
-	f      *os.File
-	size   int64
-	refs   int
-	deltas bool // The seal's, replayed on open; else maintenance's
+	id   uint32
+	f    *os.File
+	size int64
+	refs int
 }
 
-func permDataName(id uint32) string  { return fmt.Sprintf("perm-%06d.dat", id) }
-func permRunName(id uint32) string   { return fmt.Sprintf("runs-%06d.dat", id) }
-func permDeltaName(id uint32) string { return fmt.Sprintf("deltas-%06d.dat", id) }
-
-func (rf *runFile) name() string {
-	if rf.deltas {
-		return permDeltaName(rf.id)
-	}
-	return permRunName(rf.id)
-}
+func permDataName(id uint32) string { return fmt.Sprintf("perm-%06d.dat", id) }
+func permRunName(id uint32) string  { return fmt.Sprintf("runs-%06d.dat", id) }
+func (rf *runFile) name() string    { return permRunName(rf.id) }
 
 // NewPermStore creates an empty store in directory, replacing anything
 // there.
@@ -182,11 +180,10 @@ type permManifest struct {
 	Retired      []permRunRef  `json:"retired"`
 	DataFiles    []uint32      `json:"dataFiles"`
 	RunFiles     []uint32      `json:"runFiles"`
-	DeltaFiles   []uint32      `json:"deltaFiles"`
 }
 
 type permRunRef struct {
-	File   uint32 `json:"file"`
+	File   uint32 `json:"file"` // A data file for a delta, a run file otherwise
 	Off    int64  `json:"off"`
 	Height uint64 `json:"height,omitempty"`
 }
@@ -219,9 +216,6 @@ func (p *PermStore) Open() (err error) {
 		if p.cur, err = p.newDataFile(); err != nil {
 			return err
 		}
-		if p.curRun, err = p.newRunFile(true); err != nil {
-			return err
-		}
 		return p.commitManifest()
 	case err != nil:
 		return err
@@ -249,30 +243,6 @@ func (p *PermStore) Open() (err error) {
 		st, _ := f.Stat()
 		p.runs[id] = &runFile{id: id, f: f, size: st.Size()}
 	}
-	// Delta files: the manifest's, and any the seal created after it
-	deltaIDs := append([]uint32(nil), m.DeltaFiles...)
-	if entries, err := os.ReadDir(p.Directory); err == nil {
-		for _, e := range entries {
-			var id uint32
-			if n, _ := fmt.Sscanf(e.Name(), "deltas-%06d.dat", &id); n == 1 && id > m.NextRun-1 {
-				deltaIDs = append(deltaIDs, id)
-			}
-		}
-	}
-	for _, id := range deltaIDs {
-		if p.runs[id] != nil {
-			continue
-		}
-		f, err := os.OpenFile(filepath.Join(p.Directory, permDeltaName(id)), os.O_RDWR, 0o644)
-		if err != nil {
-			return fmt.Errorf("perm: delta file %s: %w", permDeltaName(id), err)
-		}
-		st, _ := f.Stat()
-		p.runs[id] = &runFile{id: id, f: f, size: st.Size(), deltas: true}
-		if id >= p.nextRun {
-			p.nextRun = id + 1
-		}
-	}
 	load := func(ref permRunRef, resident bool) (*permRun, *runFile, error) {
 		rf := p.runs[ref.File]
 		if rf == nil {
@@ -285,19 +255,30 @@ func (p *PermStore) Open() (err error) {
 		rf.refs++
 		return r, rf, nil
 	}
+	loadDelta := func(ref permRunRef) (*permDelta, error) {
+		hf := p.files[ref.File]
+		if hf == nil {
+			return nil, fmt.Errorf("perm: data file %d not open", ref.File)
+		}
+		r, err := openPermRun(hf.f, ref.File, ref.Off, true)
+		if err != nil {
+			return nil, err
+		}
+		return &permDelta{height: ref.Height, run: r, f: hf.f, data: ref.File}, nil
+	}
 	for _, ref := range m.Window {
-		r, rf, err := load(ref, true)
+		d, err := loadDelta(ref)
 		if err != nil {
 			return err
 		}
-		p.window = append(p.window, &permDelta{height: ref.Height, run: r, rf: rf})
+		p.window = append(p.window, d)
 	}
 	for _, ref := range m.Pending {
-		r, rf, err := load(ref, true)
+		d, err := loadDelta(ref)
 		if err != nil {
 			return err
 		}
-		p.pending = append(p.pending, &permDelta{height: ref.Height, run: r, rf: rf})
+		p.pending = append(p.pending, d)
 	}
 	for i, bm := range m.Buckets {
 		if i >= PermBuckets {
@@ -327,56 +308,98 @@ func (p *PermStore) Open() (err error) {
 			p.cur = hf
 		}
 	}
-	p.curRun = p.runs[m.DeltasFile]
-	if p.curRun == nil {
-		if p.curRun, err = p.newRunFile(true); err != nil {
-			return err
-		}
-	}
 	p.deltasFrom.file, p.deltasFrom.off = m.DeltasFile, m.DeltasOff
 	return p.replayDeltas()
 }
 
-// replayDeltas reads every whole delta after the manifest's offset
-// into the window (and pending), cutting a torn tail.  The caller
-// holds the lock.
+// replayDeltas applies every delta entry in the data files after the
+// manifest's point, oldest first, into the window and pending.  The
+// last delta is trusted only if every entry it names checks -- one
+// fsync covered it and its entries together -- and the newest data
+// file is cut back to the last delta admitted.  The caller holds the
+// lock.
 func (p *PermStore) replayDeltas() error {
-	ids := make([]uint32, 0, len(p.runs))
-	for id, rf := range p.runs {
-		if rf.deltas && id >= p.deltasFrom.file {
+	ids := make([]uint32, 0, len(p.files))
+	for id := range p.files {
+		if id >= p.deltasFrom.file {
 			ids = append(ids, id)
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	type found struct {
+		hf       *heapFile
+		off, end int64
+		run      *permRun
+	}
+	var deltas []found
 	for _, id := range ids {
-		rf := p.runs[id]
-		off := int64(0)
-		if id == p.deltasFrom.file {
-			off = p.deltasFrom.off
+		hf := p.files[id]
+		buf := make([]byte, hf.size)
+		if _, err := hf.f.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+			return err
 		}
-		for off < rf.size {
-			r, err := openPermRun(rf.f, id, off, true)
-			if err != nil {
-				// Torn: cut the file here
-				if err := rf.f.Truncate(off); err != nil {
-					return err
-				}
-				rf.size = off
+		at := int64(0)
+		if id == p.deltasFrom.file {
+			at = p.deltasFrom.off
+		}
+		for at < int64(len(buf)) {
+			size, _, key, _, ok := decodeEntry(buf[at:])
+			if size == 0 {
 				break
 			}
-			rf.refs++
-			p.admit(&permDelta{height: r.height, run: r, rf: rf})
-			if r.height > p.height {
-				p.height = r.height
+			if ok && key == heapDeltaKey {
+				r, err := openPermRun(hf.f, id, at+heapHeader, true)
+				if err == nil {
+					deltas = append(deltas, found{hf: hf, off: at, end: at + size, run: r})
+				}
 			}
-			off += int64(r.bytes)
-		}
-		// The newest delta file is the seal's current one
-		if p.curRun == nil || rf.id > p.curRun.id {
-			p.curRun = rf
+			at += size
 		}
 	}
+	var last *found
+	for i := range deltas {
+		d := &deltas[i]
+		if i == len(deltas)-1 && !p.deltaEntriesCheck(d.run, d.hf.f) {
+			break // The block did not commit
+		}
+		p.admit(&permDelta{height: d.run.height, run: d.run, f: d.hf.f, data: d.hf.id})
+		if d.run.height >= p.height {
+			p.height = d.run.height + 1
+		}
+		last = d
+	}
+	// The newest data file is cut back to what is committed: the last
+	// delta admitted, or the manifest's point
+	newest := p.files[ids[len(ids)-1]]
+	end := int64(0)
+	if newest.id == p.deltasFrom.file {
+		end = p.deltasFrom.off
+	}
+	if last != nil && last.hf == newest {
+		end = last.end
+	}
+	if newest.size > end {
+		if err := newest.f.Truncate(end); err != nil {
+			return err
+		}
+		newest.size = end
+	}
+	p.cur = newest
 	return nil
+}
+
+// deltaEntriesCheck reads every entry a delta names and checks it.
+func (p *PermStore) deltaEntriesCheck(r *permRun, f *os.File) bool {
+	recs, err := r.records(f)
+	if err != nil {
+		return false
+	}
+	for _, rec := range recs {
+		if _, err := p.readEntry(rec, rec.key); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // admit puts a delta in the window and moves what falls out of it to
@@ -401,10 +424,10 @@ func (p *PermStore) newDataFile() (*heapFile, error) {
 	return hf, nil
 }
 
-func (p *PermStore) newRunFile(deltas bool) (*runFile, error) {
+func (p *PermStore) newRunFile() (*runFile, error) {
 	id := p.nextRun
 	p.nextRun++
-	rf := &runFile{id: id, deltas: deltas}
+	rf := &runFile{id: id}
 	f, err := os.OpenFile(filepath.Join(p.Directory, rf.name()), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, err
@@ -436,7 +459,7 @@ func (p *PermStore) Close() error {
 			err = cerr
 		}
 	}
-	p.files, p.runs, p.cur, p.curRun = nil, nil, nil, nil
+	p.files, p.runs, p.cur, p.maintRun = nil, nil, nil, nil
 	return err
 }
 
@@ -457,7 +480,7 @@ func (p *PermStore) PutIfAbsent(key [32]byte, value []byte) (existing []byte, ex
 	}
 	for i := len(p.window) - 1; i >= 0; i-- {
 		d := p.window[i]
-		rec, found, err := d.run.lookup(d.rf.f, key)
+		rec, found, err := d.run.lookup(d.f, key)
 		if err != nil {
 			return nil, false, err
 		}
@@ -517,7 +540,7 @@ func (p *PermStore) Get(key [32]byte) ([]byte, error) {
 	}
 	for i := len(p.window) - 1; i >= 0; i-- {
 		d := p.window[i]
-		rec, found, err := d.run.lookup(d.rf.f, key)
+		rec, found, err := d.run.lookup(d.f, key)
 		if err != nil {
 			return nil, err
 		}
@@ -540,7 +563,7 @@ func (p *PermStore) GetDeep(key [32]byte) ([]byte, error) {
 	defer p.mu.RUnlock()
 	for i := len(p.pending) - 1; i >= 0; i-- {
 		d := p.pending[i]
-		rec, found, err := d.run.lookup(d.rf.f, key)
+		rec, found, err := d.run.lookup(d.f, key)
 		if err != nil {
 			return nil, err
 		}
@@ -625,36 +648,49 @@ func (s *permSeal) finish() error {
 		p.mu.Unlock()
 		return nil
 	}
+	// The delta's run goes into the block's data file behind the
+	// block's entries, under the reserved key, and the one fsync
+	// covers both
 	p.mu.Lock()
-	rf := p.curRun
-	if rf.size > PermFileBytes {
-		var err error
-		if rf, err = p.newRunFile(true); err != nil {
-			p.mu.Unlock()
-			return err
-		}
-		p.curRun = rf
-	}
-	at := rf.size
-	p.mu.Unlock()
-	run, err := writePermRun(rf.f, at, rf.id, s.recs, s.height)
+	defer p.mu.Unlock()
+	var w bufWriterAt
+	run, err := writePermRun(&w, 0, p.cur.id, s.recs, s.height)
 	if err != nil {
 		return err
 	}
-	if err = fsync(rf.f); err != nil {
+	entry := encodeEntry(s.height, heapDeltaKey, w.buf)
+	if p.cur.size+int64(len(entry)) > PermFileBytes {
+		if p.cur, err = p.newDataFile(); err != nil {
+			return err
+		}
+	}
+	hf, at := p.cur, p.cur.size
+	if _, err = hf.f.WriteAt(entry, at); err != nil {
+		return err
+	}
+	hf.size += int64(len(entry))
+	run.file, run.off, run.bloomAt = hf.id, at+heapHeader, at+heapHeader+run.bloomAt
+	if err = fsync(hf.f); err != nil {
 		return err
 	}
 	p.indexBytes.Add(uint64(run.bytes))
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	rf.size = at + int64(run.bytes)
-	rf.refs++
-	p.admit(&permDelta{height: s.height, run: run, rf: rf})
+	p.admit(&permDelta{height: s.height, run: run, f: hf.f, data: hf.id})
 	p.live = map[[32]byte]permRecord{}
 	if s.height >= p.height {
 		p.height = s.height + 1
 	}
 	return nil
+}
+
+// bufWriterAt collects what a run writer writes at offset 0.
+type bufWriterAt struct{ buf []byte }
+
+func (w *bufWriterAt) WriteAt(b []byte, off int64) (int, error) {
+	if need := int(off) + len(b); need > len(w.buf) {
+		w.buf = append(w.buf, make([]byte, need-len(w.buf))...)
+	}
+	copy(w.buf[off:], b)
+	return len(b), nil
 }
 
 // AdvanceBlock sets the block new writes belong to.
@@ -682,7 +718,7 @@ func (p *PermStore) LiveCount() int {
 // PermFileBytes.  The caller holds the lock.
 func (p *PermStore) maintFile() (*runFile, error) {
 	if p.maintRun == nil || p.maintRun.size > PermFileBytes {
-		rf, err := p.newRunFile(false)
+		rf, err := p.newRunFile()
 		if err != nil {
 			return nil, err
 		}
@@ -734,7 +770,7 @@ func (p *PermStore) Merge() error {
 	p.mu.Unlock()
 	byBucket := map[int][][]permRecord{}
 	for _, d := range pendingCopy {
-		recs, err := d.run.records(d.rf.f)
+		recs, err := d.run.records(d.f)
 		if err != nil {
 			return err
 		}
@@ -810,10 +846,8 @@ func (p *PermStore) Merge() error {
 	}
 	var keep []*permDelta
 	for _, d := range p.pending {
-		if d.height <= minMerged {
-			d.rf.refs--
-		} else {
-			keep = append(keep, d)
+		if d.height > minMerged {
+			keep = append(keep, d) // A delta in a data file costs nothing to drop: the file stays
 		}
 	}
 	p.pending = keep
@@ -936,13 +970,12 @@ func (p *PermStore) Pack() error {
 	var inputs [][]permRecord
 	var release []*runFile
 	for _, d := range p.pending {
-		recs, err := d.run.records(d.rf.f)
+		recs, err := d.run.records(d.f)
 		if err != nil {
 			p.mu.RUnlock()
 			return err
 		}
 		inputs = append(inputs, recs)
-		release = append(release, d.rf)
 	}
 	for b := range p.buckets {
 		for i, r := range p.buckets[b].runs {
@@ -1022,10 +1055,10 @@ func (p *PermStore) encodeManifest() ([]byte, error) {
 		return permRunRef{File: rf.id, Off: r.off, Height: height}
 	}
 	for _, d := range p.window {
-		m.Window = append(m.Window, ref(d.run, d.rf, d.height))
+		m.Window = append(m.Window, permRunRef{File: d.data, Off: d.run.off, Height: d.height})
 	}
 	for _, d := range p.pending {
-		m.Pending = append(m.Pending, ref(d.run, d.rf, d.height))
+		m.Pending = append(m.Pending, permRunRef{File: d.data, Off: d.run.off, Height: d.height})
 	}
 	for b := range p.buckets {
 		bm := permBucketM{Merged: p.buckets[b].merged}
@@ -1040,19 +1073,14 @@ func (p *PermStore) encodeManifest() ([]byte, error) {
 	for id := range p.files {
 		m.DataFiles = append(m.DataFiles, id)
 	}
-	for id, rf := range p.runs {
-		if rf.deltas {
-			m.DeltaFiles = append(m.DeltaFiles, id)
-		} else {
-			m.RunFiles = append(m.RunFiles, id)
-		}
+	for id := range p.runs {
+		m.RunFiles = append(m.RunFiles, id)
 	}
 	sort.Slice(m.DataFiles, func(i, j int) bool { return m.DataFiles[i] < m.DataFiles[j] })
 	sort.Slice(m.RunFiles, func(i, j int) bool { return m.RunFiles[i] < m.RunFiles[j] })
-	sort.Slice(m.DeltaFiles, func(i, j int) bool { return m.DeltaFiles[i] < m.DeltaFiles[j] })
-	// Deltas sealed after this point append to the current delta file
-	// from its end; open replays from there
-	m.DeltasFile, m.DeltasOff = p.curRun.id, p.curRun.size
+	// Deltas sealed after this point lie in the data files from the
+	// current one's end; open replays from there
+	m.DeltasFile, m.DeltasOff = p.cur.id, p.cur.size
 	p.deltasFrom.file, p.deltasFrom.off = m.DeltasFile, m.DeltasOff
 	return json.MarshalIndent(m, "", " ")
 }
@@ -1088,7 +1116,7 @@ func (p *PermStore) writeManifest(buf []byte) error {
 // holds the lock.
 func (p *PermStore) dropUnreferencedRunFiles() error {
 	for id, rf := range p.runs {
-		if rf.refs > 0 || rf == p.curRun || rf == p.maintRun {
+		if rf.refs > 0 || rf == p.maintRun {
 			continue
 		}
 		rf.f.Close()
