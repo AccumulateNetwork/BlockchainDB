@@ -70,18 +70,19 @@ type PermStore struct {
 	nextID uint32
 	dirty  map[uint32]*heapFile
 
-	runs     map[uint32]*runFile // Run files, by id
-	curRun   *runFile            // The run file the seal appends deltas to
-	maintRun *runFile            // The run file maintenance appends to: never the seal's, so their barriers never share an inode
-	nextRun  uint32
-	live     map[[32]byte]permRecord // This block's records
-	window   []*permDelta            // The last FilterBlocks deltas, oldest first
-	pending  []*permDelta            // Deltas below the window not yet in every bucket
-	buckets  [PermBuckets]permBucket // The history above the watermark
-	retired  []*permRun              // The history below it, newest last
-	height   uint64
-	window_n uint64 // FilterBlocks
-	rotation int    // The next bucket to merge
+	runs      map[uint32]*runFile // Run files, by id
+	curRun    *runFile            // The run file the seal appends deltas to
+	maintRun  *runFile            // The run file maintenance appends to: never the seal's, so their barriers never share an inode
+	nextRun   uint32
+	live      map[[32]byte]permRecord // This block's records
+	window    []*permDelta            // The last FilterBlocks deltas, oldest first
+	pending   []*permDelta            // Deltas below the window not yet in every bucket
+	buckets   [PermBuckets]permBucket // The history above the watermark
+	retired   []*permRun              // The history below it, newest last
+	height    uint64
+	window_n  uint64 // FilterBlocks
+	rotation  int    // The next bucket to merge
+	lastMerge uint64 // The height Merge last ran at: what decides how many buckets are due
 
 	// The manifest's view: the run file and offset after which deltas
 	// are replayed on open
@@ -705,11 +706,21 @@ func (p *PermStore) Merge() error {
 		p.mu.Unlock()
 		return nil
 	}
-	// Which buckets, and from which deltas
-	due := int(PermBuckets / PermMergeEvery)
+	// Which buckets: every bucket is due once per PermMergeEvery
+	// blocks, so a call that comes after n blocks takes n/PermMergeEvery
+	// of them, whatever the caller's cadence
+	elapsed := p.height - p.lastMerge
+	if p.lastMerge == 0 || elapsed > PermMergeEvery {
+		elapsed = PermMergeEvery
+	}
+	due := int(uint64(PermBuckets) * elapsed / PermMergeEvery)
 	if due < 1 {
 		due = 1
 	}
+	if due > PermBuckets {
+		due = PermBuckets
+	}
+	p.lastMerge = p.height
 	newest := p.pending[len(p.pending)-1].height
 	type job struct{ b int }
 	var jobs []job
