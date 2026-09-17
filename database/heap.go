@@ -1121,30 +1121,52 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	if len(taken) == 0 {
 		return emptied > 0, nil
 	}
-	// 2. Without the lock: read and decode them.  A picked file is
-	// neither the block's nor the mover's, so its bytes do not change;
-	// only what the index says of them can, and that is checked under
-	// the lock.  Decoding here, checksums included, keeps 16 MB of
-	// CRC per file off the lock
+	// 2. Under the lock, briefly: the picked files' live slots, from
+	// the index -- one pass over the map, not a decode of the files.
+	// Scanning a file to find its live entries read and checksummed
+	// up to 128 MB a shard per pass, and nine stores' passes together
+	// starved the block loops for CPU (load 27 on 24 cores, seal p50
+	// 200 ms for the minute).  Then without the lock: read those
+	// entries, and only those
+	type liveSlot struct {
+		key [32]byte
+		s   slot
+	}
+	h.mu.Lock()
+	picked := map[uint32]int{}
+	for i, hf := range taken {
+		picked[hf.id] = i
+	}
+	slots := make([][]liveSlot, len(taken))
+	for key, s := range h.index {
+		if i, ok := picked[s.file]; ok {
+			slots[i] = append(slots[i], liveSlot{key: key, s: s})
+		}
+	}
+	h.mu.Unlock()
 	entries := make([][]heapEntry, len(taken))
 	for i, hf := range taken {
-		buf := make([]byte, hf.size)
-		if _, err := hf.f.ReadAt(buf, 0); err != nil {
-			h.mu.Lock()
-			for _, hf := range taken {
-				hf.cleaning = false
+		sort.Slice(slots[i], func(a, b int) bool { return slots[i][a].s.off < slots[i][b].s.off })
+		for _, ls := range slots[i] {
+			buf := make([]byte, entrySize(int(ls.s.n)))
+			if _, err := hf.f.ReadAt(buf, int64(ls.s.off)); err != nil {
+				h.mu.Lock()
+				for _, hf := range taken {
+					hf.cleaning = false
+				}
+				h.mu.Unlock()
+				return false, err
 			}
-			h.mu.Unlock()
-			return false, err
+			size, _, key, value, ok := decodeEntry(buf)
+			if !ok || key != ls.key {
+				continue // Damaged or stale: left where it is, and a read of it reports the damage
+			}
+			entries[i] = append(entries[i], heapEntry{off: ls.s.off, size: size, key: key, value: value})
 		}
-		entries[i] = decodeFile(buf)
 		h.cleanedBytes.Add(uint64(hf.size))
 	}
-	// 3. Under the lock, a chunk of entries at a time: decide what is
-	// live and reserve each copy's slot in the mover's file.  A pass
-	// walks up to a million entries; taking the lock per chunk keeps
-	// each hold to a millisecond or so.  A block sync may begin
-	// between chunks; the mover's file is never in its dirty set
+	// 3. Under the lock, a chunk of entries at a time: confirm each is
+	// still named and reserve its copy's slot in the mover's file
 	var moves []heapMove
 	var copied int64
 	for i, hf := range taken {
@@ -1278,23 +1300,6 @@ type heapEntry struct {
 	size  int64
 	key   [32]byte
 	value []byte
-}
-
-// decodeFile walks a file's bytes into its entries, stopping at the
-// first unwritten, torn or damaged slot.
-func decodeFile(buf []byte) (entries []heapEntry) {
-	var at int64
-	for at < int64(len(buf)) {
-		size, _, key, value, ok := decodeEntry(buf[at:])
-		if size == 0 {
-			break
-		}
-		if ok {
-			entries = append(entries, heapEntry{off: uint32(at), size: size, key: key, value: value})
-		}
-		at += size // A damaged entry stays where it is: not moved, not named by the mover
-	}
-	return entries
 }
 
 // planFile reserves, in the mover's file, a slot for each entry of a
