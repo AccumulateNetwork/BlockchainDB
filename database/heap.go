@@ -123,6 +123,27 @@ type HeapStore struct {
 	// a block's finish and the time in those unlinks; snapshots
 	// written and the time in them
 	releases, releaseNs, snapshotsN, snapshotNs atomic.Uint64
+	unlink                                      []uint32 // Released files not yet deleted
+	// The bytes one mover pass may copy; 0 means HeapCleanBytes.  A
+	// store's budget is HeapStoreCleanBytes however many shards it
+	// has, so a shard gets its share (SetCleanBudget).
+	budget int64
+}
+
+// SetCleanBudget sets the bytes one mover pass may copy.
+func (h *HeapStore) SetCleanBudget(n int64) {
+	h.mu.Lock()
+	h.budget = n
+	h.mu.Unlock()
+}
+
+func (h *HeapStore) cleanBudget() int64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.budget > 0 {
+		return h.budget
+	}
+	return HeapCleanBytes
 }
 
 // heapFile is one data file and its accounting.
@@ -188,6 +209,13 @@ var HeapFileBlocks uint64 = 64
 // (run 7), 4 MB releases more than the soak appends per shard per
 // cadence (~4 MB, of which a quarter to a third is live).
 var HeapCleanBytes int64 = 4 << 20
+
+// HeapStoreCleanBytes is a store's mover budget per pass, shared out
+// among its shards: a store sharded eight ways moves the same bytes a
+// pass as one sharded once.  Measured: with one shard and the
+// per-shard budget alone the store grew to 6 GB in five minutes
+// where eight shards held it under 4.
+var HeapStoreCleanBytes int64 = 32 << 20
 
 // HeapCleanFiles and HeapScanBytes bound a pass by the files it takes
 // and the bytes it reads: with hot keys most of a file is dead and
@@ -731,6 +759,9 @@ func (h *HeapStore) Close() error {
 	if err := p.finish(); err != nil {
 		return err
 	}
+	if err := h.unlinkReleased(); err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.closed = true
@@ -1011,20 +1042,37 @@ func (p *heapSync) finish() (err error) {
 	h.syncBytes.Add(uint64(p.bytes))
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(p.release) > 0 {
-		t = time.Now()
-		for _, id := range p.release {
-			hf := h.files[id]
-			hf.f.Close()
-			delete(h.files, id)
-			h.deadBytes -= hf.dead
-			if err = os.Remove(filepath.Join(h.Directory, dataName(id))); err != nil {
-				return err
-			}
-		}
-		h.releases.Add(uint64(len(p.release)))
-		h.releaseNs.Add(uint64(time.Since(t)))
+	// The files the delta no longer names leave the map now; their
+	// unlinks are the mover's, off the block's path.  Until then they
+	// are unnamed files on disk, which an open deletes as such.
+	for _, id := range p.release {
+		hf := h.files[id]
+		hf.f.Close()
+		delete(h.files, id)
+		h.deadBytes -= hf.dead
+		h.unlink = append(h.unlink, id)
 	}
+	return nil
+}
+
+// unlinkReleased deletes the files the block syncs have released.
+// Called without the lock.
+func (h *HeapStore) unlinkReleased() error {
+	h.mu.Lock()
+	ids := h.unlink
+	h.unlink = nil
+	h.mu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	t := time.Now()
+	for _, id := range ids {
+		if err := os.Remove(filepath.Join(h.Directory, dataName(id))); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	h.releases.Add(uint64(len(ids)))
+	h.releaseNs.Add(uint64(time.Since(t)))
 	return nil
 }
 
@@ -1032,7 +1080,10 @@ func (p *heapSync) finish() (err error) {
 // bounded mover pass, and every HeapSnapshotEvery calls a new index
 // generation, which bounds the replay on open.
 func (h *HeapStore) compact() (bool, error) {
-	moved, err := h.clean(HeapCleanBytes)
+	if err := h.unlinkReleased(); err != nil {
+		return false, err
+	}
+	moved, err := h.clean(h.cleanBudget())
 	if err != nil {
 		return moved, err
 	}

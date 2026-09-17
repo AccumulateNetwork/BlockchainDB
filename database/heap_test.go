@@ -82,8 +82,14 @@ func TestHeapRewriteReusesWithinTheBlockAndMovesOneSyncLate(t *testing.T) {
 	released := append([]uint32(nil), h.release...)
 	syncHeap(t, h)
 	for _, id := range released {
+		require.Nil(t, h.files[id], "out of the map after the sync")
 		_, err := os.Stat(filepath.Join(h.Directory, dataName(id)))
-		require.ErrorIs(t, err, os.ErrNotExist, "deleted after the sync")
+		require.NoError(t, err, "the unlink is the mover's, off the block's path")
+	}
+	require.NoError(t, h.unlinkReleased())
+	for _, id := range released {
+		_, err := os.Stat(filepath.Join(h.Directory, dataName(id)))
+		require.ErrorIs(t, err, os.ErrNotExist, "deleted by the mover")
 	}
 	_, copied := h.Cleaned()
 	require.Greater(t, copied, uint64(0), "the live entries left in it were copied out")

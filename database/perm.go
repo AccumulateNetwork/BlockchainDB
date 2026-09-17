@@ -633,6 +633,8 @@ type permSeal struct {
 	dirty  []*heapFile
 	recs   []permRecord
 	height uint64
+	run    *permRun  // The delta as written, admitted once durable
+	hf     *heapFile // The data file it was written to
 }
 
 // beginSeal takes the block's records under the lock; finish makes
@@ -654,12 +656,52 @@ func (p *PermStore) beginSeal(height uint64) (*permSeal, error) {
 	for _, rec := range p.live {
 		s.recs = append(s.recs, rec)
 	}
+	p.live = map[[32]byte]permRecord{} // A put from here on is the next block's
 	sortPermRecords(s.recs)
+	if len(s.recs) == 0 {
+		return s, nil
+	}
+	// The delta's run goes into the block's data file behind the
+	// block's entries, under the reserved key: one fsync of that file
+	// covers both, and replay trusts the last delta only if every
+	// entry it names checks (spec 1.7)
+	var w bufWriterAt
+	run, err := writePermRun(&w, 0, p.cur.id, s.recs, s.height)
+	if err != nil {
+		p.syncMu.Unlock()
+		return nil, err
+	}
+	entry := encodeEntry(s.height, heapDeltaKey, w.buf)
+	if p.cur.size+int64(len(entry)) > PermFileBytes {
+		if p.cur, err = p.newDataFile(); err != nil {
+			p.syncMu.Unlock()
+			return nil, err
+		}
+	}
+	hf, at := p.cur, p.cur.size
+	if _, err = hf.f.WriteAt(entry, at); err != nil {
+		p.syncMu.Unlock()
+		return nil, err
+	}
+	hf.size += int64(len(entry))
+	run.file, run.off, run.bloomAt = hf.id, at+heapHeader, at+heapHeader+run.bloomAt
+	s.run, s.hf = run, hf
+	if _, dirty := p.dirty[hf.id]; !dirty {
+		for _, d := range s.dirty {
+			if d == hf {
+				dirty = true
+			}
+		}
+		if !dirty {
+			s.dirty = append(s.dirty, hf)
+		}
+	}
 	return s, nil
 }
 
-// finish: entries durable, then the delta appended and durable, then
-// the delta admitted to the window and the live map cleared.
+// finish: the block's entries and its delta durable, one fsync per
+// file touched, with the lock released; then the delta admitted to
+// the window.  Releases syncMu.
 func (s *permSeal) finish() error {
 	p := s.p
 	defer p.syncMu.Unlock()
@@ -668,42 +710,12 @@ func (s *permSeal) finish() error {
 			return err
 		}
 	}
-	if len(s.recs) == 0 {
-		p.mu.Lock()
-		if s.height >= p.height {
-			p.height = s.height + 1
-		}
-		p.mu.Unlock()
-		return nil
-	}
-	// The delta's run goes into the block's data file behind the
-	// block's entries, under the reserved key, and the one fsync
-	// covers both
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var w bufWriterAt
-	run, err := writePermRun(&w, 0, p.cur.id, s.recs, s.height)
-	if err != nil {
-		return err
+	if s.run != nil {
+		p.indexBytes.Add(uint64(s.run.bytes))
+		p.admit(&permDelta{height: s.height, run: s.run, f: s.hf.f, data: s.hf.id})
 	}
-	entry := encodeEntry(s.height, heapDeltaKey, w.buf)
-	if p.cur.size+int64(len(entry)) > PermFileBytes {
-		if p.cur, err = p.newDataFile(); err != nil {
-			return err
-		}
-	}
-	hf, at := p.cur, p.cur.size
-	if _, err = hf.f.WriteAt(entry, at); err != nil {
-		return err
-	}
-	hf.size += int64(len(entry))
-	run.file, run.off, run.bloomAt = hf.id, at+heapHeader, at+heapHeader+run.bloomAt
-	if err = fsync(hf.f); err != nil {
-		return err
-	}
-	p.indexBytes.Add(uint64(run.bytes))
-	p.admit(&permDelta{height: s.height, run: run, f: hf.f, data: hf.id})
-	p.live = map[[32]byte]permRecord{}
 	if s.height >= p.height {
 		p.height = s.height + 1
 	}
