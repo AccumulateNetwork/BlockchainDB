@@ -179,6 +179,7 @@ func OpenKVShard(directory string) (kVShard *KVShard, err error) {
 			return nil, err
 		}
 	}
+	kVShard.phaseSnapshots()
 	kVShard.useSharedBlockRecord()
 	if err = kVShard.adoptBlockHeight(); err != nil {
 		return nil, err
@@ -256,6 +257,17 @@ func NewKVShardN(directory string, shards int, sealLimit uint64) (kvs *KVShard, 
 	return newKVShardN(directory, shards, sealLimit, NewKV2)
 }
 
+// phaseSnapshots spreads the heap shards' key-map snapshots over the
+// snapshot period, so that a store's shards do not all write theirs
+// on the same block.
+func (k *KVShard) phaseSnapshots() {
+	for i, shard := range k.Shards {
+		if shard.Heap != nil {
+			shard.Heap.SetSnapshotPhase(uint64(i) * HeapSnapshotBlocks / uint64(len(k.Shards)))
+		}
+	}
+}
+
 func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(string, uint64) (*KV2, error)) (kvs *KVShard, err error) {
 	if shards < 1 {
 		return nil, fmt.Errorf("a database needs at least one shard, asked for %d", shards)
@@ -274,6 +286,7 @@ func newKVShardN(directory string, shards int, sealLimit uint64, newShard func(s
 			return nil, err
 		}
 	}
+	kvs.phaseSnapshots()
 	kvs.useSharedBlockRecord()
 	if kvs.Sets, err = NewSetStore(kvs.setDir()); err != nil {
 		return nil, err

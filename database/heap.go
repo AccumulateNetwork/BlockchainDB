@@ -103,10 +103,11 @@ type HeapStore struct {
 	// snapshot, so the map a snapshot writes is exactly the state of
 	// the last finished delta and no delta is in flight into a log
 	// about to be retired.
-	syncMu sync.Mutex
-	log    *os.File
-	gen    uint64
-	snapAt uint64 // The block the key map was last snapshotted at
+	syncMu    sync.Mutex
+	log       *os.File
+	gen       uint64
+	snapAt    uint64 // The block the key map was last snapshotted at
+	snapPhase uint64 // Blocks this shard's snapshot cadence is offset by
 
 	closed    bool
 	liveBytes int64
@@ -1047,6 +1048,14 @@ func (p *heapSync) finish() (err error) {
 	return nil
 }
 
+// SetSnapshotPhase offsets this shard's snapshot cadence by blocks, so
+// that a store's shards do not all snapshot on the same block.
+func (h *HeapStore) SetSnapshotPhase(blocks uint64) {
+	h.mu.Lock()
+	h.snapPhase = blocks
+	h.mu.Unlock()
+}
+
 // unlinkReleased deletes the files the block syncs have released.
 // Called without the lock.
 func (h *HeapStore) unlinkReleased() error {
@@ -1092,7 +1101,7 @@ func (h *HeapStore) compact(budget int64) (bool, error) {
 			pinned += hf.size
 		}
 	}
-	due := h.height-h.snapAt >= HeapSnapshotBlocks || pinned >= HeapSnapshotPinnedFiles*HeapFileBytes
+	due := h.height+h.snapPhase-h.snapAt >= HeapSnapshotBlocks || pinned >= HeapSnapshotPinnedFiles*HeapFileBytes
 	if due {
 		h.snapAt = h.height
 	}
