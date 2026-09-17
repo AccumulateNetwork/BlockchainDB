@@ -195,6 +195,58 @@ func (r *permRun) records(f *os.File) ([]permRecord, error) {
 	return recs, nil
 }
 
+// recordsBucketRange reads the records whose first key byte lies in
+// [lo, hi]: the run is sorted, so they are one slice, found by a
+// binary search that probes a byte per step and read at once.  A
+// merge takes its due buckets' records from every pending delta this
+// way rather than reading each delta whole -- with buckets due in
+// rotation that was a read of every pending delta, up to
+// PermMergeEvery blocks of them, at every pass.
+func (r *permRun) recordsBucketRange(f *os.File, lo, hi byte) ([]permRecord, error) {
+	first := func(i int) (byte, error) {
+		var b [1]byte
+		_, err := f.ReadAt(b[:], r.off+permRunHdr+int64(i)*permRecSize)
+		return b[0], err
+	}
+	// The first record whose key's first byte is not below target
+	search := func(target int) (int, error) {
+		i, j := 0, int(r.count)
+		for i < j {
+			m := int(uint(i+j) >> 1)
+			b, err := first(m)
+			if err != nil {
+				return 0, err
+			}
+			if int(b) < target {
+				i = m + 1
+			} else {
+				j = m
+			}
+		}
+		return i, nil
+	}
+	i, err := search(int(lo))
+	if err != nil {
+		return nil, err
+	}
+	j, err := search(int(hi) + 1)
+	if err != nil {
+		return nil, err
+	}
+	if j <= i {
+		return nil, nil
+	}
+	buf := make([]byte, (j-i)*permRecSize)
+	if _, err := f.ReadAt(buf, r.off+permRunHdr+int64(i)*permRecSize); err != nil {
+		return nil, err
+	}
+	recs := make([]permRecord, j-i)
+	for k := range recs {
+		recs[k] = getPermRecord(buf[k*permRecSize:])
+	}
+	return recs, nil
+}
+
 // mergePermRuns merges sorted record lists, oldest first, into one
 // sorted list; a key present in several takes the newest.  Permanent
 // keys are written once, so a duplicate is a replay or a fault, and

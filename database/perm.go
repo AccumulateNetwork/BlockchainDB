@@ -95,13 +95,18 @@ type PermStore struct {
 		file uint32
 		off  int64
 	}
-	syncMu sync.Mutex // Serializes seals with each other and with manifest commits
-	closed bool
+	syncMu      sync.Mutex // Serializes seals with each other and with manifest commits
+	mergesSince int        // Merges since the manifest was last committed
+	closed      bool
 
 	putTotal, putDuplicate, lookups, windowHits, deepHits atomic.Uint64
 	mergeRuns, foldRuns, packRuns                         atomic.Uint64
 	indexBytes                                            atomic.Uint64
 }
+
+// PermManifestEvery is how many merges may pass between manifest
+// commits when no fold made one necessary.
+var PermManifestEvery = 8
 
 // PermBuckets is how many buckets a shard's history above the
 // watermark is kept in, by the key's first byte.
@@ -476,6 +481,14 @@ func (p *PermStore) Close() error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.mergesSince > 0 {
+		if err = p.commitManifest(); err != nil {
+			return err
+		}
+		if err = p.dropUnreferencedRunFiles(); err != nil {
+			return err
+		}
+	}
 	p.closed = true
 	for _, hf := range p.files {
 		if cerr := hf.f.Close(); err == nil {
@@ -805,14 +818,34 @@ func (p *PermStore) Merge() error {
 	}
 	rotation := (p.rotation + due) % PermBuckets
 	// Read the deltas' records for these buckets outside the lock:
-	// runs are immutable
+	// runs are immutable.  The due buckets are a run of the rotation,
+	// so their records are one or two slices of each sorted delta
+	oldest := ^uint64(0)
+	for _, j := range jobs {
+		if p.buckets[j.b].merged < oldest {
+			oldest = p.buckets[j.b].merged
+		}
+	}
+	var ranges [][2]byte
+	if last := p.rotation + due - 1; last < PermBuckets {
+		ranges = append(ranges, [2]byte{byte(p.rotation), byte(last)})
+	} else {
+		ranges = append(ranges, [2]byte{byte(p.rotation), PermBuckets - 1}, [2]byte{0, byte(last - PermBuckets)})
+	}
 	pendingCopy := append([]*permDelta(nil), p.pending...)
 	p.mu.Unlock()
 	byBucket := map[int][][]permRecord{}
 	for _, d := range pendingCopy {
-		recs, err := d.run.records(d.f)
-		if err != nil {
-			return err
+		if d.height <= oldest {
+			continue // Every due bucket has this delta already
+		}
+		var recs []permRecord
+		for _, rg := range ranges {
+			part, err := d.run.recordsBucketRange(d.f, rg[0], rg[1])
+			if err != nil {
+				return err
+			}
+			recs = append(recs, part...)
 		}
 		for _, j := range jobs {
 			if d.height <= p.buckets[j.b].merged {
@@ -910,8 +943,20 @@ func (p *PermStore) Merge() error {
 			return err
 		}
 	}
+	// The manifest names the new runs.  It is committed when a fold
+	// left run files to drop, and otherwise every PermManifestEvery
+	// merges: the runs are durable in their file already, and a
+	// merge a crash loses is done again from the pending deltas, so a
+	// commit per merge -- two barriers a shard -- bought nothing but
+	// a shorter replay.  Open removes the run files a lost merge left
+	// unnamed.
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.mergesSince++
+	if len(folds) == 0 && p.mergesSince < PermManifestEvery {
+		return nil
+	}
+	p.mergesSince = 0
 	if err := p.commitManifest(); err != nil {
 		return err
 	}
