@@ -169,6 +169,7 @@ func us(d time.Duration) string { return strconv.FormatInt(int64(d/time.Microsec
 type recent struct {
 	at          time.Time
 	block, seal time.Duration
+	store       int
 }
 
 // tallies is what every store adds to and the report takes from.
@@ -215,13 +216,13 @@ type store struct {
 	// A few hot keys are checked on read: the value the store returns
 	// must be the value last written.  A platform that only times
 	// answers cannot tell a fast wrong answer from a fast right one.
-	last        map[[32]byte][]byte
-	height      uint64
-	phase       uint64 // Blocks this store's maintenance cadence is offset by
+	last   map[[32]byte][]byte
+	height uint64
+	phase  uint64 // Blocks this store's maintenance cadence is offset by
 	// A block's samples, handed to the tallies once per block
 	dynaT, permT, readT []time.Duration
-	maintaining atomic.Bool
-	maintWG     sync.WaitGroup
+	maintaining         atomic.Bool
+	maintWG             sync.WaitGroup
 }
 
 const (
@@ -333,7 +334,7 @@ func (s *store) block(c config, t *tallies) error {
 	t.blockTimes.add(took)
 	t.blocks.Add(1)
 	t.ringMu.Lock()
-	t.ring[t.ringN%uint64(len(t.ring))] = recent{at: time.Now(), block: took, seal: sealTook}
+	t.ring[t.ringN%uint64(len(t.ring))] = recent{at: time.Now(), block: took, seal: sealTook, store: s.id}
 	t.ringN++
 	t.ringMu.Unlock()
 	if took > c.interval {
@@ -433,6 +434,7 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 	t.ringMu.Lock()
 	cut := time.Now().Add(-10 * time.Second)
 	var bt, st []time.Duration
+	var perStore [][]time.Duration
 	n := t.ringN
 	if n > uint64(len(t.ring)) {
 		n = uint64(len(t.ring))
@@ -444,8 +446,19 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		}
 		bt = append(bt, r.block)
 		st = append(st, r.seal)
+		for len(perStore) <= r.store {
+			perStore = append(perStore, nil)
+		}
+		perStore[r.store] = append(perStore[r.store], r.seal)
 	}
 	t.ringMu.Unlock()
+	// Each store's seal p90 over the same window: a tail that is one
+	// store's looks different from a tail every store shares
+	storeP90 := make([]float64, len(perStore))
+	for i, v := range perStore {
+		sort.Slice(v, func(a, b int) bool { return v[a] < v[b] })
+		storeP90[i] = float64(pct(v, .9)) / 1e6
+	}
 	sort.Slice(bt, func(i, j int) bool { return bt[i] < bt[j] })
 	sort.Slice(st, func(i, j int) bool { return st[i] < st[j] })
 	over := 0
@@ -473,7 +486,8 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		"elapsedSec": int(time.Since(start).Seconds()), "blocks": t.blocks.Load(), "height": height,
 		"last10s": map[string]any{"blocks": len(bt), "over": over,
 			"blockP50ms": float64(pct(bt, .5)) / 1e6, "blockP90ms": float64(pct(bt, .9)) / 1e6, "blockMaxMs": float64(pct(bt, 1)) / 1e6,
-			"sealP50ms": float64(pct(st, .5)) / 1e6, "sealP90ms": float64(pct(st, .9)) / 1e6, "sealMaxMs": float64(pct(st, 1)) / 1e6},
+			"sealP50ms": float64(pct(st, .5)) / 1e6, "sealP90ms": float64(pct(st, .9)) / 1e6, "sealMaxMs": float64(pct(st, 1)) / 1e6,
+			"storeSealP90ms": storeP90},
 		"maintenanceInFlight": t.inFlight.Load(), "mismatches": t.mismatches.Load(),
 		"heapHoleMB": float64(holes) / 1e6, "heapLiveMB": float64(live) / 1e6,
 		"heapScannedMB": float64(scanned) / 1e6, "heapMovedMB": float64(moved) / 1e6,
