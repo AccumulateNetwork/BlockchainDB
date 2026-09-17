@@ -243,6 +243,34 @@ func (p *PermStore) Open() (err error) {
 		st, _ := f.Stat()
 		p.runs[id] = &runFile{id: id, f: f, size: st.Size()}
 	}
+	// Data files the seals rolled after the manifest's commit are not
+	// named by it, but they hold committed deltas: they are taken in
+	// id order from the manifest's next id for as long as they exist,
+	// and the replay below covers them.  Run files past the manifest's
+	// next id are maintenance output that was never named; nothing
+	// durable refers to them, so they go, and their ids are free for
+	// O_EXCL creation again.
+	for {
+		f, err := os.OpenFile(filepath.Join(p.Directory, permDataName(p.nextID)), os.O_RDWR, 0o644)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		st, _ := f.Stat()
+		p.files[p.nextID] = &heapFile{id: p.nextID, f: f, size: st.Size()}
+		p.nextID++
+	}
+	for id := p.nextRun; ; id++ {
+		err := os.Remove(filepath.Join(p.Directory, (&runFile{id: id}).name()))
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
 	load := func(ref permRunRef, resident bool) (*permRun, *runFile, error) {
 		rf := p.runs[ref.File]
 		if rf == nil {
