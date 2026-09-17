@@ -119,6 +119,10 @@ type HeapStore struct {
 	// The sync's cost, split: nanoseconds in the data files' fsyncs
 	// and in the delta's write and fsync, and the syncs and bytes
 	syncs, syncHeapNs, syncLogNs, syncBytes atomic.Uint64
+	// The mover's cost on and off the block's path: files unlinked by
+	// a block's finish and the time in those unlinks; snapshots
+	// written and the time in them
+	releases, releaseNs, snapshotsN, snapshotNs atomic.Uint64
 }
 
 // heapFile is one data file and its accounting.
@@ -1007,14 +1011,19 @@ func (p *heapSync) finish() (err error) {
 	h.syncBytes.Add(uint64(p.bytes))
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, id := range p.release {
-		hf := h.files[id]
-		hf.f.Close()
-		delete(h.files, id)
-		h.deadBytes -= hf.dead
-		if err = os.Remove(filepath.Join(h.Directory, dataName(id))); err != nil {
-			return err
+	if len(p.release) > 0 {
+		t = time.Now()
+		for _, id := range p.release {
+			hf := h.files[id]
+			hf.f.Close()
+			delete(h.files, id)
+			h.deadBytes -= hf.dead
+			if err = os.Remove(filepath.Join(h.Directory, dataName(id))); err != nil {
+				return err
+			}
 		}
+		h.releases.Add(uint64(len(p.release)))
+		h.releaseNs.Add(uint64(time.Since(t)))
 	}
 	return nil
 }
@@ -1035,7 +1044,10 @@ func (h *HeapStore) compact() (bool, error) {
 	}
 	h.mu.Unlock()
 	if due {
+		t := time.Now()
 		err = h.Snapshot()
+		h.snapshotsN.Add(1)
+		h.snapshotNs.Add(uint64(time.Since(t)))
 	}
 	return moved, err
 }
@@ -1443,6 +1455,12 @@ func (h *HeapStore) SyncCost() (syncs, bytes uint64, heapFsync, delta time.Durat
 // copy: the ratio is the heap's write amplification.
 func (h *HeapStore) Cleaned() (scanned, moved uint64) {
 	return h.cleanedBytes.Load(), h.movedBytes.Load()
+}
+
+// MoverCost reports the files a block's finish has unlinked and the
+// time in those unlinks, and the snapshots written and their time.
+func (h *HeapStore) MoverCost() (releases uint64, release time.Duration, snapshots uint64, snapshot time.Duration) {
+	return h.releases.Load(), time.Duration(h.releaseNs.Load()), h.snapshotsN.Load(), time.Duration(h.snapshotNs.Load())
 }
 
 // SetFilterBlocks and SetSealLimit are the segment layer's knobs; a

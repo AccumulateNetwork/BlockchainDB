@@ -438,23 +438,14 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		}
 	}
 	var height uint64
-	var holes, live int64
-	var scanned, moved, syncs, syncBytes uint64
-	var heapFsync, deltaSync time.Duration
+	hs := sumHeap(stores)
+	holes, live, scanned, moved, syncs, syncBytes, heapFsync, deltaSync := hs.holes, hs.live, hs.scanned, hs.moved, hs.syncs, hs.bytes, hs.fsync, hs.delta
 	var permMerges, permFolds, permPacks, permIndexBytes uint64
 	for _, s := range stores {
 		if s.height > height {
 			height = s.height
 		}
 		for _, sh := range s.kv.Shards {
-			if sh.Heap != nil {
-				h, l := sh.Heap.HoleRatio()
-				holes, live = holes+h, live+l
-				sc, mv := sh.Heap.Cleaned()
-				scanned, moved = scanned+sc, moved+mv
-				n, b, hf, ds := sh.Heap.SyncCost()
-				syncs, syncBytes, heapFsync, deltaSync = syncs+n, syncBytes+b, heapFsync+hf, deltaSync+ds
-			}
 			if sh.Perm != nil {
 				m, f, pk, ib := sh.Perm.Counters()
 				permMerges, permFolds, permPacks, permIndexBytes = permMerges+m, permFolds+f, permPacks+pk, permIndexBytes+ib
@@ -472,8 +463,45 @@ func (t *tallies) liveState(c config, stores []*store, start time.Time) []byte {
 		"heapSyncs": syncs, "heapSyncKBAvg": float64(syncBytes) / 1e3 / float64(max(syncs, 1)),
 		"permMerges": permMerges, "permFolds": permFolds, "permPacks": permPacks, "permIndexMB": float64(permIndexBytes) / 1e6,
 		"heapFsyncMsAvg": float64(heapFsync) / 1e6 / float64(max(syncs, 1)), "heapDeltaMsAvg": float64(deltaSync) / 1e6 / float64(max(syncs, 1)),
+		"heapReleases": hs.releases, "heapReleaseMs": hs.release.Milliseconds(), "heapSnapshots": hs.snapshots, "heapSnapshotMs": hs.snapshot.Milliseconds(),
 	})
 	return b
+}
+
+// heapSplit sums the heap layer's counters across the stores: the
+// mover's and the sync's cost, cumulative since the start.
+type heapSplit struct {
+	holes, live                  int64
+	scanned, moved, syncs, bytes uint64
+	fsync, delta                 time.Duration
+	releases, snapshots          uint64
+	release, snapshot            time.Duration
+}
+
+func (a heapSplit) minus(b heapSplit) heapSplit {
+	return heapSplit{holes: a.holes, live: a.live,
+		scanned: a.scanned - b.scanned, moved: a.moved - b.moved, syncs: a.syncs - b.syncs, bytes: a.bytes - b.bytes,
+		fsync: a.fsync - b.fsync, delta: a.delta - b.delta, releases: a.releases - b.releases, snapshots: a.snapshots - b.snapshots,
+		release: a.release - b.release, snapshot: a.snapshot - b.snapshot}
+}
+
+func sumHeap(stores []*store) (hs heapSplit) {
+	for _, s := range stores {
+		for _, sh := range s.kv.Shards {
+			if sh.Heap == nil {
+				continue
+			}
+			h, l := sh.Heap.HoleRatio()
+			hs.holes, hs.live = hs.holes+h, hs.live+l
+			sc, mv := sh.Heap.Cleaned()
+			hs.scanned, hs.moved = hs.scanned+sc, hs.moved+mv
+			n, b, hf, ds := sh.Heap.SyncCost()
+			hs.syncs, hs.bytes, hs.fsync, hs.delta = hs.syncs+n, hs.bytes+b, hs.fsync+hf, hs.delta+ds
+			r, rt, sn, st := sh.Heap.MoverCost()
+			hs.releases, hs.release, hs.snapshots, hs.snapshot = hs.releases+r, hs.release+rt, hs.snapshots+sn, hs.snapshot+st
+		}
+	}
+	return hs
 }
 
 func fail(what string, err error) {
@@ -548,7 +576,9 @@ func main() {
 	_ = csvw.Write([]string{"minute", "blocks", "over_budget", "block_p50_ms", "block_p90_ms", "block_max_ms",
 		"seal_p50_ms", "seal_p90_ms", "seal_max_ms", "dyna_put_p99_us", "perm_put_p99_us", "read_p99_us",
 		"compress_passes", "compress_s", "merge_passes", "merge_s", "pack_passes", "pack_s", "skipped",
-		"read_MBps", "write_MBps", "store_MB", "files", "perm_history", "dyna_history", "bloom_MB", "mismatches"})
+		"read_MBps", "write_MBps", "store_MB", "files", "perm_history", "dyna_history", "bloom_MB", "mismatches",
+		"heap_syncs", "heap_fsync_ms_avg", "heap_sync_MB_avg", "heap_moved_MB", "heap_hole_MB", "heap_live_MB",
+		"heap_releases", "heap_release_ms", "heap_snapshots", "heap_snapshot_ms"})
 	csvw.Flush()
 
 	fmt.Printf("bdbench: %d store(s) x %d shards, seal limit %d, window %d, maintenance every %d blocks, pack every %d; per block per store %d dyna + %d perm puts, %d reads; %s blocks for %s; %s\n",
@@ -559,6 +589,7 @@ func main() {
 	deadline := start.Add(c.duration)
 	ioR0, ioW0 := procIO()
 	period := start
+	var heap0 heapSplit
 
 	report := func() {
 		elapsed := time.Since(period)
@@ -592,11 +623,20 @@ func main() {
 		}
 		minute := int(time.Since(start) / time.Minute)
 		mism := t.mismatches.Load()
-		fmt.Printf("%3dm blocks %4d | block p50/p90/max %s/%s/%s ms | seal p50/p90/max %s/%s/%s ms | put p99 dyna %s perm %s us | read p99 %s us | maint compress %d (%.1fs) merge %d (%.1fs) pack %d (%.1fs) skipped %d | disk r %.0f w %.0f MB/s | store %.0f MB %d files | history perm %d dyna %d | bloom %.0f MB | mismatches %d%s\n",
+		heap1 := sumHeap(stores)
+		hs := heap1.minus(heap0)
+		heap0 = heap1
+		heapNote := ""
+		if hs.syncs > 0 {
+			heapNote = fmt.Sprintf(" | heap fsync %.1f ms x %d (%.1f MB) moved %.0f MB hole %.0f MB live %.0f MB releases %d (%d ms) snapshots %d (%d ms)",
+				float64(hs.fsync)/1e6/float64(hs.syncs), hs.syncs, float64(hs.bytes)/1e6/float64(hs.syncs), float64(hs.moved)/1e6, float64(hs.holes)/1e6, float64(hs.live)/1e6,
+				hs.releases, hs.release.Milliseconds(), hs.snapshots, hs.snapshot.Milliseconds())
+		}
+		fmt.Printf("%3dm blocks %4d | block p50/p90/max %s/%s/%s ms | seal p50/p90/max %s/%s/%s ms | put p99 dyna %s perm %s us | read p99 %s us | maint compress %d (%.1fs) merge %d (%.1fs) pack %d (%.1fs) skipped %d | disk r %.0f w %.0f MB/s | store %.0f MB %d files | history perm %d dyna %d | bloom %.0f MB | mismatches %d%s%s\n",
 			minute, len(bt), ms(pct(bt, .5)), ms(pct(bt, .9)), ms(pct(bt, 1)), ms(pct(st, .5)), ms(pct(st, .9)), ms(pct(st, 1)),
 			us(pct(dp, .99)), us(pct(pp, .99)), us(pct(rt, .99)),
 			passes["compress"], spent["compress"].Seconds(), passes["merge"], spent["merge"].Seconds(), passes["pack"], spent["pack"].Seconds(), skipped,
-			rMB, wMB, float64(bytes)/1e6, files, permHist, dynaHist, float64(bloom)/1e6, mism, note)
+			rMB, wMB, float64(bytes)/1e6, files, permHist, dynaHist, float64(bloom)/1e6, mism, heapNote, note)
 		_ = csvw.Write([]string{strconv.Itoa(minute), strconv.Itoa(len(bt)), strconv.FormatUint(over, 10),
 			ms(pct(bt, .5)), ms(pct(bt, .9)), ms(pct(bt, 1)), ms(pct(st, .5)), ms(pct(st, .9)), ms(pct(st, 1)),
 			us(pct(dp, .99)), us(pct(pp, .99)), us(pct(rt, .99)),
@@ -606,7 +646,12 @@ func main() {
 			strconv.FormatFloat(rMB, 'f', 1, 64), strconv.FormatFloat(wMB, 'f', 1, 64),
 			strconv.FormatFloat(float64(bytes)/1e6, 'f', 0, 64), strconv.Itoa(files),
 			strconv.Itoa(permHist), strconv.Itoa(dynaHist), strconv.FormatFloat(float64(bloom)/1e6, 'f', 1, 64),
-			strconv.FormatUint(mism, 10)})
+			strconv.FormatUint(mism, 10),
+			strconv.FormatUint(hs.syncs, 10), strconv.FormatFloat(float64(hs.fsync)/1e6/float64(max(hs.syncs, 1)), 'f', 1, 64),
+			strconv.FormatFloat(float64(hs.bytes)/1e6/float64(max(hs.syncs, 1)), 'f', 1, 64), strconv.FormatFloat(float64(hs.moved)/1e6, 'f', 0, 64),
+			strconv.FormatFloat(float64(hs.holes)/1e6, 'f', 0, 64), strconv.FormatFloat(float64(hs.live)/1e6, 'f', 0, 64),
+			strconv.FormatUint(hs.releases, 10), strconv.FormatInt(hs.release.Milliseconds(), 10),
+			strconv.FormatUint(hs.snapshots, 10), strconv.FormatInt(hs.snapshot.Milliseconds(), 10)})
 		csvw.Flush()
 	}
 
