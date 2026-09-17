@@ -316,9 +316,14 @@ func TestHeapShardRoundTrip(t *testing.T) {
 	}
 	_, dyna := kvs.Stats()
 	require.EqualValues(t, 60*200, dyna.PutTotal)
-	require.NoError(t, kvs.SealBlock(61)) // The sync that deletes what the last pass emptied
+	// A pass for what the last ten blocks left dead, and the sync that
+	// deletes what it emptied
+	require.NoError(t, kvs.Compress())
+	require.NoError(t, kvs.SealBlock(61))
+	require.NoError(t, kvs.Compress())
+	require.NoError(t, kvs.SealBlock(62))
 	dead, live := kvs.Shards[0].Heap.HoleRatio()
-	require.Less(t, dead, 4*live, "the mover keeps dead bytes bounded (deltas are dead once superseded, and reclaimed)")
+	require.Less(t, dead, 2*live+HeapFileBytes, "dead bytes are bounded: at most the current file, which the mover never takes, beyond the live set")
 	require.NoError(t, kvs.Close())
 
 	re, err := OpenKVShard(dir)

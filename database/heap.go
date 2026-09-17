@@ -36,16 +36,20 @@ import (
 //	              new generation in a file of its own, switched to by
 //	              rename.
 //
-// A block's delta -- the keys it touched and where they are -- is
-// appended to the block's data file right behind the block's
-// entries, as an entry under a reserved key, so a block is ONE fsync
-// per shard (entries and delta together) rather than two (measured:
-// the second barrier was a third of the sync's cost, and the barrier
-// count is what the device queue charges for).  One fsync does not
-// order the delta's bytes after the entries', so open verifies the
-// last delta's entries by their checksums before trusting it; an
-// earlier delta was followed by a later block's fsync, which covers it.
-// A delta's bytes are dead once a snapshot supersedes them.
+// A block's delta is appended to the block's data file right behind
+// the block's entries, as an entry under a reserved key, so a block is
+// ONE fsync per shard (entries and delta together) rather than two
+// (measured: the second barrier was a third of the sync's cost, and
+// the barrier count is what the device queue charges for).  The delta
+// names no key: a block's entries are contiguous in its file and each
+// carries its key, so the delta is the RANGES the block wrote -- its
+// own appends, and the mover's copies named this block -- and the few
+// copies that arrived dead, a few dozen bytes a block (a delta of
+// 44-byte records was a fifth of the heap's writes, all of it dead at
+// the next snapshot and churned by the mover).  Replay scans the
+// ranges in order, later naming winning, and the last delta is
+// trusted only if every entry in its ranges checks; an earlier delta
+// was followed by a later block's fsync, which covers it.
 //
 // The key map is in memory for the live key set (spec 1.2: memory that
 // scales with the working set).  Open loads the newest whole
@@ -79,12 +83,15 @@ type HeapStore struct {
 	index  map[[32]byte]slot
 	height uint64 // The block being written; slots taken in it may be rewritten in place
 
-	// touched is the block's delta in the making; dirty the files
-	// written since the last sync; release the files the mover
-	// emptied, deleted once the delta naming their copies is durable.
-	touched map[[32]byte]struct{}
-	dirty   map[uint32]*heapFile
-	release []uint32
+	// The block's delta in the making: the ranges the block appended
+	// (the mover's named copies first, then the block's own) and the
+	// copies that arrived dead; dirty the files written since the last
+	// sync; release the files the mover emptied, deleted once the
+	// delta naming their copies is durable.
+	ranges   []heapRange
+	excluded []heapRange
+	dirty    map[uint32]*heapFile
+	release  []uint32
 	// deltaAt is where the last delta ended: the replay point a
 	// snapshot records, and what a file is cut back to on open
 	deltaAt struct {
@@ -125,6 +132,12 @@ type heapFile struct {
 	cleaning   bool   // Taken by the pass in progress
 	inflight   int    // Copies reserved in it and not yet written: its size runs ahead of its bytes
 	releasing  bool   // Emptied by a pass; deleted by the next sync
+}
+
+// heapRange is a stretch of one data file: what a delta names.
+type heapRange struct {
+	file     uint32
+	from, to uint32
 }
 
 // slot is where an entry lives: its file, its offset there, the value
@@ -276,10 +289,9 @@ func (h *HeapStore) Open() (err error) {
 		return err
 	}
 	h.index = map[[32]byte]slot{}
-	h.touched = map[[32]byte]struct{}{}
 	h.dirty = map[uint32]*heapFile{}
 	h.files = map[uint32]*heapFile{}
-	h.release = nil
+	h.release, h.ranges, h.excluded = nil, nil, nil
 	h.closed = false
 	h.liveBytes, h.deadBytes = 0, 0
 	// The newest whole generation is the index; older ones are what a
@@ -399,47 +411,13 @@ func (h *HeapStore) replayDeltas(dataIDs []uint32) error {
 		}
 	}
 	for i, d := range deltas {
-		if i == len(deltas)-1 && !h.deltaEntriesCheck(d.recs) {
-			break // The block did not commit
-		}
-		if _, err := h.applyRecord(d.recs); err != nil {
-			break
+		if !h.applyDelta(d.recs, i == len(deltas)-1) {
+			break // Torn, or the last block's entries do not all check: it did not commit
 		}
 		h.deltaAt.file, h.deltaAt.off = d.file, d.end
 		h.files[d.file].deltas += d.end - d.off
 	}
 	return nil
-}
-
-// deltaEntriesCheck reads every entry a delta names and checks it.
-func (h *HeapStore) deltaEntriesCheck(recs []byte) bool {
-	if len(recs) < heapIndexHdr {
-		return false
-	}
-	count := int(binary.LittleEndian.Uint32(recs[12:]))
-	end := heapIndexHdr + count*heapIndexRec
-	if len(recs) < end+4 || crc32.ChecksumIEEE(recs[:end]) != binary.LittleEndian.Uint32(recs[end:]) {
-		return false
-	}
-	for at := heapIndexHdr; at < end; at += heapIndexRec {
-		var key [32]byte
-		copy(key[:], recs[at:])
-		file := binary.LittleEndian.Uint32(recs[at+32:])
-		off := binary.LittleEndian.Uint32(recs[at+36:])
-		n := binary.LittleEndian.Uint32(recs[at+40:])
-		hf := h.files[file]
-		if hf == nil {
-			return false
-		}
-		buf := make([]byte, heapHeader+int(n)+heapTrailer)
-		if _, err := hf.f.ReadAt(buf, int64(off)); err != nil {
-			return false
-		}
-		if _, err := heapEntryValue(buf, key); err != nil {
-			return false
-		}
-	}
-	return true
 }
 
 // startGeneration begins an index generation: a snapshot of the map
@@ -527,15 +505,107 @@ func fsyncDir(directory string) error {
 	return fsync(d)
 }
 
-// encodeIndex is one index record: a snapshot of the whole map or the
-// block's delta of the keys it touched, checksummed.  The caller holds
-// the lock.
-func (h *HeapStore) encodeIndex(magic uint32, keys map[[32]byte]struct{}) []byte {
-	return h.encodeIndexOf(magic, func(emit func(key [32]byte)) {
-		for key := range keys {
-			emit(key)
+// encodeDelta is the block's delta: marker, height, the ranges the
+// block wrote (the mover's named copies first, then the block's own
+// appends, so a later write of a key wins on replay) and the copies
+// that arrived dead, checksummed.  The caller holds the lock.
+func (h *HeapStore) encodeDelta() []byte {
+	const rangeRec = 4 + 4 + 4
+	buf := make([]byte, 4+8+4+4+len(h.ranges)*rangeRec+len(h.excluded)*rangeRec+4)
+	binary.LittleEndian.PutUint32(buf, heapMagic)
+	binary.LittleEndian.PutUint64(buf[4:], h.height)
+	binary.LittleEndian.PutUint32(buf[12:], uint32(len(h.ranges)))
+	binary.LittleEndian.PutUint32(buf[16:], uint32(len(h.excluded)))
+	at := 20
+	for _, r := range append(append([]heapRange(nil), h.ranges...), h.excluded...) {
+		binary.LittleEndian.PutUint32(buf[at:], r.file)
+		binary.LittleEndian.PutUint32(buf[at+4:], r.from)
+		binary.LittleEndian.PutUint32(buf[at+8:], r.to)
+		at += rangeRec
+	}
+	binary.LittleEndian.PutUint32(buf[at:], crc32.ChecksumIEEE(buf[:at]))
+	return buf
+}
+
+// decodeDelta reads a delta's ranges and exclusions.
+func decodeDelta(buf []byte) (height uint64, ranges, excluded []heapRange, ok bool) {
+	const rangeRec = 4 + 4 + 4
+	if len(buf) < 20 || binary.LittleEndian.Uint32(buf) != heapMagic {
+		return
+	}
+	nr, ne := int(binary.LittleEndian.Uint32(buf[12:])), int(binary.LittleEndian.Uint32(buf[16:]))
+	end := 20 + (nr+ne)*rangeRec
+	if len(buf) < end+4 || crc32.ChecksumIEEE(buf[:end]) != binary.LittleEndian.Uint32(buf[end:]) {
+		return
+	}
+	height = binary.LittleEndian.Uint64(buf[4:])
+	at := 20
+	for i := 0; i < nr+ne; i++ {
+		r := heapRange{file: binary.LittleEndian.Uint32(buf[at:]), from: binary.LittleEndian.Uint32(buf[at+4:]), to: binary.LittleEndian.Uint32(buf[at+8:])}
+		if i < nr {
+			ranges = append(ranges, r)
+		} else {
+			excluded = append(excluded, r)
 		}
-	}, len(keys))
+		at += rangeRec
+	}
+	return height, ranges, excluded, true
+}
+
+// applyDelta names every entry in the delta's ranges, in order, later
+// naming winning, except the excluded copies; verify makes it refuse
+// a delta any of whose entries does not check.  The caller holds the
+// lock; the files are open.
+func (h *HeapStore) applyDelta(recs []byte, verify bool) bool {
+	height, ranges, excluded, ok := decodeDelta(recs)
+	if !ok {
+		return false
+	}
+	skip := map[heapRange]bool{}
+	for _, e := range excluded {
+		skip[heapRange{file: e.file, from: e.from}] = true
+	}
+	type naming struct {
+		key [32]byte
+		s   slot
+	}
+	var names []naming
+	for _, r := range ranges {
+		hf := h.files[r.file]
+		if hf == nil || int64(r.to) > hf.size {
+			return false
+		}
+		buf := make([]byte, r.to-r.from)
+		if _, err := hf.f.ReadAt(buf, int64(r.from)); err != nil {
+			return false
+		}
+		at := int64(0)
+		for at < int64(len(buf)) {
+			size, _, key, value, ok := decodeEntry(buf[at:])
+			if size == 0 || !ok && verify {
+				return false // Torn; or the last block's entries do not all check
+			}
+			off := int64(r.from) + at
+			// A damaged entry of a committed block is named all the
+			// same, so a read of it reports the damage rather than
+			// answering that the key is absent
+			n := uint32(len(value))
+			if !ok {
+				n = binary.LittleEndian.Uint32(buf[at:])
+			}
+			if key != heapDeltaKey && !skip[heapRange{file: r.file, from: uint32(off)}] {
+				names = append(names, naming{key: key, s: slot{file: r.file, off: uint32(off), n: n}})
+			}
+			at += size
+		}
+	}
+	for _, n := range names {
+		h.index[n.key] = n.s
+	}
+	if height > h.height {
+		h.height = height
+	}
+	return true
 }
 
 func (h *HeapStore) encodeIndexOf(magic uint32, each func(emit func(key [32]byte)), count int) []byte {
@@ -566,7 +636,7 @@ func (h *HeapStore) applyRecord(buf []byte) (int, error) {
 		return 0, errHeapTorn
 	}
 	magic := binary.LittleEndian.Uint32(buf)
-	if magic != heapMagic && magic != heapSnapshot {
+	if magic != heapSnapshot {
 		return 0, errHeapTorn
 	}
 	count := int(binary.LittleEndian.Uint32(buf[12:]))
@@ -689,8 +759,9 @@ func decodeEntry(buf []byte) (size int64, height uint64, key [32]byte, value []b
 	if n == 0 && binary.LittleEndian.Uint64(buf[4:]) == 0 || size > int64(len(buf)) {
 		return 0, 0, key, nil, false
 	}
+	copy(key[:], buf[12:])
 	if crc32.ChecksumIEEE(buf[4:heapHeader+n]) != binary.LittleEndian.Uint32(buf[heapHeader+n:]) {
-		return size, 0, key, nil, false // Damaged: its size lets a scan step over it
+		return size, 0, key, nil, false // Damaged: its size lets a scan step over it, its key lets replay name it
 	}
 	height = binary.LittleEndian.Uint64(buf[4:])
 	copy(key[:], buf[12:])
@@ -735,8 +806,19 @@ func (h *HeapStore) reserve(mover bool, size int64) (hf *heapFile, off int64, er
 		hf.inflight++
 	} else {
 		h.dirty[hf.id] = hf
+		h.extendRange(hf.id, off, off+size)
 	}
 	return hf, off, nil
+}
+
+// extendRange adds [from, to) of a file to the block's delta,
+// extending the last range when it abuts.  The caller holds the lock.
+func (h *HeapStore) extendRange(file uint32, from, to int64) {
+	if n := len(h.ranges); n > 0 && h.ranges[n-1].file == file && int64(h.ranges[n-1].to) == from {
+		h.ranges[n-1].to = uint32(to)
+		return
+	}
+	h.ranges = append(h.ranges, heapRange{file: file, from: uint32(from), to: uint32(to)})
 }
 
 // kill accounts a slot its key stopped naming.  The caller holds the
@@ -788,7 +870,6 @@ func (h *HeapStore) Put(key [32]byte, value []byte) error {
 		return err
 	}
 	h.index[key] = s
-	h.touched[key] = struct{}{}
 	return nil
 }
 
@@ -872,12 +953,13 @@ func (h *HeapStore) beginBlockSync() (blockSync, error) {
 	}
 	p := &heapSync{h: h, release: h.release}
 	h.release = nil
-	if len(h.touched) > 0 || len(p.release) > 0 {
+	if len(h.ranges) > 0 || len(p.release) > 0 {
 		// The delta goes into the block's data file behind its entries,
 		// under the reserved key, so the block's one fsync covers both
-		p.delta = h.encodeIndex(heapMagic, h.touched)
-		h.touched = map[[32]byte]struct{}{}
+		p.delta = h.encodeDelta()
+		h.ranges, h.excluded = nil, nil
 		hf, off, err := h.reserve(false, entrySize(len(p.delta)))
+		h.ranges = nil // The delta entry itself is not part of the block's range
 		if err != nil {
 			h.syncMu.Unlock()
 			return nil, err
@@ -1106,17 +1188,29 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	// the files the pass emptied
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// The copies were reserved in order, so they form ranges of the
+	// mover's files; a copy that arrived dead is excluded from them.
+	// The mover's ranges go before the block's own in the delta, so
+	// that a put of the same key later in the block wins on replay
+	var mine []heapRange
 	for _, m := range moves {
 		m.hf.inflight--
+		size := entrySize(int(m.to.n))
+		if n := len(mine); n > 0 && mine[n-1].file == m.to.file && int64(mine[n-1].to) == int64(m.to.off) {
+			mine[n-1].to = uint32(int64(m.to.off) + size)
+		} else {
+			mine = append(mine, heapRange{file: m.to.file, from: m.to.off, to: uint32(int64(m.to.off) + size)})
+		}
 		s, live := h.index[m.key]
 		if live && s == m.from {
 			h.index[m.key] = m.to
-			h.touched[m.key] = struct{}{}
 			h.kill(m.from)
 		} else {
 			h.kill(m.to) // Reserved and written, but no longer wanted
+			h.excluded = append(h.excluded, heapRange{file: m.to.file, from: m.to.off})
 		}
 	}
+	h.ranges = append(mine, h.ranges...)
 	for _, hf := range taken {
 		if hf.live == 0 && hf != h.cur && hf != h.mov {
 			hf.releasing = true
@@ -1221,8 +1315,7 @@ func RepairHeapStore(directory string, committed uint64) (*HeapStore, error) {
 	for _, g := range gens {
 		os.Remove(filepath.Join(directory, indexName(g)))
 	}
-	h := &HeapStore{Directory: directory, index: map[[32]byte]slot{}, touched: map[[32]byte]struct{}{},
-		dirty: map[uint32]*heapFile{}, files: map[uint32]*heapFile{}, height: committed}
+	h := &HeapStore{Directory: directory, index: map[[32]byte]slot{}, dirty: map[uint32]*heapFile{}, files: map[uint32]*heapFile{}, height: committed}
 	heights := map[[32]byte]uint64{}
 	for _, id := range dataIDs {
 		data, err := os.ReadFile(filepath.Join(directory, dataName(id)))
