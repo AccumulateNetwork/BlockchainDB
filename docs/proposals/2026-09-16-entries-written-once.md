@@ -229,11 +229,21 @@ point" and closes #33.
 
 ## Durability and crash consistency (1.8)
 
-- **A file is deleted one seal late, by the mover.**  A file emptied
-  by the mover leaves the map only after the delta naming the mover's
-  copies out of it is durable.  Until then the durable index still
-  names its slots, and a crash must find them intact: never unlink
-  what a durable index names.  The unlink itself is the mover's, at
+- **A file is deleted one seal late, by the mover, and never while a
+  delta names it.**  A file emptied by the mover leaves the map only
+  after the delta naming the mover's copies out of it is durable.
+  Until then the durable index still names its slots, and a crash
+  must find them intact: never unlink what a durable index names.
+  The deltas name ranges, and the mover's files are the destination
+  of theirs: a file every copy in which has died is still named by
+  the generation's deltas, and stays until the snapshot that
+  supersedes them, however dead it is.  (Measured the other way
+  first: the platform's reopen check found a store closed cleanly
+  that would not open, its replay stopped at a delta naming an
+  unlinked mover file, and the derivation deleting what it then took
+  for unnamed.)  Each file carries the bytes such deltas name in it;
+  the pinned-bytes rule counts those files, so the snapshot comes
+  early when they pile up.  The unlink itself is the mover's, at
   its next pass, so no block's seal holds the store lock over a
   directory operation; between the two the file is unnamed on disk,
   which an open deletes as such.  The adapter never asks the store
@@ -379,6 +389,15 @@ under load.  The acceptance run must show:
    -- the seal's second barrier, the merge's three, and its reread of
    every pending delta were the tail.  One shard per store: 37-39 /
    51-54.
+
+   *What waits unmerged is bounded by the window.*  A bucket was
+   merged once per 256 blocks, so up to 256 deltas waited unmerged,
+   and every deep read probed each one's filter and every merge read
+   a slice of each: over five minutes read p99 climbed from 7 to 47
+   us and merge work from 157 to 305 s a minute.  A bucket is now
+   merged once a window (`PermMergeEvery` = `MinFilterBlocks`), so
+   no more than a window of deltas waits; the extra folds are a
+   fraction of the index bytes, themselves a sixth of the data.
 
    *The cadence per layer.*  On the every-block cadence the heap's
    slice is cheap, but the permanent layer's merge ended every call
