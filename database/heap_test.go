@@ -55,7 +55,7 @@ func TestHeapRewriteReusesWithinTheBlockAndMovesOneSyncLate(t *testing.T) {
 	require.NotEqual(t, first, h.index[key(1)], "a durable slot is never rewritten")
 	dead, live := h.HoleRatio()
 	require.EqualValues(t, entrySize(3), dead, "the old slot is dead where it lies")
-	require.EqualValues(t, entrySize(3), live)
+	require.EqualValues(t, entrySize(3), live-h.deltaBytes(), "one live entry besides the deltas")
 	// Fill the block's file past its size so it rolls, then kill most
 	// of what the first file holds
 	for i := byte(10); i < 40; i++ {
@@ -68,6 +68,7 @@ func TestHeapRewriteReusesWithinTheBlockAndMovesOneSyncLate(t *testing.T) {
 		require.NoError(t, h.Put(key(i), make([]byte, 64)))
 	}
 	syncHeap(t, h)
+	require.NoError(t, h.Snapshot()) // The deltas so far are superseded: dead where they lie
 
 	h.AdvanceBlock(4)
 	moved, err := h.clean(1 << 20)
@@ -110,7 +111,7 @@ func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	h.AdvanceBlock(2)
 	require.NoError(t, h.Put(key(1), []byte("rewritten in block 2")))
 	syncHeap(t, h)
-	size := h.cur.size
+	size := h.deltaAt.off // Where block 2's delta ended: the durable append point
 	// Block 3: written, never synced -- the crash
 	h.AdvanceBlock(3)
 	require.NoError(t, h.Put(key(2), []byte("lost")))
@@ -140,17 +141,20 @@ func TestHeapReopenKeepsTheDurableAndDropsTheRest(t *testing.T) {
 	require.EqualValues(t, 2, r.height, "the durable height: block 3 never synced")
 }
 
-// A torn delta at the end of the generation is dropped whole.
-func TestHeapTornLogTailIsDropped(t *testing.T) {
+// A torn entry at the end of the data file -- a crash mid-write --
+// is cut, and the deltas before it stand.
+func TestHeapTornTailIsCut(t *testing.T) {
 	dir := heapDir(t)
 	h, err := NewHeapStore(dir)
 	require.NoError(t, err)
 	h.AdvanceBlock(1)
 	require.NoError(t, h.Put(key(1), []byte("one")))
+	syncHeap(t, h)
+	end := h.deltaAt.off
 	require.NoError(t, h.Close())
-	f, err := os.OpenFile(filepath.Join(dir, indexName(1)), os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, dataName(0)), os.O_WRONLY|os.O_APPEND, 0o644)
 	require.NoError(t, err)
-	_, err = f.Write([]byte{0x50, 0x41, 0x45, 0x48, 9, 9}) // A marker and six bytes of nothing
+	_, err = f.Write([]byte{9, 0, 0, 0, 1, 2, 3, 4, 5, 6}) // A length and a few bytes of nothing
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
@@ -160,9 +164,9 @@ func TestHeapTornLogTailIsDropped(t *testing.T) {
 	v, err := r.Get(key(1))
 	require.NoError(t, err)
 	require.Equal(t, "one", string(v))
-	st, err := os.Stat(filepath.Join(dir, indexName(1)))
+	st, err := os.Stat(filepath.Join(dir, dataName(0)))
 	require.NoError(t, err)
-	require.EqualValues(t, 2*(heapIndexHdr+4)+heapIndexRec, st.Size(), "the empty snapshot and one whole delta of one key remain")
+	require.Equal(t, end, st.Size(), "cut back to the last delta")
 }
 
 // A snapshot starts a new generation in its own file and retires the
@@ -214,6 +218,9 @@ func TestHeapChecksumCatchesADamagedSlot(t *testing.T) {
 	h.AdvanceBlock(1)
 	require.NoError(t, h.Put(key(1), []byte("intact")))
 	s := h.index[key(1)]
+	syncHeap(t, h)
+	h.AdvanceBlock(2)
+	require.NoError(t, h.Put(key(2), []byte("later"))) // A later block's sync covers block 1
 	require.NoError(t, h.Close())
 	f, err := os.OpenFile(filepath.Join(dir, dataName(s.file)), os.O_WRONLY, 0o644)
 	require.NoError(t, err)
@@ -311,7 +318,7 @@ func TestHeapShardRoundTrip(t *testing.T) {
 	require.EqualValues(t, 60*200, dyna.PutTotal)
 	require.NoError(t, kvs.SealBlock(61)) // The sync that deletes what the last pass emptied
 	dead, live := kvs.Shards[0].Heap.HoleRatio()
-	require.Less(t, dead, 2*live, "the mover keeps dead bytes under twice the live set")
+	require.Less(t, dead, 4*live, "the mover keeps dead bytes bounded (deltas are dead once superseded, and reclaimed)")
 	require.NoError(t, kvs.Close())
 
 	re, err := OpenKVShard(dir)
@@ -348,6 +355,10 @@ func TestHeapMoveIsDeadOnArrivalIfTheKeyWasRewritten(t *testing.T) {
 		}
 		syncHeap(t, h)
 	}
+	require.NoError(t, h.Snapshot()) // The deltas so far are superseded: the file is mostly dead
+	files := HeapCleanFiles
+	HeapCleanFiles = 64 // One pass takes every eligible file, key 20's half-dead one included
+	defer func() { HeapCleanFiles = files }()
 	h.AdvanceBlock(4)
 	moverHook = func() {
 		require.NoError(t, h.Put(key(20), []byte("rewritten while moving")))
