@@ -86,6 +86,7 @@ type HeapStore struct {
 	closed    bool
 	liveBytes int64
 	deadBytes int64
+	bound     bool // The size bound engaged: the mover takes files below the ratio
 
 	putTotal, putInPlace, putAppend atomic.Uint64
 	lookups, hits                   atomic.Uint64
@@ -150,10 +151,18 @@ var HeapCleanBytes int64 = 4 << 20
 var HeapCleanFiles = 4
 
 // HeapCleanRatio is the dead fraction a file must reach before the
-// mover takes it -- unless dead bytes exceed live bytes overall, when
-// the deadest file is taken regardless, which bounds the heap at
-// twice its live set.
-var HeapCleanRatio = 0.5
+// mover takes it -- unless the heap is over its size bound, when the
+// deadest file is taken at HeapCleanFloor or more.  The bound has
+// hysteresis: it engages when dead bytes exceed live by
+// HeapBoundOn and releases when they fall below live again, so the
+// movers of nine stores in lockstep do not all engage on the same
+// block and then all disengage (measured: p90 461-704 ms in the
+// minutes the bound flipped, 70-90 ms otherwise).
+var (
+	HeapCleanRatio = 0.5
+	HeapCleanFloor = 0.25
+	HeapBoundOn    = 1.5
+)
 
 // HeapSnapshotEvery is how many compact calls pass between key-map
 // snapshots; between them the generation's deltas are what open
@@ -1015,7 +1024,13 @@ func (h *HeapStore) pickFile() *heapFile {
 			pick, best = hf, f
 		}
 	}
-	if pick == nil || (best < HeapCleanRatio && h.deadBytes <= h.liveBytes) {
+	switch {
+	case !h.bound && float64(h.deadBytes) > HeapBoundOn*float64(h.liveBytes):
+		h.bound = true
+	case h.bound && h.deadBytes < h.liveBytes:
+		h.bound = false
+	}
+	if pick == nil || best < HeapCleanRatio && (!h.bound || best < HeapCleanFloor) {
 		return nil
 	}
 	return pick
