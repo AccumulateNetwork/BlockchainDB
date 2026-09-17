@@ -278,7 +278,18 @@ point" and closes #33.
 
 ## What it is measured with
 
-`cmd/bdbench -stores 9`, the run above, is the acceptance test:
+`cmd/bdbench -stores 9`, the run above, is the acceptance test.  It
+checks answers, not only times: a permanent value is derived from its
+key, so every sampled permanent read (through the deep read, as the
+adapter reads anything older than the window) is checked for presence
+and content, a checked hot key must read as last written, and at the
+end every store is closed, reopened and every sampled key of both
+layers read back -- a run that lost one fails.  Until 2026-09-17 the
+platform tolerated "not found" on every permanent read, and a data
+file rolled between manifest commits was being lost on reopen without
+a number moving.  With the check in place: 200,000 sampled permanent
+keys per store read back correctly after reopen, zero mismatches
+under load.  The acceptance run must show:
 
 - seal p90 under `-seal-budget` (100 ms) and flat from minute 1 to
   minute 30;
@@ -368,6 +379,16 @@ point" and closes #33.
    -- the seal's second barrier, the merge's three, and its reread of
    every pending delta were the tail.  One shard per store: 37-39 /
    51-54.
+
+   *The cadence per layer.*  On the every-block cadence the heap's
+   slice is cheap, but the permanent layer's merge ended every call
+   with an fsync of its run file: at a call per shard per block that
+   was 72-144 barriers a second at nine stores, merges cost 190-250 s
+   of work a minute, and every seal's fsync doubled.  A bucket's run
+   is named by the manifest alone, so it needs durability before the
+   manifest commit and not before: the run files are fsynced at the
+   commit (every PermManifestBlocks, or at a fold), and a merge call
+   has no barrier.
 
    Still to do: the store-level commit (one block record naming
    every shard's deltas) and the per-store data file, so that a
