@@ -289,5 +289,20 @@ point" and closes #33.
    remeasured next.*  Measured
    alone first (`-stores 9 -dyna 0`), then with the heap under the
    full load, which is the acceptance run.
-3. The block's deltas in the data files and the store-level commit:
-   one barrier round per shard, one per store.
+3. The block's deltas in the data files: one barrier per shard per
+   layer.  *Built for both layers.*  The heap's delta names no key:
+   a block's entries are contiguous in its file and carry their
+   keys, so the delta is the ranges the block wrote (the mover's
+   named copies first, then the block's own) and the copies that
+   arrived dead, a few dozen bytes a block; a delta of 44-byte
+   records was a fifth of the heap's writes.  Replay scans the
+   ranges and trusts the last delta only if every entry in it
+   checks.  The permanent layer's delta stays a run with its filter,
+   since it is the window's search structure, but lives in the data
+   file too.  Alone, the heap seals at 44-54 ms p50 at nine stores
+   (57-64 with two barriers).  The mover finds a file's live entries
+   through the index rather than by scanning the file, because nine
+   stores' scans together starved the block loops for CPU.  Still to
+   do: the store-level commit (one block record naming every
+   shard's deltas) and the per-store data file, so that a hundred
+   shards cost a block one barrier.
