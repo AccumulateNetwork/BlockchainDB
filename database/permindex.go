@@ -72,6 +72,27 @@ type permRun struct {
 	bloom   *Bloom
 	k       int
 	bytes   uint32
+	// Every permFenceEvery-th key, for a resident run: a lookup finds
+	// its chunk in memory and reads that chunk once, where a binary
+	// search over the file was a pread a probe -- a dozen a run, and
+	// 40% of a block's CPU under the load platform's reads.
+	fence [][32]byte
+}
+
+// permFenceEvery is the records between fence keys: a chunk is one
+// read of this many records, and the fence costs 32 bytes per chunk.
+const permFenceEvery = 32
+
+// buildFence takes every permFenceEvery-th key from records laid out
+// in buf.
+func buildFence(buf []byte, count uint32) [][32]byte {
+	fence := make([][32]byte, 0, (int(count)+permFenceEvery-1)/permFenceEvery)
+	for i := 0; i < int(count); i += permFenceEvery {
+		var k [32]byte
+		copy(k[:], buf[i*permRecSize:])
+		fence = append(fence, k)
+	}
+	return fence
 }
 
 // writePermRun writes records, which must be sorted by key and free
@@ -102,7 +123,8 @@ func writePermRun(w io.WriterAt, at int64, file uint32, recs []permRecord, heigh
 	if _, err := w.WriteAt(buf, at); err != nil {
 		return nil, err
 	}
-	return &permRun{path: permRunName(file), file: file, off: at, count: uint32(len(recs)), height: height, bloomAt: at + int64(p), bloom: bloom, k: bloom.K, bytes: uint32(len(buf))}, nil
+	return &permRun{path: permRunName(file), file: file, off: at, count: uint32(len(recs)), height: height, bloomAt: at + int64(p), bloom: bloom, k: bloom.K, bytes: uint32(len(buf)),
+		fence: buildFence(buf[permRunHdr:], uint32(len(recs)))}, nil
 }
 
 // openPermRun reads a run's header at off in f and verifies the run.
@@ -131,6 +153,7 @@ func openPermRun(f *os.File, file uint32, off int64, resident bool) (*permRun, e
 		r.bloom = &Bloom{NumBytes: uint64(bloomBytes), SizeOfMap: float64(bloomBytes) / (1 << 20), K: r.k,
 			Map: make([]byte, bloomBytes), Capacity: uint64(bloomBytes) * 8 / BloomBitsPerKey, Count: uint64(r.count)}
 		copy(r.bloom.Map, body[int64(r.count)*permRecSize:])
+		r.fence = buildFence(body, r.count)
 	}
 	return r, nil
 }
@@ -144,6 +167,31 @@ func (r *permRun) lookup(f *os.File, key [32]byte) (rec permRecord, found bool, 
 		}
 	} else if ok, err := r.bloomTestCold(f, key); err != nil || !ok {
 		return rec, false, err
+	}
+	if r.fence != nil {
+		// The chunk whose first key is the greatest not above key
+		i := sort.Search(len(r.fence), func(i int) bool { return bytes.Compare(r.fence[i][:], key[:]) > 0 }) - 1
+		if i < 0 {
+			return rec, false, nil
+		}
+		first := int64(i) * permFenceEvery
+		n := int64(permFenceEvery)
+		if first+n > int64(r.count) {
+			n = int64(r.count) - first
+		}
+		buf := make([]byte, n*permRecSize)
+		if _, err := f.ReadAt(buf, r.off+permRunHdr+first*permRecSize); err != nil {
+			return rec, false, err
+		}
+		for j := int64(0); j < n; j++ {
+			switch c := bytes.Compare(buf[j*permRecSize:j*permRecSize+32], key[:]); {
+			case c == 0:
+				return getPermRecord(buf[j*permRecSize:]), true, nil
+			case c > 0:
+				return rec, false, nil
+			}
+		}
+		return rec, false, nil
 	}
 	lo, hi := int64(0), int64(r.count)
 	buf := make([]byte, permRecSize)
