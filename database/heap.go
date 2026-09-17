@@ -138,6 +138,27 @@ type heapFile struct {
 	cleaning   bool   // Taken by the pass in progress
 	inflight   int    // Copies reserved in it and not yet written: its size runs ahead of its bytes
 	releasing  bool   // Emptied by a pass; deleted by the next sync
+	// Bytes of ranges in it that the deltas of the current generation
+	// name, and where the last of them ends.  A durable delta names
+	// the file, so the file stays until a snapshot supersedes the
+	// delta, whatever is live in it (spec 1.7): never unlink what a
+	// durable index names.
+	named, namedEnd int64
+}
+
+// nameRanges records that a delta of the current generation names
+// these ranges.  The caller holds the lock.
+func (h *HeapStore) nameRanges(ranges []heapRange) {
+	for _, r := range ranges {
+		hf := h.files[r.file]
+		if hf == nil || r.to <= r.from {
+			continue
+		}
+		hf.named += int64(r.to - r.from)
+		if int64(r.to) > hf.namedEnd {
+			hf.namedEnd = int64(r.to)
+		}
+	}
 }
 
 // heapRange is a stretch of one data file: what a delta names.
@@ -479,8 +500,10 @@ func (h *HeapStore) startGeneration() error {
 	}
 	snap := h.encodeIndexOf(heapSnapshot, all, len(h.index))
 	superseded := map[uint32]int64{}
+	namedThen := map[uint32]int64{}
 	for id, hf := range h.files {
 		superseded[id] = hf.deltas
+		namedThen[id] = hf.named
 	}
 	h.mu.Unlock()
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -523,6 +546,16 @@ func (h *HeapStore) startGeneration() error {
 			hf.dead += n
 			h.liveBytes -= n
 			h.deadBytes += n
+		}
+	}
+	// The ranges those deltas named are no longer named by anything
+	// durable but the snapshot's own slots
+	for id, n := range namedThen {
+		if hf := h.files[id]; hf != nil {
+			hf.named -= n
+			if hf.named == 0 {
+				hf.namedEnd = 0
+			}
 		}
 	}
 	return nil
@@ -636,6 +669,7 @@ func (h *HeapStore) applyDelta(recs []byte, verify bool) bool {
 	for _, n := range names {
 		h.index[n.key] = n.s
 	}
+	h.nameRanges(ranges)
 	if height > h.height {
 		h.height = height
 	}
@@ -716,6 +750,9 @@ func (h *HeapStore) deriveFiles(dataIDs []uint32) error {
 		end, live := named[id]
 		if id == h.deltaAt.file && h.deltaAt.off > end {
 			end, live = h.deltaAt.off, true
+		}
+		if hf.namedEnd > end {
+			end, live = hf.namedEnd, true // A delta of this generation names it
 		}
 		if !live && hf.deltas == 0 {
 			hf.f.Close()
@@ -994,6 +1031,7 @@ func (h *HeapStore) beginBlockSync() (blockSync, error) {
 		// The delta goes into the block's data file behind its entries,
 		// under the reserved key, so the block's one fsync covers both
 		p.delta = h.encodeDelta()
+		h.nameRanges(h.ranges)
 		h.ranges, h.excluded = nil, nil
 		hf, off, err := h.reserve(false, entrySize(len(p.delta)))
 		h.ranges = nil // The delta entry itself is not part of the block's range
@@ -1097,8 +1135,8 @@ func (h *HeapStore) compact(budget int64) (bool, error) {
 	h.mu.Lock()
 	var pinned int64
 	for _, hf := range h.files {
-		if hf != h.cur && hf != h.mov && hf.deltas > 0 && hf.live == hf.deltas {
-			pinned += hf.size
+		if hf != h.cur && hf != h.mov && hf.live == hf.deltas && (hf.deltas > 0 || hf.named > 0) {
+			pinned += hf.size // Nothing live in it but what the generation's deltas need
 		}
 	}
 	due := h.height+h.snapPhase-h.snapAt >= HeapSnapshotBlocks || pinned >= HeapSnapshotPinnedFiles*HeapFileBytes
@@ -1175,7 +1213,7 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	// floated with the size bound engaged.
 	emptied := 0
 	for _, hf := range h.files {
-		if hf.live == 0 && hf != h.cur && hf != h.mov && !hf.cleaning && hf.inflight == 0 && !hf.releasing && hf.size > 0 {
+		if hf.live == 0 && hf.named == 0 && hf != h.cur && hf != h.mov && !hf.cleaning && hf.inflight == 0 && !hf.releasing && hf.size > 0 {
 			hf.releasing = true
 			h.release = append(h.release, hf.id)
 			emptied++
@@ -1333,7 +1371,7 @@ func (h *HeapStore) clean(budget int64) (bool, error) {
 	}
 	h.ranges = append(mine, h.ranges...)
 	for _, hf := range taken {
-		if hf.live == 0 && hf != h.cur && hf != h.mov {
+		if hf.live == 0 && hf.named == 0 && hf != h.cur && hf != h.mov {
 			hf.releasing = true
 			h.release = append(h.release, hf.id)
 		}

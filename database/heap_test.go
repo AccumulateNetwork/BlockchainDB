@@ -396,3 +396,56 @@ func TestHeapMoveIsDeadOnArrivalIfTheKeyWasRewritten(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "rewritten while moving", string(v))
 }
+
+// A file the mover copied into is named by the deltas of the current
+// generation, as the destination of their ranges.  When every copy in
+// it dies it must not be unlinked until a snapshot supersedes those
+// deltas: never unlink what a durable index names (spec 1.7).  Found
+// by the platform's reopen check: a store closed cleanly would not
+// open, "the index names heap-000006.dat: missing".
+func TestHeapMoverFileNamedByDeltasOutlivesItsEntries(t *testing.T) {
+	was, blocks, pinned := HeapFileBytes, HeapSnapshotBlocks, HeapSnapshotPinnedFiles
+	HeapFileBytes, HeapSnapshotBlocks, HeapSnapshotPinnedFiles = 64<<10, 1<<20, 1<<30 // No snapshot at all
+	defer func() { HeapFileBytes, HeapSnapshotBlocks, HeapSnapshotPinnedFiles = was, blocks, pinned }()
+	dir := heapDir(t)
+	h, err := NewHeapStore(dir)
+	require.NoError(t, err)
+	value := make([]byte, 400)
+	last := map[byte]byte{}
+	// Half the keys are rewritten every block, half every seventh: a
+	// file is soon half dead with live entries the mover copies out,
+	// and the copies die within seven blocks, emptying the mover's file
+	put := func(b uint64) {
+		h.AdvanceBlock(b)
+		for i := byte(1); i <= 100; i++ {
+			if i > 50 && b%7 != 0 {
+				continue
+			}
+			value[0] = byte(b)
+			require.NoError(t, h.Put(key(i), value))
+			last[i] = byte(b)
+		}
+		syncHeap(t, h)
+	}
+	for b := uint64(1); b <= 70; b++ {
+		put(b)
+		if b%3 == 0 {
+			_, err := h.compact(HeapCleanBytes) // Copies live entries into mover files, releases what emptied
+			require.NoError(t, err)
+		}
+	}
+	_, moved := h.Cleaned()
+	require.Greater(t, moved, uint64(0), "the mover must have copied")
+	releases, _, snapshots, _ := h.MoverCost()
+	t.Logf("moved %d bytes, %d files unlinked, %d snapshots, %d files open, gen %d", moved, releases, snapshots, len(h.files), h.gen)
+	require.NoError(t, h.Close())
+	h, err = OpenHeapStore(dir)
+	require.NoError(t, err, "a store closed cleanly reopens")
+	t.Logf("after open: %d files, gen %d, replay point %v", len(h.files), h.gen, h.deltaAt)
+	for i := byte(1); i <= 100; i++ {
+		v, err := h.Get(key(i))
+		require.NoError(t, err, "key %d", i)
+		require.Equal(t, last[i], v[0], "key %d", i)
+	}
+	require.NoError(t, h.Close())
+}
