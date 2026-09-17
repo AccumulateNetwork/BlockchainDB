@@ -409,7 +409,18 @@ under load.  The acceptance run must show:
    commit (every PermManifestBlocks, or at a fold), and a merge call
    has no barrier.
 
+   *Measured with every fix above, both layers, nine stores, eight
+   shards, maintenance every block, 2026-09-17 00:05:* seal 38-42 ms
+   p50 and 57-65 p90 in the four clean minutes (the fifth was a disk
+   stall), merges 3-8 s of work a minute, zero mismatches, and every
+   store reopened with all 200,000 sampled permanent keys and 1,024
+   checked dynamic keys read back correctly.  Block time drifted from
+   157 to 210 ms: the profile put 40% of the CPU in the deep read's
+   binary search over bucket runs, a pread a probe; a resident run
+   now keeps a fence of every 32nd key and a lookup is one read.
+
    Still to do: the store-level commit (one block record naming
    every shard's deltas) and the per-store data file, so that a
    hundred shards cost a block one barrier; one shard per store is
    that layout by another name and measures the same as eight now.
+   The 30-minute acceptance run waits on the trimmed disk.
