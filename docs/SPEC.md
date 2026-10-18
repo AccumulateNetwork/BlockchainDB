@@ -94,6 +94,14 @@ Every other rule in this section serves this one.  Corollaries:
   them all put every history probe on the disk — K one-byte reads per
   segment, on the walk a mutable read takes for any key outside the
   window (#86, #88).
+- A logarithmic cost is acceptable only where its pages can stay
+  cached.  A binary search over an index larger than the page cache
+  costs a disk read per probe, and the node's own writes evict it over
+  hours, so the cost follows how long the node has run.  The dynamic
+  layer's lookup is therefore resident: its live keys are the working
+  set, and a `Get` is one map lookup and one read of the value (the
+  heap, 1.5; #103).  An on-disk binary search belongs only on the
+  permanent layer's deep reads (1.4).
 
 ### 1.3 Blocks, the window, and windowed immutability
 
@@ -562,6 +570,7 @@ The current gaps between Section 1 and the code, in one place:
 |---|---|---|
 | #33 | 1.8 one commit point | Residual fsyncs; manifest rewritten whole per commit |
 | #94 | 1.2, 1.6 bounded maintenance | Compaction passes are bounded by records, not bytes or rate; the seal's barriers wait behind their I/O |
+| #103 | 1.2 resident dynamic lookup | The segment-store dynamic layer (`NewKVShard`, what Accumulate opens today) still binary-searches its history runs on disk; the heap (`NewKVShardHeapN`) closes it once the embedder adopts it (accumulate#4546) |
 
 A pull request that closes one of these updates this table.  A pull
 request that adds one updates it too — knowingly.
