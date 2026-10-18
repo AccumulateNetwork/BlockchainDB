@@ -1,0 +1,278 @@
+# HANDOFF — BlockchainDB
+
+**Generated:** 2026-07-21
+**Reason:** 76-fun Thelio to System76 for NVMe repair; work continues elsewhere.
+**Repo path on origin machine:** `/home/paul/go/src/github.com/BlockchainDB`
+**Remote:** `git@github.com:AccumulateNetwork/BlockchainDB.git` (fetch and push)
+
+> **Note on recoverability.** This repo *has* a remote, but **14 commits on the current
+> branch are not on it**, and the branch `feature/configurable-shards` has no upstream at
+> all. A fresh clone will get you `origin/main` at `92a6c4d` and none of the DKV work,
+> the benchmarking infrastructure, or the 20-byte key change. Roughly six weeks of work
+> (2025-12 through 2026-01) exists only on this disk. See §3.
+
+## 1. What this repo is
+
+A high-performance key-value store in Go, purpose-built for blockchain workloads —
+append-only, immutable, read-heavy. Module `github.com/AccumulateNetwork/BlockchainDB`
+(Go 1.24). It layers a sharded KV store (`database/kv`, KVShard with 1024 shards) over
+low-level buffered file I/O (`database/storage`: BFile, KFile), with bloom filters, history
+tracking, and a newer LSM-tree-based dynamic store (`database/dkv`). It exists to be a
+faster storage backend for Accumulate — `go.mod` depends on
+`gitlab.com/accumulatenetwork/accumulate v1.4.2` — and it benchmarks itself head-to-head
+against BadgerDB and LevelDB, both of which are direct dependencies used purely for
+comparison testing.
+
+## 2. Current work in flight
+
+Two threads, both live, both uncommitted.
+
+**Thread A — the Accumulate adapter (`adapter/adapter.go`, untracked, 5058 bytes,
+dated 2026-01-12).** This is the newest file in the repo and the more strategically
+important one. It is a brand-new package whose doc comment reads: *"Package adapter
+provides an adapter to use BlockchainDB with the accumulate keyvalue interface."* It wraps
+`dkv.BlockchainStore` to implement `keyvalue.Beginner` from
+`gitlab.com/accumulatenetwork/accumulate/pkg/database/keyvalue`, exposing `Open(path)`,
+`Begin(prefix *database.Key, writable bool) keyvalue.ChangeSet`, and a `Stats()` method
+backed by atomic counters for Puts, Gets, Deletes, BloomHits, BloomMisses, and
+Deduplication. The `changeSet` type buffers writes in a `map[[32]byte][]byte` `pending` map
+and a `deleted` set. **This is the integration point that would let Accumulate actually run
+on BlockchainDB instead of Badger/LevelDB** — the payoff for all the preceding performance
+work. It has no tests and is not committed. Verify it compiles first thing on the far end;
+it is the least-proven code in the tree.
+
+**Thread B — 500M-entry write-only benchmarking (2026-01-11).** Two untracked files:
+
+- `database/dkv/writeonly_benchmark_test.go` (253 lines) — adds `TestWriteOnly_BDB_500M`,
+  `TestWriteOnly_LevelDB_500M`, and `TestWriteOnly_Badger_500M`, each driving 500,000,000
+  entries through its respective engine. Uses a `PerfTracker` writing to
+  `/tmp/bdb_benchmark.log`, reports every 3 minutes, and batches at 101 entries
+  (`writeOnlyBatchSize` — commented as "1 account + 100 txs", i.e. shaped like real
+  Accumulate traffic).
+- `docs/performance/500m-benchmark-comparison-2026-01-11.md` — the results writeup from
+  running exactly that. All three engines completed 500M entries inside a 5-hour timeout on
+  24 cores. Headline numbers: Badger 1h14m / 97.2K writes-per-sec / 102.9 GB / 12.41 GB
+  heap with **182 seconds of GC pause**; LevelDB 1h32m / 69.1K/s / 34.9 GB / 0.92 GB heap;
+  BlockchainDB 1h45m / 55.4K/s / 75.1 GB / 1.24 GB heap. **BDB loses on write throughput
+  but wins reads by three orders of magnitude — 2 µs average vs 3,747 µs (LevelDB) and
+  4,940 µs (Badger).**
+
+**The document names its own next step explicitly**, and this is the clearest "resume
+here" signal in the repo: the read numbers come from only ~550K reads sampled during a
+99.9%-write workload, and the doc states *"Dedicated read benchmarks needed for conclusive
+comparison."* A read-focused benchmark to confirm or refute the 2 µs figure is the
+outstanding task.
+
+**Recent committed context.** The last commit `c300398` (2026-01-11) implemented **20-byte
+internal keys**: the external API still takes `[32]byte`, but storage truncates to
+`[20]byte`, shrinking entries 48→36 bytes (25%), saving ~6 GB at 500M entries, at a
+2^80 birthday bound deemed sufficient. It touched `kv_shard.go` (+347 lines changed),
+`kv.go`, `kv2.go`, `bucket_store.go`, `dyna_kv.go`, `mmap_index.go`, `blockchain_store.go`,
+and the benchmark tests. Before that, `02b0ddc` cut Go's `selectgo` overhead from 28% to 3%
+by reorganizing KVShard async writes into 4 channel groups, and `a0b1cff` introduced DKV
+itself.
+
+**The 20 `perf/*` branches are a parameter sweep, not features.** `perf/shards-512`
+through `perf/shards-4096`, `perf/buckets-32` through `-256`, `perf/channels-2` through
+`-16`, `perf/buffer-5k`/`-20k`/`-50k`, plus `perf/conservative` and `perf/optimistic`. They
+were generated by `scripts/create-perf-branches.sh` and driven by `scripts/batch-perf.sh`
+to find optimal tuning constants. Do not treat them as work in progress; they are
+disposable experiment carriers.
+
+**Also uncommitted:** a `CLAUDE.md` rename and complete rewrite (see §3 and §4).
+
+## 3. State at handoff
+
+- **Branch:** `feature/configurable-shards` (upstream: **none** — `git rev-parse @{u}`
+  errors with "no upstream configured for branch 'feature/configurable-shards'". The branch
+  has never been pushed.)
+- **Uncommitted changes:** 5 files (1 deleted tracked, 4 untracked)
+  - `.CLAUDE.md` — **deleted** (27 lines removed). Its old content was a narrow, temporary
+    focus note titled "Project Focus: App Server Deployment" that instructed the AI to
+    **ignore** BlockchainDB, databases, DKV, LSM-trees, and the whole `database/` directory
+    in favor of an unrelated follower-deployment task. It was stale and actively harmful to
+    work in this repo; deleting it was correct.
+  - `CLAUDE.md` — **untracked, new** (98 lines). Replaces the above with a real
+    repo-specific AI development guide. Content summarized in §4. Effectively this is a
+    rename `.CLAUDE.md` → `CLAUDE.md` plus a full rewrite; git reports it as an unrelated
+    delete + add because the content shares nothing.
+  - `adapter/` — **untracked directory**, containing `adapter.go` only. Thread A above.
+  - `database/dkv/writeonly_benchmark_test.go` — untracked, 253 lines. Thread B above.
+  - `docs/performance/500m-benchmark-comparison-2026-01-11.md` — untracked. Thread B results.
+- **Unpushed commits:** **14** on `feature/configurable-shards` relative to `origin/main`.
+  Full list (not truncated):
+
+```
+c300398 feat: Implement 20-byte internal keys for storage efficiency
+878d05d docs: Add benchmark results and update architecture documentation
+6156ffc Fix branch creation script to only stage changed files
+8be7716 Add overnight testing infrastructure and durability tests
+02b0ddc Optimize KVShard async writes: 4 channel groups, reduce selectgo from 28% to 3%
+9bbe92e Add comprehensive database benchmarks with real-time reporter
+ea6aa9b Add follower configs and DKV design documentation
+a0b1cff feat: Implement DKV (Dynamic Key-Value Store) with LSM-tree architecture
+0d733f9 Major codebase reorganization: Proper Go package structure
+88f61e1 Implement hybrid sorted/unsorted HistoryFile to fix O(n²) degradation
+33627a1 Add performance comparison tests and read optimization design
+bdcfe69 Phase 2: Major performance optimizations and bug fixes
+cca75ae Optimize HistoryFile read performance with binary search and caching
+9c25314 Add comprehensive performance analysis and improvement roadmap
+```
+
+  Note `6156ffc` is also the tip of `2-performance`, which *does* track
+  `origin/2-performance` — so a subset of these commits is reachable from the remote via
+  that branch. The genuinely remote-only-absent work is `878d05d` and `c300398` (the docs
+  and the 20-byte key change) plus everything unique to this branch's path. Confirm with
+  `git log --oneline --all --not --remotes` on the far end.
+
+  Other local branches with upstreams: `main` → `origin/main` (`92a6c4d`, in sync),
+  `2-performance` → `origin/2-performance`, `performance` → `origin/performance`. The 20
+  `perf/*` branches have no upstreams and are local-only experiment branches.
+
+- **Recent commits:**
+
+```
+c300398 feat: Implement 20-byte internal keys for storage efficiency        (2026-01-11)
+878d05d docs: Add benchmark results and update architecture documentation   (2026-01-11)
+6156ffc Fix branch creation script to only stage changed files              (2026-01-10)
+8be7716 Add overnight testing infrastructure and durability tests           (2026-01-10)
+02b0ddc Optimize KVShard async writes: 4 channel groups, reduce selectgo... (2026-01-10)
+```
+
+## 4. Claude setup
+
+**`CLAUDE.md` — present but UNTRACKED** (see §3; it replaced a deleted `.CLAUDE.md`). It is
+written as an ordered five-step protocol and its directives are unusually operational:
+
+- **STEP 1 — Command output handling, marked CRITICAL.** *Always* redirect long-running
+  output to a file and inspect with `tail`, never stream it: `go test ./... > /tmp/test.log
+  2>&1`, benchmarks to `/tmp/bench.log` in the background, builds to `/tmp/build.log`. The
+  stated reason is that verbose output crashes the AI context window and streaming commands
+  block interaction. Given that this repo runs multi-hour 500M-entry benchmarks, this rule
+  is load-bearing.
+- **STEP 2 — File organization.** Never ALL_CAPS filenames; always lowercase-with-hyphens.
+  Tests are `*_test.go` colocated with implementation. Documents the intended layout:
+  `database/kv` (KVShard, KV, DynaKV), `database/dkv` (LSM-tree), `database/storage`
+  (BFile/KFile), `database/history`, `database/utils` (bloom filters, key utilities),
+  `database/tests`, `experimental/` (explicitly *not* production).
+- **STEP 3 — Workflow.** Read existing code before proposing changes; understand the
+  architecture (1024 shards, 20-byte internal keys) first; run targeted package tests before
+  the full suite and `grep -i fail` the log. Pre-commit checklist: `go vet ./...` passes,
+  `go build ./...` succeeds, relevant tests pass, no experimental code on production paths.
+- **STEP 4 — Key technical details.** External API keys are `[32]byte`, internal storage is
+  `[20]byte` truncated; **"Do NOT change this without understanding collision
+  implications."** Hot paths are `PutPermAsync` (fire-and-forget) and `PutPerm`
+  (synchronous). **Always call `Flush()` before `Close()` on KVShard.** Gives the exact
+  benchmark invocations (reproduced in §5).
+- **STEP 5 — Documentation.** Update `CHANGELOG.md` for significant changes; docs go in
+  `docs/`, never the root; technical facts only, no verbose language. Points at
+  `docs/kv-architecture.md`, `docs/dkv/`, `docs/performance/`.
+- Closes with a restated mandatory ordering: redirect output → read before writing → test
+  incrementally → `go vet` before commits.
+
+**`.claude/` — none.** No agents, skills, commands, or settings files.
+**`.mcp.json` — none.**
+
+There is also a `.vscode/` directory (editor config, unrelated to Claude).
+
+## 5. Directives and conventions
+
+**There is no Makefile.** All commands are raw `go`. Verified against `go.mod` (module
+`github.com/AccumulateNetwork/BlockchainDB`, go 1.24.0, toolchain go1.24.4) and the
+`CLAUDE.md` protocol:
+
+```bash
+go build ./...  > /tmp/build.log 2>&1     # always redirect (STEP 1)
+go vet ./...                              # required before commit
+go test ./database/kv/...  > /tmp/kv.log 2>&1 ; grep -i fail /tmp/kv.log
+go test ./... > /tmp/test.log 2>&1 ; tail -20 /tmp/test.log
+```
+
+Benchmarks, from `CLAUDE.md` STEP 4 — note these are long-running and disk-heavy:
+
+```bash
+# quick check, ~10 min
+go test -run '^TestBDB_10M$'  -v -timeout 10m ./database/dkv/ > /tmp/10m.log 2>&1
+# 100M entries, up to 2h
+go test -run '^TestBDB_100M$' -v -timeout 2h  ./database/dkv/ > /tmp/100m.log 2>&1 &
+```
+
+The untracked 500M suite adds `TestWriteOnly_BDB_500M`, `TestWriteOnly_LevelDB_500M`, and
+`TestWriteOnly_Badger_500M` in `database/dkv/`. Those took 1–2 hours *each* and consumed
+35–103 GB of disk per engine. Do not launch them casually.
+
+**Helper scripts:** `scripts/create-perf-branches.sh` generates the `perf/*` sweep branches;
+`scripts/batch-perf.sh` drives runs across them. Root also holds
+`update-follower.sh` / `update-darkwingdog-follower.sh` and `follower-config.{json,yaml}`,
+which are deployment leftovers unrelated to the database.
+
+**Commit conventions:** mixed. Recent commits favor Conventional Commits (`feat:`, `docs:`,
+`perf:`) with a detailed bulleted body and a `Co-Authored-By: Claude` trailer; older ones
+are plain imperative prose. Follow the `feat:`/`docs:`/`perf:` form.
+
+**Branch policy:** `main` is stable; feature work on `feature/*`; performance experiments on
+`perf/*` (disposable). **No CONTRIBUTING.md.** `LICENSE` and `CHANGELOG.md` are present, and
+`CLAUDE.md` requires CHANGELOG updates for significant changes.
+
+**Cleanup candidates noticed while surveying — not yet acted on:** `dkv.test` (a compiled
+test binary) and `test_new_kv.go` (a stray root-level Go file outside the package layout
+that STEP 2 prescribes) are both sitting in the repo root.
+
+## 6. Resuming on another machine
+
+1. **Restore from the external-drive archive, do not clone.** A clone gives you
+   `origin/main` at `92a6c4d` and loses the 14 unpushed commits, all 20 `perf/*` branches,
+   and every uncommitted file in §3 — including the entire `adapter/` package. Copy the
+   directory with `.git` intact.
+2. **Verify the history survived:** `git -C <path> log --oneline -1` should show `c300398`,
+   `git -C <path> branch -vv` should list 23 branches, and
+   `git -C <path> rev-list --count origin/main..HEAD` should return **14**.
+3. **Push the unpushed work early.** Once credentials are working (see below), get
+   `feature/configurable-shards` onto the remote and set its upstream:
+   `git push -u origin feature/configurable-shards`. This is the single action that removes
+   the "only copy" risk for this repo.
+4. **Check out `feature/configurable-shards`** — that is where §2's work belongs. It is
+   already the checked-out branch in the archive.
+5. **Install:** Go 1.24.4 or newer (the `toolchain go1.24.4` directive will try to fetch it
+   otherwise). Then `go mod download`. Dependencies include BadgerDB, goleveldb, testify,
+   go-humanize, and `gitlab.com/accumulatenetwork/accumulate v1.4.2`.
+6. **Verify the build in this order**, redirecting output per `CLAUDE.md`:
+   `go build ./... > /tmp/build.log 2>&1`, then `go vet ./...`, then the fast package tests
+   `go test ./database/kv/... ./database/utils/... > /tmp/kv.log 2>&1 && grep -i fail
+   /tmp/kv.log`. **Do not start with the full suite** — it pulls in the multi-hundred-million
+   entry benchmarks.
+7. **First real task: confirm `adapter/adapter.go` compiles.** It is untracked, untested,
+   and depends on Accumulate's `keyvalue.Beginner`, `database.Key`, and `record` packages.
+   If the pinned Accumulate version drifted, this is where it breaks. Once green, commit it
+   — an untracked new package is the most fragile state in this repo.
+8. **Then take up the named next step:** write dedicated read benchmarks to validate the
+   2 µs read latency claim, per the explicit recommendation in
+   `docs/performance/500m-benchmark-comparison-2026-01-11.md`. Reserve real time and disk
+   for it.
+9. **Commit the `CLAUDE.md` rename** (`git add -A CLAUDE.md .CLAUDE.md`). The current state
+   leaves the repo with no tracked AI guidance at all.
+
+**What will NOT transfer:**
+
+- **SSH authentication to the remote.** `origin` is `git@github.com:...` — an **SSH**
+  remote — and `~/.ssh` was **deleted** from this machine, both private keys and
+  `known_hosts`. `git fetch` and `git push` will fail on the new host until you generate a
+  new keypair and add the public half to the GitHub account, or switch the remote to HTTPS
+  with a personal access token:
+  `git remote set-url origin https://github.com/AccumulateNetwork/BlockchainDB.git`.
+  `~/.aws` and `~/.gnupg` were deleted as well — **commit signing will fail** if it was
+  configured.
+- **Benchmark scratch data and logs.** Everything under `/tmp` (`/tmp/bdb_benchmark.log`,
+  `/tmp/test.log`, `/tmp/bench.log`, `/tmp/100m.log`) is gone, as are the raw run logs
+  named in the 500M comparison doc — `bdb_500m_benchmark_2026-01-11.log`,
+  `leveldb_500m_benchmark_2026-01-11.log`, `badger_500m_benchmark_2026-01-11.log`. Only the
+  summary markdown survives. The benchmarks use `t.TempDir()` for database files, so no
+  benchmark databases persist anyway.
+- **Disk capacity assumptions.** The 500M benchmark consumed 102.9 GB (Badger) + 34.9 GB
+  (LevelDB) + 75.1 GB (BDB) ≈ **213 GB**, and the published results were measured on a
+  24-core machine. Numbers from a different host are not comparable to the recorded
+  baselines — note the hardware change in any new results file.
+- **`dkv.test`** — a compiled binary; architecture-dependent, rebuild rather than trust it.
+- **The follower deployment scripts** (`update-follower.sh`,
+  `update-darkwingdog-follower.sh`) target remote hosts over SSH and are dead without keys.
+  They are unrelated to database work; ignore them.
