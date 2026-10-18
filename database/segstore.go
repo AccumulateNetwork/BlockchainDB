@@ -814,6 +814,16 @@ type StoreStats struct {
 	HistorySegments    int    // Segments in history now
 	ActiveSegments     int    // Segments in the window now
 	ResidentBloomBytes uint64 // History filter memory held, of BloomResidentBytes
+
+	// The heap's own figures (heap.go), zero for a segment store: the
+	// key map's resident bytes, its data files, what is live and dead
+	// in them, and what the mover has scanned and copied so far.
+	ResidentIndexBytes uint64
+	HeapFiles          int
+	HeapLiveBytes      uint64
+	HeapDeadBytes      uint64
+	HeapScannedBytes   uint64
+	HeapMovedBytes     uint64
 }
 
 // storeCounters is StoreStats as the store keeps it: atomics, because
@@ -2712,6 +2722,40 @@ func compactionRunWithin(history []*segment, ratio float64, budget uint64) (run 
 // the merge's rule: an uncommitted output sits below the newest active
 // segment and recoverOrphans deletes it, while the inputs are still
 // named.
+// beginBlockSync and compact are the dynaLayer surface (kv_2.go)
+// over Sync and CompactHistory.
+func (s *SegmentStore) beginBlockSync() (blockSync, error) {
+	p, err := s.beginSync()
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func (s *SegmentStore) compact(int64) (bool, error) { return s.CompactHistory() }
+
+// beginPermSeal and mergeBelow are the permLayer surface (kv_2.go)
+// over beginSeal and MergeBelow.
+func (s *SegmentStore) beginPermSeal(height uint64) (blockSync, error) {
+	p, err := s.beginSeal(height)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, nil
+	}
+	return segSeal{p}, nil
+}
+
+type segSeal struct{ p *pendingSeal }
+
+func (s segSeal) finish() error { _, err := s.p.finish(); return err }
+
+func (s *SegmentStore) mergeBelow(height uint64) (bool, error) {
+	_, merged, err := s.MergeBelow(height)
+	return merged, err
+}
+
 func (s *SegmentStore) CompactHistory() (compacted bool, err error) {
 	s.maint.Lock()
 	defer s.maint.Unlock()

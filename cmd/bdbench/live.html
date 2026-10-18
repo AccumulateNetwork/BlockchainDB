@@ -2,7 +2,12 @@
 <style>
 body{margin:0;background:#0d1117;color:#e6edf3;font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
 .wrap{max-width:1300px;margin:0 auto;padding:16px}h1{font-size:18px;margin:0 0 4px}.sub{color:#8b949e;font-size:12px;margin-bottom:12px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:14px}
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;margin:10px 0 14px}
+.group{background:#161b22;border:1px solid #2a3240;border-radius:8px;padding:8px 10px}
+.group h2{margin:0 0 6px;font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.group table{width:100%;border-collapse:collapse;font-size:12px}.group td{padding:2px 0;border:0;white-space:nowrap}
+.group td:first-child{color:#8b949e;text-align:left;padding-right:10px}.group td:last-child{text-align:right;font-variant-numeric:tabular-nums}
+.group td.big{font-size:18px;font-weight:650}
 .card{background:#161b22;border:1px solid #2a3240;border-radius:8px;padding:8px 10px}.card .k{color:#8b949e;font-size:10px;text-transform:uppercase;letter-spacing:.04em}
 .card .v{font-size:20px;font-weight:650;margin-top:2px}.card .d{color:#8b949e;font-size:11px}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:10px;margin-bottom:14px}
@@ -12,8 +17,10 @@ table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:ta
 td:first-child,th:first-child{text-align:left}.warn{color:#d29922}.bad{color:#f85149}.ok{color:#3fb950}
 </style></head><body><div class=wrap>
 <h1>bdbench <span id=state class=ok>live</span></h1>
-<div class=sub id=sub>refreshes every 5 s from bdbench.csv</div>
-<div class=cards id=cards></div>
+<div class=sub>live state every 2 s (live.json); a report row every minute (bdbench.csv)</div>
+<div class=groups id=now></div>
+<div class=groups id=config></div>
+<div class=groups id=cards></div>
 <div class=charts>
  <div class=chart><h3>seal p50 / p90 / max (ms) — must stay flat with age</h3><canvas id=c_seal></canvas></div>
  <div class=chart><h3>block p50 / p90 / max (ms) — interval is 1000</h3><canvas id=c_block></canvas></div>
@@ -28,16 +35,30 @@ function parse(t){const L=t.trim().split("\n");const h=L[0].split(",");return L.
 function line(id,rows,keys,colors,ymax){const c=document.getElementById(id);const W=c.width=c.clientWidth*2,H=c.height=c.clientHeight*2;const x=c.getContext("2d");x.clearRect(0,0,W,H);if(!rows.length)return;
  let m=ymax||Math.max(1,...keys.flatMap(k=>rows.map(r=>r[k]||0)))*1.1;x.strokeStyle="#2a3240";x.lineWidth=1;for(let g=0;g<=4;g++){const y=H-6-(H-12)*g/4;x.beginPath();x.moveTo(40,y);x.lineTo(W,y);x.stroke();x.fillStyle="#8b949e";x.font="18px sans-serif";x.fillText((m*g/4).toFixed(0),0,y+6)}
  keys.forEach((k,i)=>{x.strokeStyle=colors[i];x.lineWidth=3;x.beginPath();rows.forEach((r,j)=>{const px=40+(W-44)*j/Math.max(1,rows.length-1),py=H-6-(H-12)*Math.min(1,(r[k]||0)/m);j?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()})}
+async function now(){try{const l=await (await fetch("live.json?"+Date.now())).json();const m=Math.floor(l.elapsedSec/60),s=l.elapsedSec%60;document.getElementById("state").textContent=`live · ${m}m ${String(s).padStart(2,"0")}s · block ${l.height} · ${l.blocks} blocks`;const L=l.last10s;
+ document.getElementById("now").innerHTML=[
+  group("Now: seals, last 10 s",[["p50",L.sealP50ms.toFixed(0)+" ms","big"],["p90 (budget 100)",L.sealP90ms.toFixed(0)+" ms",L.sealP90ms>100?"warn":"ok"],["max",L.sealMaxMs.toFixed(0)+" ms"]]),
+  group("Now: blocks, last 10 s",[["p50",L.blockP50ms.toFixed(0)+" ms","big"],["p90 (interval 1000)",L.blockP90ms.toFixed(0)+" ms",L.blockP90ms>1000?"bad":"ok"],["max",L.blockMaxMs.toFixed(0)+" ms"],["over the interval",L.over+" of "+L.blocks,L.over>0?"bad":"ok"]]),
+  group("Now: maintenance and heap",[["passes in flight",l.maintenanceInFlight,"big"],["heap live / dead",l.heapLiveMB.toFixed(0)+" / "+l.heapHoleMB.toFixed(0)+" MB"],["cleaner scanned / copied",l.heapScannedMB.toFixed(0)+" / "+l.heapMovedMB.toFixed(0)+" MB"],["shard sync: heap fsync / delta",l.heapFsyncMsAvg.toFixed(1)+" / "+l.heapDeltaMsAvg.toFixed(1)+" ms avg"],["shard sync covers",l.heapSyncKBAvg.toFixed(0)+" KB avg"],["perm merges / folds / packs",l.permMerges+" / "+l.permFolds+" / "+l.permPacks],["perm index written",(l.permIndexMB||0).toFixed(0)+" MB"],["wrong answers so far",l.mismatches,l.mismatches>0?"bad":"ok"]])].join("")}catch(e){}}
 async function tick(){let t;try{t=await (await fetch("bdbench.csv?"+Date.now())).text()}catch(e){document.getElementById("state").textContent="unreachable";return}
  const rows=parse(t),last=rows[rows.length-1]||{};const st=document.getElementById("state");
- st.textContent=rows.length?("minute "+last.minute):"waiting for the first minute";
- const cards=[["seal p90",last.seal_p90_ms+" ms","budget 100"],["block p90",last.block_p90_ms+" ms","interval 1000"],["blocks over interval",last.over_budget,"this minute"],["read p99",last.read_p99_us+" µs",""],["put p99 dyna/perm",last.dyna_put_p99_us+"/"+last.perm_put_p99_us+" µs",""],["maintenance",(+last.compress_s+ +last.merge_s+ +last.pack_s).toFixed(1)+" s/min",last.compress_passes+" passes, "+last.skipped+" skipped"],["disk write",last.write_MBps+" MB/s","read "+last.read_MBps],["store",(last.store_MB/1000).toFixed(2)+" GB",last.files+" files"],["history segments","perm "+last.perm_history+" dyna "+last.dyna_history,"bloom "+last.bloom_MB+" MB"],["wrong answers",last.mismatches,""]];
- document.getElementById("cards").innerHTML=cards.map(c=>`<div class=card><div class=k>${c[0]}</div><div class=v ${c[0]=="wrong answers"&&last.mismatches>0?'class=bad':''}>${c[1]}</div><div class=d>${c[2]}</div></div>`).join("");
+ if(!rows.length)st.textContent="waiting for the first minute";
+ const tot=(+last.compress_s+ +last.merge_s+ +last.pack_s).toFixed(1);
+ document.getElementById("cards").innerHTML=[
+  group("Protocol path, this minute",[["seal p90 (budget 100 ms)",last.seal_p90_ms+" ms",last.seal_p90_ms>100?"big warn":"big ok"],["block p90 (interval 1000 ms)",last.block_p90_ms+" ms",last.block_p90_ms>1000?"big bad":"big"],["blocks over the interval",last.over_budget,last.over_budget>0?"bad":"ok"],["blocks this minute",last.blocks],["read p99",last.read_p99_us+" µs"],["put p99 dyna / perm",last.dyna_put_p99_us+" / "+last.perm_put_p99_us+" µs"]]),
+  group("Maintenance, this minute",[["seconds of work",tot+" s","big"],["compress passes / s",last.compress_passes+" / "+last.compress_s],["merge passes / s",last.merge_passes+" / "+last.merge_s],["pack passes / s",last.pack_passes+" / "+last.pack_s],["skipped (one in flight)",last.skipped]]),
+  group("Disk",[["write",last.write_MBps+" MB/s","big"],["read",last.read_MBps+" MB/s"],["store size",(last.store_MB/1000).toFixed(2)+" GB"],["files",last.files]]),
+  group("Store",[["history segments perm / dyna",last.perm_history+" / "+last.dyna_history],["resident filters",last.bloom_MB+" MB"],["wrong answers",last.mismatches,last.mismatches>0?"big bad":"big ok"]])].join("");
  line("c_seal",rows,["seal_p50_ms","seal_p90_ms","seal_max_ms"],["#3fb950","#d29922","#f85149"]);
  line("c_block",rows,["block_p50_ms","block_p90_ms","block_max_ms"],["#3fb950","#d29922","#f85149"],1000);
  line("c_maint",rows,["compress_s","merge_s","pack_s"],["#58a6ff","#bc8cff","#39c5cf"]);
  line("c_disk",rows.map(r=>({w:r.write_MBps,g:r.store_MB/1000*10})),["w","g"],["#d29922","#58a6ff"]);
  const T=document.getElementById("t");T.innerHTML="<tr>"+cols.map(c=>"<th>"+c.replace(/_/g," ")+"</th>").join("")+"</tr>"+rows.slice().reverse().map(r=>"<tr>"+cols.map(c=>{let cls="";if(c=="seal_p90_ms"&&r[c]>100)cls="warn";if(c=="over_budget"&&r[c]>0)cls="bad";if(c=="mismatches"&&r[c]>0)cls="bad";return `<td class="${cls}">${r[c]}</td>`}).join("")+"</tr>").join("")}
-fetch("run.json").then(r=>r.json()).then(c=>{document.getElementById("sub").textContent=`${c.stores} store(s) × ${c.shards} shards, seal limit ${c.sealLimit}, window ${c.window}, maintenance every ${c.compressEvery} blocks, pack every ${c.packEvery} · per ${c.interval} block: ${c.dynaPuts} dyna puts, ${c.permPuts} perm puts, ${c.reads} reads over ${c.hotKeys} hot keys, values ${c.valueMin}-${c.valueMax} B · ${c.dir} · started ${c.started} for ${c.duration} · refreshes every 5 s from bdbench.csv`}).catch(()=>{});
-tick();setInterval(tick,5000);
+function group(title,rows){return `<div class=group><h2>${title}</h2><table>${rows.map(r=>`<tr><td>${r[0]}</td><td class="${r[2]||""}">${r[1]}</td></tr>`).join("")}</table></div>`}
+fetch("run.json").then(r=>r.json()).then(c=>{document.getElementById("config").innerHTML=[
+ group("Store",[["dynamic layer",c.dynaHeap?"heap with holes":"sealed segments"],["stores on the disk",c.stores],["shards per store",c.shards],["seal limit (records/shard layer)",c.sealLimit],["window (blocks)",c.window]]),
+ group("Load per block per store",[["dynamic puts",c.dynaPuts],["permanent puts",c.permPuts],["reads",c.reads],["hot dynamic keys",c.hotKeys],["value bytes",c.valueMin+" to "+c.valueMax]]),
+ group("Schedule",[["block interval",c.interval],["duration",c.duration],["maintenance every (blocks)",c.compressEvery],["pack every (blocks)",c.packEvery],["started (UTC)",c.started]]),
+ group("Run",[["directory",c.dir.split("/").slice(-1)[0]],["seed",c.seed]])].join("")}).catch(()=>{});
+now();tick();setInterval(now,2000);setInterval(tick,5000);
 </script></body></html>
